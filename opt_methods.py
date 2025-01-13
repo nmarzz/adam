@@ -18,19 +18,90 @@ def risk(K, x, xstar):
 
 ## Plain ol' Adam
 
+# def one_pass_adam(quadratic, grad_function, K, data, targets, params0, optimal_params, lrk, beta1, beta2):
+        
+#     def update(carry, idx):
+#         params, m, v, quad_vals, step, Vs = carry
+#         data_point, target = data[idx], targets[idx]
+
+#         # Compute gradient
+#         grad = grad_function(params, data_point, target)
+
+#         # Update first moment estimate
+#         m = beta1 * m + (1 - beta1) * grad
+
+#         # Update second moment estimate
+#         v = beta2 * v + (1 - beta2) * grad**2
+
+#         # Bias correction
+#         # mhat = m / (1 - beta1 ** (step + 1))
+#         # vhat = v / (1 - beta2 ** (step + 1))
+        
+#         ## This is the truth
+#         mhat = m
+#         # vhat = m
+        
+#         ## This is to test things
+#         vhat = beta2 * jnp.diag(K)  + (1 - beta2) * grad**2
+#         # vhat = 2 * beta2 * Pbeta * jnp.diag(K)  + (1 - beta2) * grad**2 
+
+#         # Compute update step
+#         eps = 0
+#         step_update = mhat / (jnp.sqrt(vhat) + eps)
+
+#         # Update params
+#         params = params - lrk * step_update
+
+#         # Update Pbeta
+#         Q = quadratic(K,params,optimal_params)
+        
+        
+#         # Pbeta = beta2 * Pbeta + (1 - beta2) * Q
+#         # Pbetas = Pbetas.at[step].set(Pbeta)   
+        
+            
+#         Vs = Vs.at[step].set(vhat)                
+#         quad_vals = quad_vals.at[step].set(Q)
+        
+        
+#         return (params, m, v, quad_vals, step + 1, Vs), None
+
+#     # Preallocate arrays for risk_vals, times, Pbetas, and Vs
+#     max_steps = len(data)
+#     quad_vals = jnp.zeros(max_steps)
+#     times = jnp.arange(max_steps)    
+#     Vs = jnp.zeros((len(data), K.shape[0]))
+
+#     # Initialize variables
+#     d = K.shape[0]
+#     m = jnp.zeros(d)
+#     v = jnp.zeros(d)
+    
+#     carry = (params0, m, v, quad_vals, 0, Vs)
+
+#     # Use JAX lax.scan for iteration
+#     carry, _ = jax.lax.scan(update, carry, times)
+
+#     params, m, v, quad_vals, step, Vs = carry    
+
+#     return quad_vals, times
+
 def one_pass_adam(quadratic, grad_function, K, data, targets, params0, optimal_params, lrk, beta1, beta2):
         
     def update(carry, idx):
-        params, m, v, quad_vals, step, Vs = carry
+        params, m, v, Pbeta, quad_vals, step, Vs = carry
         data_point, target = data[idx], targets[idx]
-
+        
+        Q = quadratic(K,params,optimal_params)
+        Vs = Vs.at[step].set(v)
+        quad_vals = quad_vals.at[step].set(Q)
+        # Pbetas = Pbetas.at[step].set(Pbeta)   
+        
         # Compute gradient
         grad = grad_function(params, data_point, target)
 
-        # Update first moment estimate
-        m = beta1 * m + (1 - beta1) * grad
-
-        # Update second moment estimate
+        # Update moment estimates
+        m = beta1 * m + (1 - beta1) * grad        
         v = beta2 * v + (1 - beta2) * grad**2
 
         # Bias correction
@@ -39,11 +110,15 @@ def one_pass_adam(quadratic, grad_function, K, data, targets, params0, optimal_p
         
         ## This is the truth
         mhat = m
-        # vhat = m
+        # vhat = v ## This is the truth
         
-        ## This is to test things
+        
+        # This is to test things
+        # vhat = beta2 * jnp.diag(K) * 4  + (1 - beta2) * grad**2
+        # Pbeta = 15*jnp.cos(step)**2
+        # Pbeta = 0
+        # Q = quadratic(K,params,optimal_params)
         vhat = beta2 * jnp.diag(K)  + (1 - beta2) * grad**2
-        # vhat = 2 * beta2 * Pbeta * jnp.diag(K)  + (1 - beta2) * grad**2 
 
         # Compute update step
         eps = 0
@@ -51,20 +126,9 @@ def one_pass_adam(quadratic, grad_function, K, data, targets, params0, optimal_p
 
         # Update params
         params = params - lrk * step_update
-
-        # Update Pbeta
-        Q = quadratic(K,params,optimal_params)
-        
-        
-        # Pbeta = beta2 * Pbeta + (1 - beta2) * Q
-        # Pbetas = Pbetas.at[step].set(Pbeta)   
-        
-            
-        Vs = Vs.at[step].set(vhat)                
-        quad_vals = quad_vals.at[step].set(Q)
-        
-        
-        return (params, m, v, quad_vals, step + 1, Vs), None
+        Pbeta = beta2 * Pbeta + (1 - beta2) * Q
+                
+        return (params, m, v, Pbeta, quad_vals, step + 1, Vs), None
 
     # Preallocate arrays for risk_vals, times, Pbetas, and Vs
     max_steps = len(data)
@@ -76,17 +140,16 @@ def one_pass_adam(quadratic, grad_function, K, data, targets, params0, optimal_p
     d = K.shape[0]
     m = jnp.zeros(d)
     v = jnp.zeros(d)
+    Pbeta = 0
     
-    carry = (params0, m, v, quad_vals, 0, Vs)
+    carry = (params0, m, v, Pbeta, quad_vals, 0, Vs)
 
     # Use JAX lax.scan for iteration
     carry, _ = jax.lax.scan(update, carry, times)
 
-    params, m, v, quad_vals, step, Vs = carry    
+    params, m, v, Pbeta, quad_vals, step, Vs = carry
 
     return quad_vals, times
-
-
 ## SDE(s) for Adam
 
 @partial(jax.jit, static_argnames=['f'])
