@@ -150,6 +150,7 @@ def one_pass_adam(quadratic, grad_function, K, data, targets, params0, optimal_p
     params, m, v, Pbeta, quad_vals, step, Vs = carry
 
     return quad_vals, times
+
 ## SDE(s) for Adam
 
 @partial(jax.jit, static_argnames=['f'])
