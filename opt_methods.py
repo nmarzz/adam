@@ -107,13 +107,13 @@ def adam_mean_from_params(params, optimal_params, f, K, Kbar, beta,  key, n_samp
     z_history = jax.random.normal(key_z_hist, (n_samples, history_length))
 
     decay_vec = jnp.array([beta ** i for i in range(1, history_length + 1)])
-    history_average = (1-beta)*(f(Q_history)**2 * z_history**2) @ decay_vec
+    history_average = (1-beta)*(f(Q_history)**2 * z_history**2) @ decay_vec    
 
     fq = f(Q)
     fq = fq.squeeze()
     Q = Q.squeeze()
         
-    phi = jnp.mean((z**2 * fq / jnp.sqrt( history_average + (1-beta) * fq**2 * z**2))[:,None]  *  (Q @ Binv), axis = 0)
+    phi = jnp.mean((z**2 * fq / jnp.sqrt(history_average + (1-beta) * fq**2 * z**2))[:,None]  *  (Q @ Binv), axis = 0)
         
     return Kbar @ params * phi[0] + Kbar @ optimal_params * phi[1]
     
@@ -243,7 +243,7 @@ def one_pass_sgd(K, data, targets, x0, xstar, lrk, diag_preconditioner = None):
     
     return np.array(risk_vals), np.array(times)
 
-
+@partial(jax.jit, static_argnames=['f'])
 def phi_from_B(B, f, beta,  key, n_samples = 10000):
     """
     Compute the mean of the adam update in terms of B
@@ -256,25 +256,24 @@ def phi_from_B(B, f, beta,  key, n_samples = 10000):
     history_length = 50    
     Q = jax.random.multivariate_normal(key_Q, mean = np.zeros(2), cov = B, shape=(n_samples, 1))
     z = jax.random.normal(key_z, (n_samples))
+    
+    Q_history = jax.random.multivariate_normal(key_Q_hist, mean = np.zeros(2), cov = B, shape=(n_samples, history_length))
+    z_history = jax.random.normal(key_z_hist, (n_samples, history_length))
 
-    if beta > 0:
-        Q_history = jax.random.multivariate_normal(key_Q_hist, mean = np.zeros(2), cov = B, shape=(n_samples, history_length))
-        z_history = jax.random.normal(key_z_hist, (n_samples, history_length))
+    decay_vec = jnp.array([beta ** i for i in range(1, history_length + 1)])
+    history_average = (1-beta)*(f(Q_history)**2 * z_history**2) @ decay_vec
+    # history_average = (1-beta)*(z_history**2) @ decay_vec
 
-        decay_vec = jnp.array([beta ** i for i in range(1, history_length + 1)])
-        history_average = (1-beta)*(f(Q_history)**2 * z_history**2) @ decay_vec
-    else:
-        history_average = 0
 
     fq = f(Q)
     fq = fq.squeeze()
     Q = Q.squeeze()
         
-    phi = jnp.mean((z**2 * fq / jnp.sqrt( history_average + (1-beta) * fq**2 * z**2))[:,None]  *  (Q @ Binv), axis = 0)
+    phi = jnp.mean((z**2 * fq / jnp.sqrt( history_average + (1-beta) * z**2 * fq**2))[:,None]  *  (Q @ Binv), axis = 0)
         
     return phi
 
-
+@partial(jax.jit, static_argnames=['f'])
 def cov_from_B(B, f, beta,  key, n_samples = 10000):
     """
     Compute the covariance update the adam update in terms of B
@@ -287,19 +286,18 @@ def cov_from_B(B, f, beta,  key, n_samples = 10000):
     Q = jax.random.multivariate_normal(key_Q, mean = np.zeros(2), cov = B, shape=(n_samples, 1))
     z = jax.random.normal(key_z, (n_samples))
 
-    if beta > 0:        
-        Q_history = jax.random.multivariate_normal(key_Q_hist, mean = np.zeros(2), cov = B, shape=(n_samples, history_length))
-        z_history = jax.random.normal(key_z_hist, (n_samples, history_length))
+    
+    Q_history = jax.random.multivariate_normal(key_Q_hist, mean = np.zeros(2), cov = B, shape=(n_samples, history_length))
+    z_history = jax.random.normal(key_z_hist, (n_samples, history_length))
 
-        decay_vec = jnp.array([beta ** i for i in range(1, history_length + 1)])
-        history_average = (1-beta)*(f(Q_history)**2 * z_history**2) @ decay_vec
-    else:
-        history_average = 0
+    decay_vec = jnp.array([beta ** i for i in range(1, history_length + 1)])
+    history_average = (1-beta)*(f(Q_history)**2 * z_history**2) @ decay_vec    
+    # history_average = (1-beta)*(z_history**2) @ decay_vec
 
     fq = f(Q)
     fq = fq.squeeze()        
     
-    return jnp.mean(z**2 * fq**2 / (history_average + (1-beta) * fq**2 * z**2))
+    return jnp.mean(z**2 * fq**2 / (history_average + (1-beta) * z**2 * fq**2))
 
 def adam_ode(K, Kbar, T, params0, optimal_params, lr, beta, f, risk_from_B):
     print('Precomputations...')
