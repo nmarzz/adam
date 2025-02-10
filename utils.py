@@ -1,6 +1,8 @@
 import jax
 import jax.numpy as jnp
+from jax import jit
 import numpy as np
+
 
 def make_data(cov, key = None):
     if key is None:
@@ -18,20 +20,15 @@ def make_data(cov, key = None):
 @jax.jit
 def make_B(params, optimal_params, cov):
     
-    # if len(cov.shape) == 1:        
-    #     B11 = jnp.dot(params, cov * params)
-    #     B12 = jnp.dot(optimal_params, cov * params)
-    #     B22 = jnp.dot(optimal_params, cov * optimal_params)
-    #     B = jnp.array([[B11,B12],[B12, B22]])
-    # else:
-    #     B11 = jnp.dot(params, cov @ params)
-    #     B12 = jnp.dot(optimal_params, cov @ params)
-    #     B22 = jnp.dot(optimal_params, cov @ optimal_params)
-    #     B = jnp.array([[B11,B12],[B12, B22]])
-    
-    B11 = jnp.dot(params, cov * params)
-    B12 = jnp.dot(optimal_params, cov * params)
-    B22 = jnp.dot(optimal_params, cov * optimal_params)
-    B = jnp.array([[B11,B12],[B12, B22]])
-    
+    if len(cov.shape) == 1:        
+        B11 = jnp.dot(params, cov * params)
+        B12 = jnp.dot(optimal_params, cov * params)
+        B22 = jnp.dot(optimal_params, cov * optimal_params)        
+        B = jnp.array([[B11,B12],[B12, B22]])
+    else:
+        B11 = jnp.dot(params, cov @ params)
+        B12 = jnp.dot(optimal_params, cov @ params)
+        B22 = jnp.dot(optimal_params, cov @ optimal_params)
+        B = jnp.array([[B11,B12],[B12, B22]])
+        
     return B
