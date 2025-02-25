@@ -1,3 +1,5 @@
+from tqdm import tqdm
+from utils import make_data, make_B
 from risks_and_discounts import *
     
 class Optimizer:
@@ -8,12 +10,19 @@ class Optimizer:
         if problem == 'logreg':
             self.grad = grad_logreg
             self.get_target = logreg_target
-            self.get_target = logreg_target
             self.risk_fun = risk_from_B_logreg
         elif problem == 'linreg':
             self.grad = grad_linreg
             self.get_target = linreg_target
             self.risk_fun = risk_from_B_linreg
+        elif problem == 'lip_phaseret':            
+            self.grad = grad_lip_phase_ret
+            self.get_target = lip_phase_ret_target
+            self.risk_fun = risk_from_B_lip_phase_retrieval
+        elif problem == 'real_phaseret':            
+            self.grad = grad_real_phase_ret
+            self.get_target = real_phase_ret_target
+            self.risk_fun = risk_from_B_real_phase_retrieval
 
     def init_state(self, d):
         return None
@@ -31,6 +40,8 @@ class Optimizer:
         for k in tqdm(range(T * d)):
             if callable(lr_fun):
                 lr = lr_fun(k)
+            else:
+                lr = lr_fun
             params, key, state = self.update(params, lr, cov, optimal_params, key, state, **kwargs)
             risks.append(self.risk_fun(B))
             B = make_B(params, optimal_params, cov)

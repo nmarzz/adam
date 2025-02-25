@@ -17,6 +17,12 @@ class ODE:
         elif problem == 'linreg':            
             self.risk_fun = risk_from_B_linreg
             self.f = f_linreg
+        elif problem == 'lip_phaseret':
+            self.risk_fun = risk_from_B_lip_phase_retrieval
+            self.f = f_lip_phase_ret
+        elif problem == 'real_phaseret':
+            self.risk_fun = risk_from_B_real_phase_retrieval
+            self.f = f_real_phase_ret
     
     def run(self, params, optimal_params, cov, T, lr_fun, dt = 0.01, **kwargs):
         risks = []
@@ -39,6 +45,8 @@ class ODE:
             key, subkey = jax.random.split(key)
             if callable(lr_fun):
                 lr = lr_fun(t)
+            else:
+                lr = lr_fun
             y_update = self.update_odes(y, eigs, B, lr, subkey, extra, **kwargs)
             y += dt * y_update
             
