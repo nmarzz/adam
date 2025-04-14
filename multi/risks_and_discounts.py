@@ -39,7 +39,7 @@ def phi_from_B(B, f, beta,  key, n_samples = 10000):
     key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(key, 4)
     Binv = jnp.linalg.inv(B)
 
-    history_length = 500
+    history_length = 2500
     Q = jax.random.multivariate_normal(key_Q, mean = jnp.zeros(len(B)), cov = B, shape=(n_samples, 1))
     z = jax.random.normal(key_z, (n_samples,1))
 
@@ -76,7 +76,7 @@ def cov_from_B(B, f, beta,  key, n_samples = 10000):
     history_average = (1 - beta) * jnp.einsum('abc,b->ac', f(Q_history)**2 * z_history[:,:,None]**2, decay_vec)
 
     fq = f(Q).squeeze(axis=1)
-    vvv = (z**2 * fq / jnp.sqrt(history_average + (1-beta) * z**2 * fq**2))
+    vvv = (z * fq / jnp.sqrt(history_average + (1-beta) * z**2 * fq**2))
     op = jnp.einsum('ab,ac->abc', vvv, vvv)
 
     return jnp.mean(op, axis = 0)
