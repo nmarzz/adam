@@ -16,19 +16,11 @@ def make_data(cov, key = None):
         
     return jax.random.multivariate_normal(key, mean=jnp.zeros(d), cov=cov)
 
-
 @jax.jit
 def make_B(params, optimal_params, cov):
-    
+    W =  jnp.concatenate([params, optimal_params], axis = 1)
     if len(cov.shape) == 1:        
-        B11 = jnp.dot(params, cov * params)
-        B12 = jnp.dot(optimal_params, cov * params)
-        B22 = jnp.dot(optimal_params, cov * optimal_params)        
-        B = jnp.array([[B11,B12],[B12, B22]])
+        B = W. T @ (W * cov[:,None])
     else:
-        B11 = jnp.dot(params, cov @ params)
-        B12 = jnp.dot(optimal_params, cov @ params)
-        B22 = jnp.dot(optimal_params, cov @ optimal_params)
-        B = jnp.array([[B11,B12],[B12, B22]])
-        
+        B = W. T @ cov @ W   
     return B

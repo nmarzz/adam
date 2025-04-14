@@ -14,7 +14,7 @@ class Optimizer:
         else:
             raise NotImplementedError(f'Problem {problem} not implemented')
 
-    def init_state(self, d):
+    def init_state(self, d, num_classes):
         return None
                                         
     def update(self):
@@ -22,10 +22,10 @@ class Optimizer:
 
     def run(self, params, cov, T, lr_fun, optimal_params, **kwargs):
         risks = []        
-        d = len(cov)        
+        d, num_classes = params.shape
         key = self.key
         
-        state = self.init_state(d)
+        state = self.init_state(d,num_classes)
         B = make_B(params, optimal_params, cov)
         for k in tqdm(range(T * d)):
             if callable(lr_fun):
@@ -54,8 +54,8 @@ class Optimizer:
     
 @jax.tree_util.register_pytree_node_class
 class Adam(Optimizer):   
-    def init_state(self, d):
-        return (jnp.zeros(d), jnp.zeros(d))
+    def init_state(self, d, num_classes):
+        return (jnp.zeros((d,num_classes)), jnp.zeros((d,num_classes)))
         
     @jit
     def update(self, params, lr, cov, optimal_params, key, state, beta1, beta2, eps = 0):
@@ -82,7 +82,7 @@ class SGD(Optimizer):
     @jit
     def update(self, params, lr, cov, optimal_params, key, state):
         key, subkey = jax.random.split(key)
-        data = make_data(cov, subkey)
+        data = make_data(cov, subkey)        
         target = self.get_target(data, optimal_params)
 
         gradient = self.grad(params, data, target)       
