@@ -11,12 +11,17 @@ class ODE:
         self.problem = problem        
         self.key = key if key is not None else jax.random.PRNGKey(np.random.randint(0, 10000))        
 
-        if problem == 'logreg':            
+        if problem == 'logreg':
             self.risk_fun = risk_from_B_logreg
             self.f = f_logreg
-        elif problem == 'linreg':            
+        elif problem == 'linreg':
             self.risk_fun = risk_from_B_linreg
-            self.f = f_linreg        
+            self.f = f_linreg
+        elif problem == 'real_phase_ret':
+            self.risk_fun = risk_from_B_real_phase_ret
+            self.f = f_real_phase_ret
+        else:
+            raise NotImplementedError(f"{problem} not implement for ODEs")
     
     def run(self, params, optimal_params, cov, T, lr_fun, dt = 0.01, **kwargs):
         risks = []

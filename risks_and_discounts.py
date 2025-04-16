@@ -20,8 +20,11 @@ def grad_logreg(params, data, target):
 
 @jit
 def grad_linreg(params, data, target):    
-    return data[:, None] * (data @ params - target)
+    return jnp.outer(data, data @ params - target)
 
+@jit
+def grad_real_phase_ret(params, data, target):
+    return jnp.outer(data, 4 * (params.T @ data) * ((params.T @ data)**2 - target))
 
 @jit
 def linreg_target(optimal_params, data):    
@@ -57,6 +60,14 @@ def risk_from_B_logreg(B):
         
     return jnp.sum(weights * (t1 + t2)) / jnp.sqrt(jnp.pi)
 
+@jit
+def risk_from_B_real_phase_ret(B):
+    m = len(B)//2
+    B11 = B[0:m,0:m]
+    B12 = B[0:m,m:]
+    B22 = B[m:,m:]
+    return 3*jnp.trace(B11@B11) -2 * jnp.trace(B11 @ B22) -4*jnp.trace(B12 @ B12.T) + 3 * jnp.trace(B22@B22)
+
 
 # @partial(jax.jit, static_argnames=['m'])
 @jit
@@ -72,6 +83,17 @@ def f_logreg(q):
     q1 = q[:,:,0:m]
     q2 = q[:,:,m:]
     return sigmoid(q1) - sigmoid(q2)
+
+@jit
+def f_real_phase_ret(q):
+    m = q.shape[2] // 2
+    q1 = q[:,:,0:m]
+    q2 = q[:,:,m:]
+    return 4 * q1 * ((q1)**2 - (q2)**2)
+
+
+
+
 
 @partial(jax.jit, static_argnames=['f'])
 def phi_from_B(B, f, beta,  key, n_samples = 10000):

@@ -15,6 +15,10 @@ class Optimizer:
             self.grad = grad_logreg
             self.get_target = logreg_target
             self.risk_fun = risk_from_B_logreg
+        elif problem == 'real_phase_ret':
+            self.grad = grad_real_phase_ret
+            self.get_target = real_phase_ret_target
+            self.risk_fun = risk_from_B_real_phase_ret
         else:
             raise NotImplementedError(f'Problem {problem} not implemented')
 
