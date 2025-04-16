@@ -3,6 +3,11 @@ import jax.numpy as jnp
 from jax import jit
 import numpy as np
 
+def compute_ci(data, alpha=0.2):
+    lower = jnp.percentile(data, 100 * (alpha / 2), axis=0)
+    upper = jnp.percentile(data, 100 * (1 - alpha / 2), axis=0)
+    mean = jnp.mean(data, axis=0)
+    return mean, lower, upper
 
 def make_data(cov, key = None):
     if key is None:
@@ -16,19 +21,11 @@ def make_data(cov, key = None):
         
     return jax.random.multivariate_normal(key, mean=jnp.zeros(d), cov=cov)
 
-
 @jax.jit
 def make_B(params, optimal_params, cov):
-    
+    W =  jnp.concatenate([params, optimal_params], axis = 1)
     if len(cov.shape) == 1:        
-        B11 = jnp.dot(params, cov * params)
-        B12 = jnp.dot(optimal_params, cov * params)
-        B22 = jnp.dot(optimal_params, cov * optimal_params)        
-        B = jnp.array([[B11,B12],[B12, B22]])
+        B = W. T @ (W * cov[:,None])
     else:
-        B11 = jnp.dot(params, cov @ params)
-        B12 = jnp.dot(optimal_params, cov @ params)
-        B22 = jnp.dot(optimal_params, cov @ optimal_params)
-        B = jnp.array([[B11,B12],[B12, B22]])
-        
+        B = W. T @ cov @ W   
     return B

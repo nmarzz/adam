@@ -14,18 +14,12 @@ class OptimizerSDE:
         self.problem = problem        
         self.key = key if key is not None else jax.random.PRNGKey(np.random.randint(0, 10000))        
 
-        if problem == 'logreg':            
+        if problem == 'linreg':
+            self.risk_fun = risk_from_B_linreg
+            self.f = f_linreg        
+        elif problem == 'logreg':
             self.risk_fun = risk_from_B_logreg
             self.f = f_logreg
-        elif problem == 'linreg':
-            self.risk_fun = risk_from_B_linreg
-            self.f = f_linreg
-        elif problem == 'lip_phaseret':
-            self.risk_fun = risk_from_B_lip_phase_retrieval
-            self.f = f_lip_phase_ret
-        elif problem == 'real_phaseret':
-            self.risk_fun = risk_from_B_real_phase_retrieval
-            self.f = f_real_phase_ret
     
     def run(self, params, optimal_params, cov, T, lr_fun, dt = 0.005, **kwargs):
         risks = []                
@@ -76,41 +70,60 @@ class AdamSDE(OptimizerSDE):
         beta2 = kwargs['beta2']
         covbar = kwargs['covbar']
         
+        d, m = params.shape
         subkey_phi, subkey_cov, subkey_brownian = jax.random.split(subkey, 3)
-        d = len(cov)
-        W = jax.random.normal(subkey_brownian, (d,)) * jnp.sqrt(dt)
+        W = jax.random.normal(subkey_brownian, optimal_params.shape) * jnp.sqrt(dt)
         
         phi = phi_from_B(B, self.f, beta2, subkey_phi)
-        
+                
         if len(covbar.shape) == 1:
-            mean =  covbar * params * phi[0] + covbar * optimal_params * phi[1]
+            mean =  covbar[:,None] * params * phi[0:m] + covbar[:,None] * optimal_params * phi[m:]
         else:
-            mean =  covbar @ params * phi[0] + covbar @ optimal_params * phi[1]
+            mean =  covbar @ params * phi[0:m] + covbar @ optimal_params * phi[m:]
         
         cov = cov_from_B(B, self.f, beta2,  subkey_cov)
-        params = params - lr * mean * dt + lr * jnp.sqrt(cov) * W / jnp.sqrt(d)
                 
+        sqrtcov = jnp.linalg.cholesky(cov)
+        params = params - lr * mean * dt + lr * W @ sqrtcov / jnp.sqrt(d)
+                        
         return params
 
 
 @jax.tree_util.register_pytree_node_class
 class SgdSDE(OptimizerSDE):
+        
+    def run(self, params, optimal_params, cov, T, lr_fun, dt=0.005, **kwargs):
+        if len(cov.shape) == 1:
+            sqrtcov = jnp.sqrt(cov)
+        else:
+            sqrtcov = jnp.linalg.cholesky(cov)
+
+        kwargs['sqrtcov'] = sqrtcov
+        return super().run(params, optimal_params, cov, T, lr_fun, dt, **kwargs)
+    
     @jit
     def update(self,  params, optimal_params, B, lr, cov, dt, subkey, **kwargs):
-        d = len(cov)
+        d, num_classes = params.shape
         subkey_mean, subkey_cov, subkey_brownian = jax.random.split(subkey, 3)
-        W = jax.random.normal(subkey_brownian, (d,)) * jnp.sqrt(dt)
-                
+        W = jax.random.normal(subkey_brownian, optimal_params.shape) * jnp.sqrt(dt)
+        sqrtcov = kwargs['sqrtcov']
+        
         H = compute_H(B, self.f, subkey_mean)
         I = compute_I(B, self.f, subkey_cov)
         
+        vals, vecs = jnp.linalg.eigh(I)
+        sqrtI = vecs @ (jnp.sqrt(vals)[:, None] * vecs.T)
+        
         
         if len(cov.shape) == 1:
-            mean =  cov * params * H[0] + cov * optimal_params * H[1]
+            mean =  cov[:,None] * params * H[0:num_classes] + cov[:,None] * optimal_params * H[num_classes:]
+            params = params - lr * mean * dt + lr * W @ sqrtI * jnp.sqrt(cov)[:,None] / jnp.sqrt(d)
         else:
-            mean =  cov @ params * H[0] + cov @ optimal_params * H[1]
+            mean =  cov @ params * H[0:num_classes] + cov @ optimal_params * H[num_classes:]
+            noise_term = sqrtcov @ W @ sqrtI
             
-        params = params - lr * mean * dt + lr * jnp.sqrt(I) * W * jnp.sqrt(cov) / jnp.sqrt(d)
+            params = params - lr * mean * dt + lr * noise_term / jnp.sqrt(d)
+                                
                 
         return params
     
