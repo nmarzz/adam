@@ -10,7 +10,11 @@ class Optimizer:
         if problem == 'linreg':
             self.grad = grad_linreg
             self.get_target = linreg_target
-            self.risk_fun = risk_from_B_linreg        
+            self.risk_fun = risk_from_B_linreg   
+        elif problem == 'logreg':
+            self.grad = grad_logreg
+            self.get_target = logreg_target
+            self.risk_fun = risk_from_B_logreg
         else:
             raise NotImplementedError(f'Problem {problem} not implemented')
 
@@ -49,7 +53,7 @@ class Optimizer:
         """Reconstruct the PyTree from its flattened representation."""
         key = leaves
         problem = aux_data
-        return cls(problem, key=key)    
+        return cls(problem, key=key)
     
     
 @jax.tree_util.register_pytree_node_class

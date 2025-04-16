@@ -16,13 +16,7 @@ class ODE:
             self.f = f_logreg
         elif problem == 'linreg':            
             self.risk_fun = risk_from_B_linreg
-            self.f = f_linreg
-        elif problem == 'lip_phaseret':
-            self.risk_fun = risk_from_B_lip_phase_retrieval
-            self.f = f_lip_phase_ret
-        elif problem == 'real_phaseret':
-            self.risk_fun = risk_from_B_real_phase_retrieval
-            self.f = f_real_phase_ret
+            self.f = f_linreg        
     
     def run(self, params, optimal_params, cov, T, lr_fun, dt = 0.01, **kwargs):
         risks = []
@@ -80,59 +74,54 @@ class AdamODE(ODE):
     @jit    
     def make_B(y, eigs):
         d = len(eigs)
-        p,u,v,q = y[:d], y[d:2*d], y[2*d:3*d], y[3*d:]
-        B11 = jnp.sum(p)
-        B12 = jnp.sum(u)
-        B21 = jnp.sum(v)
-        B22 = jnp.sum(q)
-        return jnp.array([[B11,B12],[B21,B22]])
-    
-    def init_odes(self, cov, params, optimal_params):                
+        p,u,q = y[:d,:,:], y[d:2*d,:,:], y[2*d:,:,:]
+        B11 = jnp.sum(p,axis = 0)
+        B12 = jnp.sum(u,axis = 0)
+        B22 = jnp.sum(q,axis = 0)
+
+        return jnp.block([[B11,B12],[B12.T,B22]])
+        
+    def init_odes(self, cov, params, optimal_params):
         d = len(cov)
         if len(cov.shape) == 1: # diagonal covariance            
-            eigs = cov / jnp.sqrt(cov)
-            L = jnp.eye(d)
-            R = jnp.eye(d)
-                    
-            var_force = jnp.array([jnp.inner(R[:, j], cov * L[:, j]) for j in range(d)])
-            p = jnp.array([jnp.inner(params, cov * L[:, j]) * jnp.inner(R[:, j], params) for j in range(d)])
-            u = jnp.array([jnp.inner(params, cov * L[:, j]) * jnp.inner(R[:, j], optimal_params) for j in range(d)])
-            v = jnp.array([jnp.inner(optimal_params, cov * L[:, j]) * jnp.inner(R[:, j], params) for j in range(d)])
-            q = jnp.array([jnp.inner(optimal_params, cov * L[:, j]) * jnp.inner(R[:, j], optimal_params) for j in range(d)])
+            eigs = jnp.sqrt(cov)
+            var_force = cov
+            p = jnp.array([jnp.outer(params[j,:], params[j,:]) * cov[j] for j in range(d)])
+            q = jnp.array([jnp.outer(optimal_params[j,:], optimal_params[j,:]) * cov[j] for j in range(d)])
+            u = jnp.array([jnp.outer(params[j,:], optimal_params[j,:]) * cov[j] for j in range(d)])
 
         else:
+            # TODO: update var force
             covbar = cov / jnp.sqrt(jnp.diag(cov))
             eigs, L = jnp.linalg.eig(covbar)
             R = jnp.linalg.inv(L).T
             eigs, L, R = jnp.real(eigs), jnp.real(L), jnp.real(R)
         
-        
             var_force = jnp.array([jnp.inner(R[:, j], cov @ L[:, j]) for j in range(d)])
-            p = jnp.array([jnp.inner(params, cov @ L[:,j]) * jnp.inner(R[:,j], params) for j in range(d)])
-            u = jnp.array([jnp.inner(params, cov @ L[:,j]) * jnp.inner(R[:,j], optimal_params) for j in range(d)])
-            v = jnp.array([jnp.inner(optimal_params, cov @ L[:,j]) * jnp.inner(R[:,j], params) for j in range(d)])
-            q = jnp.array([jnp.inner(optimal_params, cov @ L[:,j]) * jnp.inner(R[:,j], optimal_params) for j in range(d)])
-            
-
-        return jnp.concatenate([p, u, v, q]), eigs, var_force
+            p = jnp.array([params.T @ jnp.outer(cov @ L[:, j], R[:, j]) @ params for j in range(d)])
+            u = jnp.array([params.T @ jnp.outer(cov @ L[:, j], R[:, j]) @ optimal_params for j in range(d)])
+            # v = jnp.array([optimal_params.T @ jnp.outer(cov @ L[:, j], R[:, j]) @ params for j in range(d)])
+            q = jnp.array([optimal_params.T @ jnp.outer(cov @ L[:, j], R[:, j]) @ optimal_params for j in range(d)])
+                        
+        return jnp.concatenate([p, u, q]), eigs, var_force
     
-    @jit    
+    @jit
     def update_odes(self, y, eigs, B, lr, subkey, extra, **kwargs):
         var_force = extra
         d = len(eigs)
-        p, u, v, q = y[:d], y[d:2*d], y[2*d:3*d], y[3*d:]
+        p, u, q = y[:d,:,:], y[d:2*d,:,:], y[2*d:,:,:]
         subkey_mean, subkey_cov = jax.random.split(subkey)
         beta2 = kwargs['beta2']
         
-        phi1_B, phi2_B = phi_from_B(B, self.f, beta2, subkey_mean)
+        m = len(B) // 2
+        phi = phi_from_B(B, self.f, beta2, subkey_mean)
+        sigma = cov_from_B(B, self.f, beta2, subkey_cov)
+        phi1, phi2 = phi[0:m], phi[m:]
         
-        p_update = -lr * eigs * (2 * p * phi1_B + phi2_B * (u + v))
-        p_update += lr**2 * cov_from_B(B, self.f, beta2, subkey_cov) * var_force / d
-        
-        u_update = -lr * eigs * (phi1_B * u + phi2_B * q)
-        v_update = -lr * eigs * (phi1_B * v + phi2_B * q)
+        p_update = -2 * lr * eigs[:,None,None]  * (p * phi1 + u * phi2) + lr**2 * var_force[:,None,None] * sigma / d
+        u_update = -lr * eigs[:,None,None] * (phi1 * u + phi2 * q)
                 
-        return jnp.concatenate([p_update, u_update, v_update, jnp.zeros(d)])
+        return jnp.concatenate([p_update, u_update, jnp.zeros(u_update.shape)])
     
 
 @jax.tree_util.register_pytree_node_class
