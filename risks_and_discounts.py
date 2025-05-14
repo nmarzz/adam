@@ -96,7 +96,7 @@ def f_real_phase_ret(q):
 
 
 @partial(jax.jit, static_argnames=['f'])
-def phi_from_B(B, f, beta,  key, n_samples = 10000):
+def phi_from_B(B, f, beta1, beta2,  key, n_samples = 10000):
     key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(key, 4)
     Binv = jnp.linalg.inv(B)
 
@@ -107,15 +107,17 @@ def phi_from_B(B, f, beta,  key, n_samples = 10000):
     Q_history = jax.random.multivariate_normal(key_Q_hist, mean = jnp.zeros(len(B)), cov = B, shape=(n_samples, history_length))
     z_history = jax.random.normal(key_z_hist, (n_samples, history_length))
 
-    decay_vec = jnp.array([beta ** i for i in range(1, history_length + 1)])
-    # history_average = (1-beta)*(f(Q_history)**2 * z_history**2) @ decay_vec
-    history_average = (1 - beta) * jnp.einsum('abc,b->ac', f(Q_history)**2 * z_history[:,:,None]**2, decay_vec)
+    decay_vec2 = jnp.array([beta2**i for i in range(1, history_length + 1)])
+    decay_vec1 = jnp.array([beta1**i for i in range(1, history_length + 1)])
+    
+    history_average2 = (1 - beta2) * jnp.einsum('abc,b->ac', f(Q_history)**2 * z_history[:,:,None]**2, decay_vec2)
+    history_average1 = (1 - beta1) * jnp.einsum('abc,b->ac', f(Q_history) * z_history[:,:,None]**2, decay_vec1)
 
 
     fq = f(Q).squeeze(axis=1)
     Q = Q.squeeze()
     
-    phi_coef = z**2 * fq / jnp.sqrt( history_average + (1-beta) * z**2 * fq**2)
+    phi_coef = ((1-beta1)*z**2 * fq + history_average1) / jnp.sqrt( history_average2 + (1-beta2) * z**2 * fq**2)
         
     phi_coef = jnp.concatenate([phi_coef,phi_coef], axis = 1)
     phi = jnp.mean(phi_coef * Q @ Binv, axis = 0)
@@ -123,7 +125,7 @@ def phi_from_B(B, f, beta,  key, n_samples = 10000):
     return phi
 
 @partial(jax.jit, static_argnames=['f'])
-def cov_from_B(B, f, beta,  key, n_samples = 10000):
+def cov_from_B(B, f, beta1, beta2,  key, n_samples = 10000):
     key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(key, 4)
 
     history_length = 250
@@ -133,11 +135,14 @@ def cov_from_B(B, f, beta,  key, n_samples = 10000):
     Q_history = jax.random.multivariate_normal(key_Q_hist, mean = jnp.zeros(len(B)), cov = B, shape=(n_samples, history_length))
     z_history = jax.random.normal(key_z_hist, (n_samples, history_length))
 
-    decay_vec = jnp.array([beta ** i for i in range(1, history_length + 1)])
-    history_average = (1 - beta) * jnp.einsum('abc,b->ac', f(Q_history)**2 * z_history[:,:,None]**2, decay_vec)
+    decay_vec2 = jnp.array([beta2**i for i in range(1, history_length + 1)])
+    decay_vec1 = jnp.array([beta1**i for i in range(1, history_length + 1)])
+    
+    history_average2 = (1 - beta2) * jnp.einsum('abc,b->ac', f(Q_history)**2 * z_history[:,:,None]**2, decay_vec2)
+    history_average1 = (1 - beta1) * jnp.einsum('abc,b->ac', f(Q_history) * z_history[:,:,None], decay_vec1)
 
     fq = f(Q).squeeze(axis=1)
-    vvv = (z * fq / jnp.sqrt(history_average + (1-beta) * z**2 * fq**2))
+    vvv = ((1-beta1)*z * fq + history_average1) / jnp.sqrt(history_average2 + (1-beta2) * z**2 * fq**2)
     op = jnp.einsum('ab,ac->abc', vvv, vvv)
 
     return jnp.mean(op, axis = 0)
