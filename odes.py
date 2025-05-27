@@ -108,7 +108,7 @@ class AdamODE(ODE):
                         
         return jnp.concatenate([p, u, q]), eigs, var_force
     
-    @jit
+    # @jit
     def update_odes(self, y, eigs, B, lr, subkey, extra, **kwargs):
         var_force = extra
         d = len(eigs)
@@ -116,10 +116,11 @@ class AdamODE(ODE):
         subkey_mean, subkey_cov = jax.random.split(subkey)
         beta2 = kwargs['beta2']
         beta1 = kwargs['beta1']
+        num_samples = kwargs['num_samples']
         
         m = len(B) // 2
-        phi = phi_from_B(B, self.f, beta1, beta2, subkey_mean)
-        sigma = cov_from_B(B, self.f, beta1, beta2, subkey_cov)
+        phi = phi_from_B(B, self.f, beta1, beta2, subkey_mean, num_samples = num_samples)
+        sigma = cov_from_B(B, self.f, beta1, beta2, subkey_cov, num_samples = num_samples)
         phi1, phi2 = phi[0:m], phi[m:]
         
         p_update = -2 * lr * eigs[:,None,None]  * (p * phi1 + u * phi2) + lr**2 * var_force[:,None,None] * sigma / d

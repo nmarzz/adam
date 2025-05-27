@@ -67,6 +67,7 @@ class AdamSDE(OptimizerSDE):
     
     @jit
     def update(self, params, optimal_params, B, lr, cov, dt, subkey, **kwargs):
+        beta1 = kwargs['beta1']
         beta2 = kwargs['beta2']
         covbar = kwargs['covbar']
         
@@ -74,14 +75,14 @@ class AdamSDE(OptimizerSDE):
         subkey_phi, subkey_cov, subkey_brownian = jax.random.split(subkey, 3)
         W = jax.random.normal(subkey_brownian, optimal_params.shape) * jnp.sqrt(dt)
         
-        phi = phi_from_B(B, self.f, beta2, subkey_phi)
+        phi = phi_from_B(B, self.f, beta1, beta2, subkey_phi)
                 
         if len(covbar.shape) == 1:
             mean =  covbar[:,None] * params * phi[0:m] + covbar[:,None] * optimal_params * phi[m:]
         else:
             mean =  covbar @ params * phi[0:m] + covbar @ optimal_params * phi[m:]
         
-        cov = cov_from_B(B, self.f, beta2,  subkey_cov)
+        cov = cov_from_B(B, self.f, beta1, beta2,  subkey_cov)
                 
         sqrtcov = jnp.linalg.cholesky(cov)
         params = params - lr * mean * dt + lr * W @ sqrtcov / jnp.sqrt(d)
