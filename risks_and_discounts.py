@@ -126,8 +126,9 @@ def f_real_phase_ret(q):
 def phi_from_B(B, f, beta1, beta2,  key, num_samples = 100000):
     key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(key, 4)
     Binv = jnp.linalg.inv(B)
-
-    history_length = 500
+    
+    history_length = 500    
+    
     Q = jax.random.multivariate_normal(key_Q, mean = jnp.zeros(len(B)), cov = B, shape=(num_samples, 1))
     z = jax.random.normal(key_z, (num_samples,1))
 
@@ -160,34 +161,72 @@ def phi_from_B(B, f, beta1, beta2,  key, num_samples = 100000):
 
 @partial(jax.jit, static_argnames=['f','num_samples'])
 def cov_from_B(B, f, beta1, beta2,  key, num_samples = 100000):
-    key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(key, 4)
+    key, subkey = jax.random.split(key)
+    key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(subkey, 4)
+            
+    history_length = 25
     
-    history_length = 500
     Q = jax.random.multivariate_normal(key_Q, mean = jnp.zeros(len(B)), cov = B, shape=(num_samples, 1))
     z = jax.random.normal(key_z, (num_samples,1))
 
     Q_history = jax.random.multivariate_normal(key_Q_hist, mean = jnp.zeros(len(B)), cov = B, shape=(num_samples, history_length))
     z_history = jax.random.normal(key_z_hist, (num_samples, history_length))
 
-    decay_vec1 = jnp.array([beta1**i for i in range(1, history_length + 1)])
-    decay_vec2 = jnp.array([beta2**i for i in range(1, history_length + 1)])
+    decay_vec1 = jnp.array([beta1**i for i in range(history_length)])* (1-beta1)
+    decay_vec2 = jnp.array([beta2**i for i in range(history_length)]) * (1-beta2)
 
     fq = f(Q).squeeze(axis=1)
     Q = Q.squeeze()
 
-    second_moment_history = jnp.einsum('abc,b->ac', f(Q_history)**2 * z_history[:,:,None]**2, decay_vec2)
-    second_moment_average = jnp.sqrt((1-beta2) * (second_moment_history + z**2 * fq**2))
+    current_grad = fq*z
+    current_grad2 = current_grad**2
 
-    first_moment_history = f(Q_history) * z_history[:,:,None]
-    first_moment_history = first_moment_history / second_moment_average[:,None,:]
+    second_moments = []
+    for l in range(history_length):
+        sample_grads = f(Q_history)**2 * z_history[:,:,None]**2
+        sample_grads = sample_grads.at[:,l,:].set(current_grad2)
+        second_moment_average = jnp.sqrt(jnp.einsum('abc,b->ac', sample_grads, decay_vec2))        
+        second_moments.append(second_moment_average)
+        
+    second_moments = jnp.array(second_moments)
 
-    current_avg = z * fq / second_moment_average
+    contributions = current_grad / jnp.array(second_moments)
+    update = jnp.einsum('abc,a->bc', contributions, decay_vec1) 
 
-    history_avg = jnp.einsum('abc,b->ac',first_moment_history, decay_vec1)
-
-    vvv = (1-beta1) * (current_avg + history_avg)
-    op = jnp.einsum('ab,ac->abc', vvv, vvv)
+    op = jnp.einsum('ab,ac->abc', update, update)
     return op.mean(axis=0)
+
+
+# @partial(jax.jit, static_argnames=['f','num_samples'])
+# def cov_from_B(B, f, beta1, beta2,  key, num_samples = 100000):
+#     key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(key, 4)
+    
+#     history_length = 500
+#     Q = jax.random.multivariate_normal(key_Q, mean = jnp.zeros(len(B)), cov = B, shape=(num_samples, 1))
+#     z = jax.random.normal(key_z, (num_samples,1))
+
+#     Q_history = jax.random.multivariate_normal(key_Q_hist, mean = jnp.zeros(len(B)), cov = B, shape=(num_samples, history_length))
+#     z_history = jax.random.normal(key_z_hist, (num_samples, history_length))
+
+#     decay_vec1 = jnp.array([beta1**i for i in range(1, history_length + 1)])
+#     decay_vec2 = jnp.array([beta2**i for i in range(1, history_length + 1)])
+
+#     fq = f(Q).squeeze(axis=1)
+#     Q = Q.squeeze()
+
+#     second_moment_history = jnp.einsum('abc,b->ac', f(Q_history)**2 * z_history[:,:,None]**2, decay_vec2)
+#     second_moment_average = jnp.sqrt((1-beta2) * (second_moment_history + z**2 * fq**2))
+
+#     first_moment_history = f(Q_history) * z_history[:,:,None]
+#     first_moment_history = first_moment_history / second_moment_average[:,None,:]
+
+#     current_avg = z * fq / second_moment_average
+
+#     history_avg = jnp.einsum('abc,b->ac',first_moment_history, decay_vec1)
+
+#     vvv = (1-beta1) * (current_avg + history_avg)
+#     op = jnp.einsum('ab,ac->abc', vvv, vvv)
+#     return op.mean(axis=0)
 
 
 @partial(jax.jit, static_argnames=['f'])

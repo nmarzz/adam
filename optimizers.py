@@ -91,6 +91,46 @@ import jax.numpy as jnp
 @jax.tree_util.register_pytree_node_class
 class ResampledAdam(Optimizer):
       
+    # @jit
+    # def update(self, params, lr, cov, optimal_params, key, state, beta1, beta2, eps = 0):
+         
+    #     history_length = 50
+    #     d_vec1 = jnp.array([beta1**i for i in range(0, history_length)]) * (1-beta1)
+    #     d_vec2 = jnp.array([beta2**i for i in range(0, history_length)]) * (1-beta2)
+
+    #     key, subkey = jax.random.split(key)
+    #     data = make_data(cov, subkey)
+    #     target = self.get_target(data, optimal_params)
+    #     current_grad = self.grad(params, data, target)
+
+
+    #     gradients = []
+    #     for _ in range(history_length):
+    #         key, subkey = jax.random.split(key)
+    #         data = make_data(cov, subkey)
+    #         target = self.get_target(data, optimal_params)
+
+    #         gradient = self.grad(params, data, target)
+    #         gradients.append(gradient)
+    #     gradients = jnp.array(gradients)
+        
+    #     second_mnts = []
+    #     for l in range(history_length):
+    #         temp_grads = gradients.copy()
+    #         temp_grads = temp_grads.at[l,:,:].set(current_grad)
+    #         gradients2 = temp_grads**2
+            
+    #         second_mnt = jnp.sqrt(jnp.einsum('i,ijk->jk', d_vec2, gradients2))
+    #         second_mnts.append(second_mnt)
+                        
+    #     second_mnts = jnp.array(second_mnts)    
+
+    #     update = jnp.einsum('i,ijk->jk', d_vec1, (current_grad / second_mnts))
+
+    #     params = params - lr * update
+        
+    #     return params, key, state
+    
     @jit
     def update(self, params, lr, cov, optimal_params, key, state, beta1, beta2, eps = 0):
          
@@ -128,35 +168,6 @@ class ResampledAdam(Optimizer):
         
         return params, key, state
     
-    # @jit
-    # def update(self, params, lr, cov, optimal_params, key, state, beta1, beta2, eps = 0):
-         
-    #     history_length = 100
-    #     d_vec1 = jnp.array([beta1**i for i in range(0, history_length)]) * (1-beta1)
-    #     d_vec2 = jnp.array([beta2**i for i in range(0, history_length)]) * (1-beta2)
-
-    #     gradients = []
-    #     for _ in range(history_length):
-    #         key, subkey = jax.random.split(key)
-    #         data = make_data(cov, subkey)
-    #         target = self.get_target(data, optimal_params)
-
-    #         gradient = self.grad(params, data, target)
-    #         gradients.append(gradient)
-    #     gradients = jnp.array(gradients)
-        
-    #     m = jnp.einsum('a,abc->bc', d_vec1, gradients)
-    #     v = jnp.einsum('a,abc->bc', d_vec2, gradients**2)
-                
-    #     m_hat = m  # Bias-corrected first moment
-    #     v_hat = v  # Bias-corrected second moment
-
-    #     params = params - lr * m_hat / jnp.sqrt(v_hat + eps)
-        
-    #     return params, key, state
-    
-
-
 
 
 
