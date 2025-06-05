@@ -125,7 +125,7 @@ def f_real_phase_ret(q):
 @partial(jax.jit, static_argnames=['f','num_samples'])
 def phi_from_B(B, f, beta1, beta2,  key, num_samples = 100000):
     key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(key, 4)
-    Binv = jnp.linalg.inv(B)
+    Binv = jnp.linalg.pinv(B, hermitian=True)
     
     history_length = 500    
     
@@ -164,7 +164,7 @@ def cov_from_B(B, f, beta1, beta2,  key, num_samples = 100000):
     key, subkey = jax.random.split(key)
     key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(subkey, 4)
             
-    history_length = 25
+    history_length = 100
     
     Q = jax.random.multivariate_normal(key_Q, mean = jnp.zeros(len(B)), cov = B, shape=(num_samples, 1))
     z = jax.random.normal(key_z, (num_samples,1))
