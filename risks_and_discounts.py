@@ -123,7 +123,7 @@ def f_real_phase_ret(q):
 #     return phi
 
 @partial(jax.jit, static_argnames=['f','num_samples'])
-def phi_from_B(B, f, beta1, beta2,  key, num_samples = 100000):
+def phi_from_B(B, f, beta1, beta2, key, num_samples = 100000):
     key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(key, 4)
     Binv = jnp.linalg.pinv(B, hermitian=True)
     
@@ -135,8 +135,8 @@ def phi_from_B(B, f, beta1, beta2,  key, num_samples = 100000):
     Q_history = jax.random.multivariate_normal(key_Q_hist, mean = jnp.zeros(len(B)), cov = B, shape=(num_samples, history_length))
     z_history = jax.random.normal(key_z_hist, (num_samples, history_length))
 
-    decay_vec2 = jnp.array([beta2**i for i in range(1, history_length + 1)])
-    decay_vec1 = jnp.array([beta1**i for i in range(1, history_length + 1)])
+    decay_vec1 = jnp.power(beta1, jnp.arange(1, history_length + 1))
+    decay_vec2 = jnp.power(beta2, jnp.arange(1, history_length + 1))
 
     fq = f(Q).squeeze(axis=1)
     Q = Q.squeeze()
@@ -160,7 +160,7 @@ def phi_from_B(B, f, beta1, beta2,  key, num_samples = 100000):
 
 
 @partial(jax.jit, static_argnames=['f','num_samples'])
-def cov_from_B(B, f, beta1, beta2,  key, num_samples = 100000):
+def cov_from_B(B, f, beta1, beta2, key, num_samples = 100000):
     key, subkey = jax.random.split(key)
     key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(subkey, 4)
             
@@ -172,8 +172,8 @@ def cov_from_B(B, f, beta1, beta2,  key, num_samples = 100000):
     Q_history = jax.random.multivariate_normal(key_Q_hist, mean = jnp.zeros(len(B)), cov = B, shape=(num_samples, history_length))
     z_history = jax.random.normal(key_z_hist, (num_samples, history_length))
 
-    decay_vec1 = jnp.array([beta1**i for i in range(history_length)])* (1-beta1)
-    decay_vec2 = jnp.array([beta2**i for i in range(history_length)]) * (1-beta2)
+    decay_vec1 = jnp.power(beta1, jnp.arange(1, history_length + 1))
+    decay_vec2 = jnp.power(beta2, jnp.arange(1, history_length + 1))
 
     fq = f(Q).squeeze(axis=1)
     Q = Q.squeeze()
