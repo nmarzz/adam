@@ -66,7 +66,7 @@ class Adam(Optimizer):
         return (jnp.zeros((d,num_classes)), jnp.zeros((d,num_classes)))
         
     @jit
-    def update(self, params, lr, cov, optimal_params, key, state, beta1, beta2, eps = 0):
+    def update(self, params, lr, cov, optimal_params, key, state, beta1, beta2, eps):
         # print(f'I am beta1 in adam: {beta1}')
         m, v = state
         key, subkey = jax.random.split(key)
@@ -85,52 +85,10 @@ class Adam(Optimizer):
         return params, key, (m, v)
     
     
-import jax
-import jax.numpy as jnp
 
 @jax.tree_util.register_pytree_node_class
 class ResampledAdam(Optimizer):
-      
-    # @jit
-    # def update(self, params, lr, cov, optimal_params, key, state, beta1, beta2, eps = 0):
-         
-    #     history_length = 50
-    #     d_vec1 = jnp.array([beta1**i for i in range(0, history_length)]) * (1-beta1)
-    #     d_vec2 = jnp.array([beta2**i for i in range(0, history_length)]) * (1-beta2)
-
-    #     key, subkey = jax.random.split(key)
-    #     data = make_data(cov, subkey)
-    #     target = self.get_target(data, optimal_params)
-    #     current_grad = self.grad(params, data, target)
-
-
-    #     gradients = []
-    #     for _ in range(history_length):
-    #         key, subkey = jax.random.split(key)
-    #         data = make_data(cov, subkey)
-    #         target = self.get_target(data, optimal_params)
-
-    #         gradient = self.grad(params, data, target)
-    #         gradients.append(gradient)
-    #     gradients = jnp.array(gradients)
-        
-    #     second_mnts = []
-    #     for l in range(history_length):
-    #         temp_grads = gradients.copy()
-    #         temp_grads = temp_grads.at[l,:,:].set(current_grad)
-    #         gradients2 = temp_grads**2
-            
-    #         second_mnt = jnp.sqrt(jnp.einsum('i,ijk->jk', d_vec2, gradients2))
-    #         second_mnts.append(second_mnt)
-                        
-    #     second_mnts = jnp.array(second_mnts)    
-
-    #     update = jnp.einsum('i,ijk->jk', d_vec1, (current_grad / second_mnts))
-
-    #     params = params - lr * update
-        
-    #     return params, key, state
-    
+          
     @jit
     def update(self, params, lr, cov, optimal_params, key, state, beta1, beta2, eps = 0):
          
@@ -144,6 +102,7 @@ class ResampledAdam(Optimizer):
         current_grad = self.grad(params, data, target)
 
 
+        # TODO: make this more efficient, 'tis very bad
         second_mnts = []
         for l in range(history_length):
             gradients = []
@@ -168,8 +127,6 @@ class ResampledAdam(Optimizer):
         
         return params, key, state
     
-
-
 
 
 @jax.tree_util.register_pytree_node_class

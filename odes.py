@@ -116,11 +116,12 @@ class AdamODE(ODE):
         subkey_mean, subkey_cov = jax.random.split(subkey)
         beta2 = kwargs['beta2']
         beta1 = kwargs['beta1']
+        eps = kwargs['eps']
         num_samples = kwargs['num_samples']
         
         m = len(B) // 2
-        phi = phi_from_B(B, self.f, beta1, beta2, subkey_mean, num_samples = num_samples)
-        sigma = cov_from_B(B, self.f, beta1, beta2, subkey_cov, num_samples = num_samples)
+        phi = phi_from_B(B, self.f, beta1, beta2, eps, subkey_mean, num_samples = num_samples)
+        sigma = cov_from_B(B, self.f, beta1, beta2, eps, subkey_cov, num_samples = num_samples)
         phi1, phi2 = phi[0:m], phi[m:]
         
         p_update = -2 * lr * eigs[:,None,None]  * (p * phi1 + u * phi2) + lr**2 * var_force[:,None,None] * sigma / d
