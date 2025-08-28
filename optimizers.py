@@ -1,10 +1,11 @@
 from tqdm import tqdm
 from utils import make_data, make_B
 from risks_and_discounts import *
+from functools import partial
     
 class Optimizer:
     def __init__(self, problem, key=None):
-        self.problem = problem
+        self.problem = problem        
         self.key = key if key is not None else jax.random.PRNGKey(np.random.randint(0, 10000))        
         
         if problem == 'linreg':
@@ -27,7 +28,7 @@ class Optimizer:
                                         
     def update(self):
         pass
-
+        
     def run(self, params, cov, T, lr_fun, optimal_params, **kwargs):
         risks = []        
         d, num_classes = params.shape
@@ -84,7 +85,80 @@ class Adam(Optimizer):
         
         return params, key, (m, v)
     
-    
+@jax.tree_util.register_pytree_node_class
+class BlockAdam(Optimizer):        
+    def init_state(self, d, num_classes):        
+        # returns m0, v0, last_block_params, step_count = 0 
+        return (jnp.zeros((d,num_classes)), jnp.zeros((d,num_classes)), jnp.zeros((d,num_classes)), 0)
+            
+    # @jit
+    # def update(self, params, lr, cov, optimal_params, key, state, beta1, beta2, eps):
+    #     M = 100
+    #     m, v, last_block_params, step = state        
+        
+    #     if step == 1:
+    #         last_block_params = params
+            
+    #     key, subkey = jax.random.split(key)
+    #     data = make_data(cov, subkey)
+    #     target = self.get_target(data, optimal_params)
+
+                
+    #     gradient = self.grad(last_block_params, data, target)
+    #     not_equal_block = (step % M != 0)
+
+    #     m = beta1 * m * not_equal_block + (1 - beta1) * gradient
+    #     v = beta2 * v * not_equal_block + (1 - beta2) * gradient**2
+
+    #     m_hat = m  # Bias-corrected first moment
+    #     v_hat = v  # Bias-corrected second moment
+
+    #     params = params - lr * m_hat / jnp.sqrt(v_hat + eps)
+                
+    #     if step % M == 0:
+    #         last_block_params = params
+
+    #     return params, key, (m, v, last_block_params)
+
+
+    @partial(jax.jit, static_argnums=0)
+    def update(self, params, lr, cov, optimal_params, key, state, beta1, beta2, eps):
+        M = 40
+        m, v, last_block_params, step = state
+
+        key, subkey = jax.random.split(key)
+        data = make_data(cov, subkey)
+        target = self.get_target(data, optimal_params)
+
+        # Pre-grad reset at very first step
+        pre_reset = (step == 1)
+        last_block_params = jax.tree.map(
+            lambda p, lbp: jnp.where(pre_reset, p, lbp), params, last_block_params
+        )
+
+        g = self.grad(last_block_params, data, target)
+
+        in_block = (step % M != 0)
+        m = jax.tree.map(
+            lambda m_, g_: jnp.where(in_block, beta1*m_ + (1-beta1)*g_, (1-beta1)*g_), m, g
+        )
+        v = jax.tree.map(
+            lambda v_, g_: jnp.where(in_block, beta2*v_ + (1-beta2)*(g_**2), (1-beta2)*(g_**2)), v, g
+        )
+
+        params = jax.tree.map(
+            lambda p, mh, vh: p - lr * mh / jnp.sqrt(vh + eps), params, m, v
+        )
+
+        # End-of-block reset
+        post_reset = (step % M == 0)
+        last_block_params = jax.tree.map(
+            lambda p, lbp: jnp.where(post_reset, p, lbp), params, last_block_params
+        )
+
+        step = step + 1
+        return params, key, (m, v, last_block_params, step)
+
 
 @jax.tree_util.register_pytree_node_class
 class ResampledAdam(Optimizer):

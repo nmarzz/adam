@@ -94,18 +94,22 @@ class AdamODE(ODE):
             p = jnp.array([jnp.outer(params[j,:], params[j,:]) * cov[j] for j in range(d)])
             u = jnp.array([jnp.outer(params[j,:], optimal_params[j,:]) * cov[j] for j in range(d)])
             q = jnp.array([jnp.outer(optimal_params[j,:], optimal_params[j,:]) * cov[j] for j in range(d)])
-
-        else:            
+            self.cov_fun = cov_from_B
+            self.tensor_cov = False
+        else:
             covbar = cov / jnp.sqrt(jnp.diag(cov))
             eigs, L = jnp.linalg.eig(covbar)
             R = jnp.linalg.inv(L).T
             eigs, L, R = jnp.real(eigs), jnp.real(L), jnp.real(R)
         
-            var_force = jnp.array([jnp.inner(R[:, j], cov @ L[:, j]) for j in range(d)])
+            var_force = jnp.array([cov @ jnp.outer(L[:, j],R[:, j]) for j in range(d)])
             p = jnp.array([params.T @ jnp.outer(cov @ L[:, j], R[:, j]) @ params for j in range(d)])
             u = jnp.array([params.T @ jnp.outer(cov @ L[:, j], R[:, j]) @ optimal_params for j in range(d)])            
             q = jnp.array([optimal_params.T @ jnp.outer(cov @ L[:, j], R[:, j]) @ optimal_params for j in range(d)])
-                        
+            self.cov_fun = cov_tensor
+            self.tensor_cov = True
+            self.cov = cov
+            
         return jnp.concatenate([p, u, q]), eigs, var_force
     
     # @jit
@@ -121,10 +125,16 @@ class AdamODE(ODE):
         
         m = len(B) // 2
         phi = phi_from_B(B, self.f, beta1, beta2, eps, subkey_mean, num_samples = num_samples)
-        sigma = cov_from_B(B, self.f, beta1, beta2, eps, subkey_cov, num_samples = num_samples)
         phi1, phi2 = phi[0:m], phi[m:]
         
-        p_update = -2 * lr * eigs[:,None,None]  * (p * phi1 + u * phi2) + lr**2 * var_force[:,None,None] * sigma / d
+        if self.tensor_cov:
+            sigma = self.cov_fun(self.cov, B, self.f, beta1, beta2, eps, subkey_cov, num_samples = num_samples)
+            forcing = jnp.einsum('abc, bcde->ade', var_force, sigma)
+            p_update = -2 * lr * eigs[:,None,None]  * (p * phi1 + u * phi2) + lr**2 * forcing / d
+        else:
+            sigma = self.cov_fun(B, self.f, beta1, beta2, eps, subkey_cov, num_samples = num_samples)
+            p_update = -2 * lr * eigs[:,None,None]  * (p * phi1 + u * phi2) + lr**2 * var_force[:,None,None] * sigma / d
+        
         u_update = -lr * eigs[:,None,None] * (phi1 * u + phi2 * q)
                 
         return jnp.concatenate([p_update, u_update, jnp.zeros(u_update.shape)])
