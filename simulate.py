@@ -120,6 +120,47 @@ def build_block_sgd(problem, cov, optimal_params, lr, *, N=None) -> Sim:
     return Sim(init, step)
 
 
+def build_sgd_momentum(problem, cov, optimal_params, lr, *, beta1) -> Sim:
+    def init(params):
+        return (jnp.zeros_like(params),)  # m
+
+    def step(params, state, key, k):
+        (m,) = state
+        g = _sample_grad(problem, cov, optimal_params, params, key)
+        m = beta1 * m + (1 - beta1) * g
+        params = params - _lr_at(lr, k) * m
+        return params, (m,)
+
+    return Sim(init, step)
+
+
+def build_block_sgd_momentum(problem, cov, optimal_params, lr, *, beta1, N=None) -> Sim:
+    """Block SGD with momentum: ``build_block_adam`` without the second moment ``v``.
+
+    Same block structure as :func:`build_block_adam` (eq. block_adam): ``m`` resets
+    and the gradient reference snapshots at every block boundary ``k % N == 0``,
+    and within a block all gradients are evaluated at the frozen reference
+    ``theta_{floor(k/N) N}``.
+    """
+    d = optimal_params.shape[0]
+    block = int(N) if N is not None else max(1, round(math.sqrt(d)))
+
+    def init(params):
+        return (jnp.zeros_like(params), params)  # m, ref
+
+    def step(params, state, key, k):
+        m, ref = state
+        at_start = (k % block) == 0
+        ref = jnp.where(at_start, params, ref)
+        keep = jnp.where(at_start, 0.0, 1.0)
+        g = _sample_grad(problem, cov, optimal_params, ref, key)
+        m = beta1 * m * keep + (1 - beta1) * g
+        params = params - _lr_at(lr, k) * m
+        return params, (m, ref)
+
+    return Sim(init, step)
+
+
 def build_resampled_adam(problem, cov, optimal_params, lr, *, beta1, beta2,
                          eps=0.0, history_length=15) -> Sim:
     """Resampled Adam: at each step the moment estimates are built from
