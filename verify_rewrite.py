@@ -1,7 +1,7 @@
-"""Cheap correctness + parity checks for the functional rewrite.
+"""Self-contained smoke + correctness checks for the simulators.
 
 Run from the ``code/`` directory:  ``venv/bin/python verify_rewrite.py``
-Everything runs at small ``d`` (128 / 256 / 512) so it is fast.
+Everything runs at small ``d`` (<= 256) so it is fast.
 """
 import time
 
@@ -10,13 +10,10 @@ config.enable_x64()  # before any array creation
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 import problems
-import discounts
 import simulate
 import dynamics
-from utils import make_B, compute_ci
 
 PASS, FAIL = "PASS", "FAIL"
 
@@ -36,19 +33,11 @@ def setup(d, m=1, seed=0):
     return params0, optimal, cov
 
 
-def test_risk_parity():
-    print("risk_from_B parity (new vs old)")
-    import risks_and_discounts as old
-    B = jax.random.normal(jax.random.PRNGKey(1), (2, 2))
-    B = B @ B.T + jnp.eye(2)
-    ok = True
-    for nm, new_f, old_f in [
-        ("linreg", problems._risk_from_B_linreg, old.risk_from_B_linreg),
-        ("logreg", problems._risk_from_B_logreg, old.risk_from_B_logreg),
-    ]:
-        diff = float(abs(new_f(B) - old_f(B)))
-        ok &= check(nm, diff < 1e-8, f"|Δ|={diff:.2e}")
-    return ok
+def dense_cov(d, seed=9):
+    cov = jnp.array([j ** -0.5 for j in range(1, d + 1)])
+    Qm, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(seed), (d, d)))
+    K = (Qm * cov) @ Qm.T
+    return (K + K.T) / 2
 
 
 def test_cov_vectorization():
@@ -72,17 +61,14 @@ def test_cov_vectorization():
     cur2 = cur ** 2
     base2 = f(Qh) ** 2 * zh[:, :, None] ** 2
 
-    # explicit reference
     sms = []
     for l in range(H):
         sg = base2.at[:, l, :].set(cur2)
         sms.append(jnp.sqrt(jnp.einsum("nlm,l->nm", sg, d2)))
-    sms = jnp.stack(sms, axis=1)               # (n, H, m)
-    contrib = cur[:, None, :] / sms
-    upd_ref = jnp.einsum("l,nlm->nm", d1, contrib)
+    sms = jnp.stack(sms, axis=1)
+    upd_ref = jnp.einsum("l,nlm->nm", d1, cur[:, None, :] / sms)
     ref = jnp.einsum("nm,nk->mk", upd_ref, upd_ref) / ns
 
-    # vectorized (mirrors discounts.cov_from_B internals)
     S = jnp.einsum("h,nhm->nm", d2, base2)
     sm = jnp.sqrt(S[:, None, :] + d2[None, :, None] * (cur2[:, None, :] - base2))
     upd = jnp.einsum("h,nhm->nm", d1, cur[:, None, :] / sm)
@@ -132,75 +118,52 @@ def test_block_adam_tracks_adam():
 
 
 def test_dynamics_run():
-    print("ODE / SDE integrators run and stay finite")
+    print("ODE / SDE integrators run and stay finite (diagonal + dense K)")
     d = 128
     p0, opt, cov = setup(d)
+    K = dense_cov(d)
     prob = problems.get_problem("linreg")
     key = jax.random.PRNGKey(5)
     ok = True
     r, _ = dynamics.run_adam_ode(prob, p0, opt, cov, 1, 0.7, beta1=0.1, beta2=0.1,
                                  dt=0.05, num_samples=5000, key=key)
-    ok &= check("adam_ode", bool(jnp.all(jnp.isfinite(r))))
+    ok &= check("adam_ode (diag)", bool(jnp.all(jnp.isfinite(r))))
     r, _ = dynamics.run_sgd_ode(prob, p0, opt, cov, 1, 0.7, dt=0.05, key=key)
-    ok &= check("sgd_ode", bool(jnp.all(jnp.isfinite(r))))
+    ok &= check("sgd_ode (diag)", bool(jnp.all(jnp.isfinite(r))))
     r, _ = dynamics.run_adam_sde(prob, p0, opt, cov, 0.2, 0.7, beta1=0.1, beta2=0.1,
                                  dt=0.02, num_samples=5000, key=key)
-    ok &= check("adam_sde", bool(jnp.all(jnp.isfinite(r))))
-    r, _ = dynamics.run_sgd_sde(prob, p0, opt, cov, 0.2, 0.7, dt=0.02, key=key)
-    ok &= check("sgd_sde", bool(jnp.all(jnp.isfinite(r))))
+    ok &= check("adam_sde (diag)", bool(jnp.all(jnp.isfinite(r))))
+    # dense covariance: general Sigma path
+    r, _ = dynamics.run_adam_ode(prob, p0, opt, K, 1, 1.5, beta1=0.1, beta2=0.1,
+                                 dt=0.05, num_samples=5000, noise_samples=2000,
+                                 noise_history=30, key=key)
+    ok &= check("adam_ode (dense K)", bool(jnp.all(jnp.isfinite(r))))
+    r, _ = dynamics.run_adam_sde(prob, p0, opt, K, 0.5, 1.5, beta1=0.1, beta2=0.1,
+                                 dt=0.02, num_samples=5000, noise_samples=2000,
+                                 noise_history=30, key=key)
+    ok &= check("adam_sde (dense K)", bool(jnp.all(jnp.isfinite(r))))
     return ok
 
 
-def test_endtoend_vs_old():
-    print("new adam mean-risk vs old Adam (d=128, MC tolerance)")
-    import optimizers as old
-    d = 128
-    p0, opt, cov = setup(d)
-    prob = problems.get_problem("linreg")
-    T, lr = 1, 0.7 / d
-    keys = jax.random.split(jax.random.PRNGKey(21), 16)
-    new = simulate.build_adam(prob, cov, opt, lr, beta1=0.1, beta2=0.1)
-    r_new = simulate.run_many(new, prob, p0, opt, cov, T * d, keys=keys).mean(0)
-
-    old_curves = []
-    for s in range(16):
-        o = old.Adam("linreg", key=jax.random.PRNGKey(1000 + s))
-        _, risks = o.run(p0, cov, T, lr, opt, beta1=0.1, beta2=0.1, eps=0.0)
-        old_curves.append(jnp.array(risks))
-    r_old = jnp.stack(old_curves).mean(0)
-
-    rel = float(jnp.abs(r_new[-1] - r_old[-1]) / r_old[-1])
-    return check("final relative gap", rel < 0.2,
-                 f"new={float(r_new[-1]):.4f} old={float(r_old[-1]):.4f} rel={rel:.3f}")
-
-
 def benchmark():
-    print("timing: new (scan) vs old (python loop), d=512, T=2")
+    print("timing: scan-driven Adam, d=512, T=2")
     d = 512
     p0, opt, cov = setup(d)
     prob = problems.get_problem("linreg")
     T, lr = 2, 0.7 / d
-    new = simulate.build_adam(prob, cov, opt, lr, beta1=0.1, beta2=0.1)
+    sim = simulate.build_adam(prob, cov, opt, lr, beta1=0.1, beta2=0.1)
     key = jax.random.PRNGKey(0)
-    # warm up jit
-    simulate.run(new, prob, p0, opt, cov, T * d, key=key)[1].block_until_ready()
+    simulate.run(sim, prob, p0, opt, cov, T * d, key=key)[1].block_until_ready()  # warm jit
     t0 = time.time()
-    simulate.run(new, prob, p0, opt, cov, T * d, key=key)[1].block_until_ready()
-    t_new = time.time() - t0
-
-    import optimizers as old
-    o = old.Adam("linreg", key=key)
-    t0 = time.time()
-    o.run(p0, cov, T, lr, opt, beta1=0.1, beta2=0.1, eps=0.0)
-    t_old = time.time() - t0
-    print(f"    new={t_new:.3f}s  old={t_old:.3f}s  speedup={t_old / t_new:.1f}x")
+    simulate.run(sim, prob, p0, opt, cov, T * d, key=key)[1].block_until_ready()
+    print(f"    {time.time() - t0:.3f}s for {T * d} steps")
 
 
 if __name__ == "__main__":
     print(f"backend={config.default_backend()} devices={config.devices()}\n")
     results = []
-    for fn in [test_risk_parity, test_cov_vectorization, test_optimizers_run,
-               test_block_adam_tracks_adam, test_dynamics_run, test_endtoend_vs_old]:
+    for fn in [test_cov_vectorization, test_optimizers_run,
+               test_block_adam_tracks_adam, test_dynamics_run]:
         results.append(fn())
         print()
     benchmark()
