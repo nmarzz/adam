@@ -3,10 +3,11 @@ from utils import make_data, make_B
 from risks_and_discounts import *
     
 class Optimizer:
-    def __init__(self, problem, key=None):
+    def __init__(self, problem, key=None, **kwargs):
         self.problem = problem
-        self.key = key if key is not None else jax.random.PRNGKey(np.random.randint(0, 10000))        
-        
+        self.key = key if key is not None else jax.random.PRNGKey(np.random.randint(0, 10000))
+        self.kwargs = kwargs
+
         if problem == 'linreg':
             self.grad = grad_linreg
             self.get_target = linreg_target
@@ -47,17 +48,15 @@ class Optimizer:
         return params, risks
 
     def tree_flatten(self):
-        """Flatten the PyTree into a tuple of arrays and auxiliary data."""
-        leaves = (self.key)
-        aux_data = (self.problem)
+        leaves = (self.key,)
+        aux_data = (self.problem, self.kwargs)
         return leaves, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, leaves):
-        """Reconstruct the PyTree from its flattened representation."""
-        key = leaves
-        problem = aux_data
-        return cls(problem, key=key)
+        problem, kwargs = aux_data
+        key, = leaves
+        return cls(problem, key=key, **kwargs)
     
     
 @jax.tree_util.register_pytree_node_class
@@ -183,5 +182,32 @@ class SGD(Optimizer):
 
         gradient = self.grad(params, data, target)       
         params = params - lr * gradient
+        
+        return params, key, state
+
+@jax.tree_util.register_pytree_node_class
+class MBlockSGD(Optimizer):   
+    def __init__(self, problem, key=None, **kwargs):
+        super().__init__(problem, key, **kwargs)
+        self.update_params = None
+        self.iter = 0
+    @jit
+    def update(self, params, lr, cov, optimal_params, key, state):
+                
+        if self.update_params is None:
+            self.update_params = params.copy()
+            self.iter = 0
+            print(self.kwargs)
+        self.iter += 1
+           
+        key, subkey = jax.random.split(key)
+        data = make_data(cov, subkey)        
+        target = self.get_target(data, optimal_params)
+
+        gradient = self.grad(self.update_params, data, target)       
+        params = params - lr * gradient
+        
+        if self.iter % self.kwargs['M'] == 0:
+            self.update_params = params.copy()            
         
         return params, key, state

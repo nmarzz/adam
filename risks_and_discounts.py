@@ -1,3 +1,13 @@
+"""
+TODO:
+
+    - Rewrite the phi and cov functions
+    - Consider splitting the target functions into separate files
+
+
+"""
+
+
 import jax
 import numpy as np
 from numpy.polynomial.hermite import hermgauss
@@ -158,7 +168,7 @@ def phi_from_B(B, f, beta1, beta2,  key, num_samples = 100000):
     phi = (1-beta1) * (current_avg + history_avg)
     return phi
 
-
+# This function is applicable when the covariance matrix is diagonal
 @partial(jax.jit, static_argnames=['f','num_samples'])
 def cov_from_B(B, f, beta1, beta2,  key, num_samples = 100000):
     key, subkey = jax.random.split(key)
