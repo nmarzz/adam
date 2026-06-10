@@ -161,32 +161,6 @@ def build_block_sgd_momentum(problem, cov, optimal_params, lr, *, beta1, N=None)
     return Sim(init, step)
 
 
-def build_resampled_sgd_momentum(problem, cov, optimal_params, lr, *, beta1,
-                                 history_length=15) -> Sim:
-    """Resampled SGD+momentum: ``build_resampled_adam`` without the second moment.
-
-    At each step ``m`` is built from ``history_length`` freshly-resampled gradients
-    at the current ``params`` (decay-weighted), instead of carrying a recursive
-    momentum buffer.
-    """
-    H = history_length
-    decay1 = beta1 ** jnp.arange(H) * (1 - beta1)
-
-    def init(params):
-        return ()
-
-    def step(params, state, key, k):
-        keys = jax.random.split(key, H)
-        grads = jax.vmap(
-            lambda kk: _sample_grad(problem, cov, optimal_params, params, kk)
-        )(keys)                                         # (H, d, m)
-        m = jnp.einsum("i,idm->dm", decay1, grads)
-        params = params - _lr_at(lr, k) * m
-        return params, ()
-
-    return Sim(init, step)
-
-
 def build_resampled_adam(problem, cov, optimal_params, lr, *, beta1, beta2,
                          eps=0.0, history_length=15) -> Sim:
     """Resampled Adam: at each step the moment estimates are built from
