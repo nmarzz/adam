@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import problems
 import simulate
 import dynamics
+from discounts import sigma0_diag
 
 PASS, FAIL = "PASS", "FAIL"
 
@@ -40,42 +41,16 @@ def dense_cov(d, seed=9):
     return (K + K.T) / 2
 
 
-def test_cov_vectorization():
-    """The einsum identity in cov_from_B must equal an explicit per-l loop."""
-    print("cov_from_B vectorization == explicit loop")
-    key = jax.random.PRNGKey(3)
-    f = problems._f_linreg
+def test_sigma0_diagonal():
+    """The corrected diagonal estimator is finite, symmetric, and PSD."""
+    print("corrected Sigma_0 diagonal estimator")
     B = jnp.array([[2.0, 0.7], [0.7, 1.5]])
-    beta1, beta2 = 0.3, 0.4
-    H, ns = 8, 4000
-
-    kQ, kQh, kz, kzh = jax.random.split(key, 4)
-    Q = jax.random.multivariate_normal(kQ, jnp.zeros(2), B, shape=(ns, 1))
-    z = jax.random.normal(kz, (ns, 1))
-    Qh = jax.random.multivariate_normal(kQh, jnp.zeros(2), B, shape=(ns, H))
-    zh = jax.random.normal(kzh, (ns, H))
-    d1 = beta1 ** jnp.arange(H) * (1 - beta1)
-    d2 = beta2 ** jnp.arange(H) * (1 - beta2)
-    fq = f(Q).squeeze(1)
-    cur = fq * z
-    cur2 = cur ** 2
-    base2 = f(Qh) ** 2 * zh[:, :, None] ** 2
-
-    sms = []
-    for l in range(H):
-        sg = base2.at[:, l, :].set(cur2)
-        sms.append(jnp.sqrt(jnp.einsum("nlm,l->nm", sg, d2)))
-    sms = jnp.stack(sms, axis=1)
-    upd_ref = jnp.einsum("l,nlm->nm", d1, cur[:, None, :] / sms)
-    ref = jnp.einsum("nm,nk->mk", upd_ref, upd_ref) / ns
-
-    S = jnp.einsum("h,nhm->nm", d2, base2)
-    sm = jnp.sqrt(S[:, None, :] + d2[None, :, None] * (cur2[:, None, :] - base2))
-    upd = jnp.einsum("h,nhm->nm", d1, cur[:, None, :] / sm)
-    vec = jnp.einsum("nm,nk->mk", upd, upd) / ns
-
-    diff = float(jnp.max(jnp.abs(ref - vec)))
-    return check("max|Δ|", diff < 1e-9, f"={diff:.2e}")
+    samples = sigma0_diag(B, problems._f_linreg, 0.3, 0.4, jax.random.PRNGKey(3),
+                           num_samples=2000, history_length=8, eps=1e-3)
+    sigma = samples.T @ samples / samples.shape[0]
+    eigs = jnp.linalg.eigvalsh((sigma + sigma.T) / 2)
+    return check("finite PSD Sigma_0", bool(jnp.all(jnp.isfinite(sigma))) and
+                 bool(jnp.min(eigs) >= -1e-10), f"min_eig={float(jnp.min(eigs)):.2e}")
 
 
 def test_optimizers_run():
@@ -162,7 +137,7 @@ def benchmark():
 if __name__ == "__main__":
     print(f"backend={config.default_backend()} devices={config.devices()}\n")
     results = []
-    for fn in [test_cov_vectorization, test_optimizers_run,
+    for fn in [test_sigma0_diagonal, test_optimizers_run,
                test_block_adam_tracks_adam, test_dynamics_run]:
         results.append(fn())
         print()

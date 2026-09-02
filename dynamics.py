@@ -84,7 +84,8 @@ def _init_adam_ode(cov, params, optimal_params):
         eigs, L, R = _real_eig(covbar)
         A = cov @ L                         # = K L
         p, u, q = _modes(A, R, params, optimal_params)
-        diff_data = ("dense", A, R, jnp.linalg.cholesky(cov))
+        corr = cov / jnp.sqrt(jnp.diag(cov))[:, None]
+        diff_data = ("dense", A, R, jnp.linalg.cholesky(corr))
     return jnp.concatenate([p, u, q]), eigs, diff_data
 
 
@@ -122,7 +123,8 @@ def run_adam_ode(problem: Problem, params, optimal_params, cov, T, lr, *,
         risk = problem.risk_from_B(B)
         m = len(B) // 2
         key, k_phi, k_cov = jax.random.split(key, 3)
-        phi = phi_from_B(B, problem.f, beta1, beta2, k_phi, num_samples=num_samples)
+        phi = phi_from_B(B, problem.f, beta1, beta2, k_phi,
+                 num_samples=num_samples, eps=eps)
         phi1, phi2 = phi[:m], phi[m:]
         p, u, q = y[:d], y[d:2 * d], y[2 * d:]
         lr_t = _lr_at(lr, i * dt)
@@ -130,7 +132,8 @@ def run_adam_ode(problem: Problem, params, optimal_params, cov, T, lr, *,
 
         if diagonal:
             var_force = diff_data[1]
-            sigma = cov_from_B(B, problem.f, beta1, beta2, k_cov, num_samples=num_samples)
+            sigma = cov_from_B(B, problem.f, beta1, beta2, k_cov,
+                               num_samples=num_samples, eps=eps)
             diffusion = var_force[:, None, None] * sigma            # (D, M, M)
         else:
             _, KL, R, cov_chol = diff_data
@@ -190,7 +193,9 @@ def run_adam_sde(problem: Problem, params, optimal_params, cov, T, lr, *,
     """
     diagonal = cov.ndim == 1
     covbar = cov / jnp.sqrt(cov) if diagonal else cov / jnp.sqrt(jnp.diag(cov))[:, None]
-    cov_chol = jnp.sqrt(cov) if diagonal else jnp.linalg.cholesky(cov)
+    corr_chol = jnp.ones(1) if diagonal else jnp.linalg.cholesky(
+        cov / jnp.sqrt(jnp.diag(cov))[:, None]
+    )
     d, m = params.shape
     iters = int(T / dt)
 
@@ -199,7 +204,8 @@ def run_adam_sde(problem: Problem, params, optimal_params, cov, T, lr, *,
         B = make_B(params, optimal_params, cov)
         risk = problem.risk_from_B(B)
         key, k_phi, k_noise = jax.random.split(key, 3)
-        phi = phi_from_B(B, problem.f, beta1, beta2, k_phi, num_samples=num_samples)
+        phi = phi_from_B(B, problem.f, beta1, beta2, k_phi,
+                 num_samples=num_samples, eps=eps)
         if diagonal:
             mean = covbar[:, None] * params * phi[:m] + covbar[:, None] * optimal_params * phi[m:]
         else:
@@ -211,7 +217,7 @@ def run_adam_sde(problem: Problem, params, optimal_params, cov, T, lr, *,
             sigma = cov_from_B(B, problem.f, beta1, beta2, k_cov, num_samples=num_samples)
             noise = W @ jnp.linalg.cholesky(sigma)
         else:
-            field = adam_noise_field(B, problem.f, beta1, beta2, k_noise, cov_chol,
+            field = adam_noise_field(B, problem.f, beta1, beta2, k_noise, corr_chol,
                                      num_samples=noise_samples,
                                      history_length=noise_history, eps=eps)
             noise = field * jnp.sqrt(dt)

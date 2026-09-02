@@ -1,12 +1,13 @@
 """Monte-Carlo functionals of the low-dimensional statistic ``B``.
 
-These compute the drift ``phi`` and diffusion ``sigma`` coefficients of the HAdam
+These compute the drift ``phi`` and diffusion ``Sigma_0`` coefficients of the HAdam
 SDE / ODE (and the SGD analogues ``H``, ``I``) by sampling the Gaussian vector
 ``Q ~ N(0, B)`` and the label noise ``z``. ``f`` is passed as a static argument so
 the kernels can be jitted once per problem.
 
-Ported from the old ``risks_and_discounts.py`` with the Python ``for l in range``
-loop in :func:`cov_from_B` replaced by a single vectorized expression.
+The corrected diffusion is the order-zero second moment from the appendix:
+``Sigma_0(B) = E[A_0 \otimes A_0]``. Its finite-history estimator is represented
+by samples of ``A_0`` so neither the SDE nor the ODE needs a fourth-order tensor.
 """
 from __future__ import annotations
 
@@ -22,7 +23,8 @@ def _decay(beta, length, scale_by_one_minus=False, start=0):
 
 
 @partial(jax.jit, static_argnames=["f", "num_samples", "history_length"])
-def phi_from_B(B, f, beta1, beta2, key, num_samples=100_000, history_length=500):
+def phi_from_B(B, f, beta1, beta2, key, num_samples=100_000, history_length=500,
+               eps=0.0):
     """Drift coefficient ``phi`` of the HAdam SDE."""
     key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(key, 4)
     Binv = jnp.linalg.pinv(B, hermitian=True)
@@ -40,7 +42,7 @@ def phi_from_B(B, f, beta1, beta2, key, num_samples=100_000, history_length=500)
     Q = Q.squeeze(axis=1)                # (num_samples, 2m)
 
     second_moment_hist = jnp.einsum("nhm,h->nm", f(Q_hist) ** 2 * z_hist[:, :, None] ** 2, decay2)
-    second_moment = jnp.sqrt((1 - beta2) * (second_moment_hist + z ** 2 * fq ** 2))
+    second_moment = jnp.sqrt((1 - beta2) * (second_moment_hist + z ** 2 * fq ** 2) + eps)
 
     fmh = f(Q_hist) * z_hist[:, :, None] ** 2 / second_moment[:, None, :]
     fmh = jnp.concatenate([fmh, fmh], axis=-1)
@@ -54,44 +56,60 @@ def phi_from_B(B, f, beta1, beta2, key, num_samples=100_000, history_length=500)
 
 
 @partial(jax.jit, static_argnames=["f", "num_samples", "history_length"])
-def cov_from_B(B, f, beta1, beta2, key, num_samples=100_000, history_length=100):
-    """Diffusion (covariance) coefficient ``sigma`` of the HAdam SDE.
+def sigma0_samples(B, f, beta1, beta2, key, corr_chol, *,
+                   num_samples=2000, history_length=50, eps=0.0):
+    """Return finite-history samples of ``A_0`` from appendix eq. Sigma_0.
 
-    Vectorized form of the old per-``l`` loop: for each history position ``l`` the
-    current gradient replaces that slot in the second-moment accumulator. Writing
-    ``S`` for the full decayed sum, the ``l``-th accumulator is
-    ``S + decay2[l] * (current_grad2 - base[l])``, which broadcasts over ``l``.
+    ``corr_chol`` factors the normalized coordinate covariance ``C``. For
+    diagonal data pass a length-one vector, which samples only one representative
+    coordinate and enables the cheap diagonal contraction.
     """
-    key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(key, 4)
+    n, H, D = num_samples, history_length, corr_chol.shape[0]
+    key_q, key_x = jax.random.split(key)
+    sequence = 2 * H - 1
+    q = jax.random.multivariate_normal(
+        key_q, jnp.zeros(B.shape[0]), B, shape=(n, sequence)
+    )
+    normal = jax.random.normal(key_x, (n, sequence, D))
+    xi = normal * corr_chol if corr_chol.ndim == 1 else normal @ corr_chol.T
+    h = f(q)[:, :, None, :] ** 2 * xi[:, :, :, None] ** 2
 
-    Q = jax.random.multivariate_normal(key_Q, jnp.zeros(len(B)), B, shape=(num_samples, 1))
-    z = jax.random.normal(key_z, (num_samples, 1))
-    Q_hist = jax.random.multivariate_normal(
-        key_Q_hist, jnp.zeros(len(B)), B, shape=(num_samples, history_length))
-    z_hist = jax.random.normal(key_z_hist, (num_samples, history_length))
+    # Sample H-1 is sample 0. Window l is the history ending at time l.
+    starts = H - 1 - jnp.arange(H)
+    offsets = jnp.arange(H)
+    windows = h[:, starts[:, None] + offsets[None, :]]
+    windows = jnp.flip(windows, axis=2)
+    decay2 = beta2 ** jnp.arange(H)
+    denom = jnp.sqrt((1 - beta2) * jnp.einsum("h,nlhdm->nldm", decay2, windows) + eps)
+    decay1 = (1 - beta1) * beta1 ** jnp.arange(H)
+    f0xi0 = f(q[:, H - 1])[:, None, :] * xi[:, H - 1, :, None]
+    return f0xi0 * jnp.einsum("l,nldm->ndm", decay1, 1.0 / denom)
 
-    decay1 = _decay(beta1, history_length, scale_by_one_minus=True)
-    decay2 = _decay(beta2, history_length, scale_by_one_minus=True)
 
-    fq = f(Q).squeeze(axis=1)            # (num_samples, m)
-    current_grad = fq * z                # (num_samples, m)
-    current_grad2 = current_grad ** 2
+@partial(jax.jit, static_argnames=["f", "num_samples", "history_length"])
+def sigma0_diag(B, f, beta1, beta2, key, *,
+                num_samples=2000, history_length=50, eps=0.0):
+    """Return ``A_0`` samples for one diagonal coordinate, shape ``(n, M)``."""
+    return sigma0_samples(
+        B, f, beta1, beta2, key, jnp.ones(1),
+        num_samples=num_samples, history_length=history_length, eps=eps,
+    )[:, 0, :]
 
-    base = f(Q_hist) ** 2 * z_hist[:, :, None] ** 2          # (n, H, m)
-    S = jnp.einsum("h,nhm->nm", decay2, base)                # (n, m): full decayed sum
-    # (n, H, m): position-l accumulator with current_grad2 swapped into slot l
-    sm = jnp.sqrt(S[:, None, :] + decay2[None, :, None] * (current_grad2[:, None, :] - base))
 
-    contributions = current_grad[:, None, :] / sm            # (n, H, m)
-    update = jnp.einsum("h,nhm->nm", decay1, contributions)  # (n, m)
-
-    return jnp.einsum("nm,nk->mk", update, update) / num_samples
+@partial(jax.jit, static_argnames=["f", "num_samples", "history_length"])
+def cov_from_B(B, f, beta1, beta2, key, num_samples=100_000, history_length=100,
+               eps=0.0):
+    """Compatibility wrapper returning the diagonal-coordinate ``Sigma_0``."""
+    samples = sigma0_diag(B, f, beta1, beta2, key,
+                          num_samples=num_samples, history_length=history_length,
+                          eps=eps)
+    return jnp.einsum("nm,nk->mk", samples, samples) / num_samples
 
 
 @partial(jax.jit, static_argnames=["f", "num_samples", "history_length"])
 def adam_U_samples(B, f, beta1, beta2, key, cov_chol, *,
                    num_samples=2000, history_length=50, eps=0.0):
-    """Monte-Carlo samples of the field ``U`` underlying the HAdam diffusion.
+    """Legacy samples of the pre-correction diffusion field.
 
     Writing (``main.tex`` eq:Sigma)
 
@@ -140,12 +158,13 @@ def adam_noise_field(B, f, beta1, beta2, key, cov_chol, *,
                      num_samples=2000, history_length=50, eps=0.0):
     """One draw of the HAdam SDE diffusion noise field, valid for a **general** ``K``.
 
-    A Gaussian field with covariance ``Sigma`` (eq:Sigma) is sampled as
+    A Gaussian field with covariance ``Sigma_0`` is sampled as
     ``(1/sqrt(n)) sum_s zeta_s U_s`` with ``zeta_s ~ N(0,1)`` — no ``D x D`` tensor is
-    materialized. Returns a ``(D, M)`` array. See :func:`adam_U_samples`.
+    materialized. Returns a ``(D, M)`` array. ``cov_chol`` factors the normalized
+    coordinate covariance ``C`` used by :func:`sigma0_samples`.
     """
     key, k_zeta = jax.random.split(key)
-    U = adam_U_samples(B, f, beta1, beta2, key, cov_chol,
+    U = sigma0_samples(B, f, beta1, beta2, key, cov_chol,
                        num_samples=num_samples, history_length=history_length, eps=eps)
     zeta = jax.random.normal(k_zeta, (num_samples,))
     return jnp.einsum("n,nik->ik", zeta, U) / jnp.sqrt(num_samples)
@@ -164,7 +183,7 @@ def adam_ode_diffusion(B, f, beta1, beta2, key, cov_chol, KL, R, *,
     ``Kbar``. Returns a ``(D, M, M)`` array (one matrix per mode), excluding the
     ``lr^2 / D`` prefactor (applied by the caller).
     """
-    U = adam_U_samples(B, f, beta1, beta2, key, cov_chol,
+    U = sigma0_samples(B, f, beta1, beta2, key, cov_chol,
                        num_samples=num_samples, history_length=history_length, eps=eps)
     alpha = jnp.einsum("dj,ndk->njk", KL, U)     # (n, D, M): KL[:,j] . U_k
     beta = jnp.einsum("dj,ndl->njl", R, U)       # (n, D, M): R[:,j]  . U_l
