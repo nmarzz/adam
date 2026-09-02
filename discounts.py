@@ -6,7 +6,7 @@ SDE / ODE (and the SGD analogues ``H``, ``I``) by sampling the Gaussian vector
 the kernels can be jitted once per problem.
 
 The corrected diffusion is the order-zero second moment from the appendix:
-``Sigma_0(B) = E[A_0 \otimes A_0]``. Its finite-history estimator is represented
+``Sigma_0(B) = E[A_0 \\otimes A_0]``. Its finite-history estimator is represented
 by samples of ``A_0`` so neither the SDE nor the ODE needs a fourth-order tensor.
 """
 from __future__ import annotations
@@ -74,11 +74,12 @@ def sigma0_samples(B, f, beta1, beta2, key, corr_chol, *,
     xi = normal * corr_chol if corr_chol.ndim == 1 else normal @ corr_chol.T
     h = f(q)[:, :, None, :] ** 2 * xi[:, :, :, None] ** 2
 
-    # Sample H-1 is sample 0. Window l is the history ending at time l.
-    starts = H - 1 - jnp.arange(H)
-    offsets = jnp.arange(H)
-    windows = h[:, starts[:, None] + offsets[None, :]]
-    windows = jnp.flip(windows, axis=2)
+    # Sample H-1 is sample 0.  G_l uses samples l, l-1, ... with the
+    # corresponding beta2 weights 1, beta2, ... .  Keeping this orientation is
+    # essential: sample 0 must enter G_l with weight beta2**l.
+    ell = jnp.arange(H)[:, None]
+    lag = jnp.arange(H)[None, :]
+    windows = h[:, H - 1 + ell - lag]
     decay2 = beta2 ** jnp.arange(H)
     denom = jnp.sqrt((1 - beta2) * jnp.einsum("h,nlhdm->nldm", decay2, windows) + eps)
     decay1 = (1 - beta1) * beta1 ** jnp.arange(H)

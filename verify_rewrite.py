@@ -42,15 +42,37 @@ def dense_cov(d, seed=9):
 
 
 def test_sigma0_diagonal():
-    """The corrected diagonal estimator is finite, symmetric, and PSD."""
+    """The estimator is PSD and its shifted denominators use the right samples."""
     print("corrected Sigma_0 diagonal estimator")
     B = jnp.array([[2.0, 0.7], [0.7, 1.5]])
-    samples = sigma0_diag(B, problems._f_linreg, 0.3, 0.4, jax.random.PRNGKey(3),
-                           num_samples=2000, history_length=8, eps=1e-3)
+    beta2, ns, history, eps = 0.4, 2000, 8, 1e-3
+    key = jax.random.PRNGKey(3)
+    samples = sigma0_diag(B, problems._f_linreg, 0.0, beta2, key,
+                           num_samples=ns, history_length=history, eps=eps)
     sigma = samples.T @ samples / samples.shape[0]
     eigs = jnp.linalg.eigvalsh((sigma + sigma.T) / 2)
-    return check("finite PSD Sigma_0", bool(jnp.all(jnp.isfinite(sigma))) and
-                 bool(jnp.min(eigs) >= -1e-10), f"min_eig={float(jnp.min(eigs)):.2e}")
+
+    # With beta1=0, A_0 has only its ell=0 term. Reconstruct that term from the
+    # same random draws and check that G_0 runs backward from sample 0.
+    k_q, k_x = jax.random.split(key)
+    sequence = 2 * history - 1
+    q = jax.random.multivariate_normal(k_q, jnp.zeros(2), B, shape=(ns, sequence))
+    xi = jax.random.normal(k_x, (ns, sequence, 1))[:, :, 0]
+    center = history - 1
+    past = center - jnp.arange(history)
+    fq_past = problems._f_linreg(q[:, past])[:, :, 0]
+    denominator = jnp.sqrt(
+        (1 - beta2) * jnp.sum(beta2 ** jnp.arange(history) * fq_past ** 2 * xi[:, past] ** 2,
+                              axis=1)
+        + eps
+    )
+    expected = problems._f_linreg(q[:, center])[:, 0] * xi[:, center] / denominator
+    alignment_error = float(jnp.max(jnp.abs(samples[:, 0] - expected)))
+
+    psd = bool(jnp.all(jnp.isfinite(sigma))) and bool(jnp.min(eigs) >= -1e-10)
+    return (check("finite PSD Sigma_0", psd, f"min_eig={float(jnp.min(eigs)):.2e}") and
+            check("history alignment", alignment_error < 1e-10,
+                  f"max|Delta|={alignment_error:.2e}"))
 
 
 def test_optimizers_run():
