@@ -214,7 +214,8 @@ def run_adam_sde(problem: Problem, params, optimal_params, cov, T, lr, *,
         if diagonal:
             k_cov, k_w = jax.random.split(k_noise)
             W = jax.random.normal(k_w, optimal_params.shape) * jnp.sqrt(dt)
-            sigma = cov_from_B(B, problem.f, beta1, beta2, k_cov, num_samples=num_samples)
+            sigma = cov_from_B(B, problem.f, beta1, beta2, k_cov,
+                               num_samples=num_samples, eps=eps)
             noise = W @ jnp.linalg.cholesky(sigma)
         else:
             field = adam_noise_field(B, problem.f, beta1, beta2, k_noise, corr_chol,
