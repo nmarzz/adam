@@ -23,10 +23,18 @@ def _decay(beta, length, scale_by_one_minus=False, start=0):
 
 
 @partial(jax.jit, static_argnames=["f", "num_samples", "history_length"])
-def phi_from_B(B, f, beta1, beta2, key, num_samples=100_000, history_length=500,
-               eps=0.0):
-    """Drift coefficient ``phi`` of the HAdam SDE."""
+def drift_matrix_from_B(B, f, beta1, beta2, key, num_samples=100_000,
+                        history_length=500, eps=0.0, noise_std=0.0):
+    """Return the matrix drift ``V(B) = B^+ phi(B)``.
+
+    The shape is ``(M+M*, M)``.  This reduces to the former vector result when
+    output coordinates decouple and also supports coupled losses such as
+    multiclass softmax. ``noise_std`` adds independent centered Gaussian noise
+    to the gradient profile, as required by noisy linear regression.
+    """
     key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(key, 4)
+    key_noise = jax.random.fold_in(key, 1)
+    key_noise_hist = jax.random.fold_in(key, 2)
     Binv = jnp.linalg.pinv(B, hermitian=True)
 
     Q = jax.random.multivariate_normal(key_Q, jnp.zeros(len(B)), B, shape=(num_samples, 1))
@@ -39,25 +47,46 @@ def phi_from_B(B, f, beta1, beta2, key, num_samples=100_000, history_length=500,
     decay1 = _decay(beta1, history_length, start=1)
 
     fq = f(Q).squeeze(axis=1)            # (num_samples, m)
+    fq = fq - noise_std * jax.random.normal(key_noise, fq.shape)
+    fqh = f(Q_hist)
+    fqh = fqh - noise_std * jax.random.normal(key_noise_hist, fqh.shape)
     Q = Q.squeeze(axis=1)                # (num_samples, 2m)
 
-    second_moment_hist = jnp.einsum("nhm,h->nm", f(Q_hist) ** 2 * z_hist[:, :, None] ** 2, decay2)
+    second_moment_hist = jnp.einsum("nhm,h->nm", fqh ** 2 * z_hist[:, :, None] ** 2, decay2)
     second_moment = jnp.sqrt((1 - beta2) * (second_moment_hist + z ** 2 * fq ** 2) + eps)
 
-    fmh = f(Q_hist) * z_hist[:, :, None] ** 2 / second_moment[:, None, :]
-    fmh = jnp.concatenate([fmh, fmh], axis=-1)
-    fmh_w_Q = fmh * (Q_hist @ Binv)
+    score_history = Q_hist @ Binv
+    scaled_history = fqh * z_hist[:, :, None] ** 2 / second_moment[:, None, :]
+    history_outer = score_history[:, :, :, None] * scaled_history[:, :, None, :]
+    history = jnp.einsum("h,nhar->nar", decay1, history_outer).mean(axis=0)
 
-    current = z ** 2 * fq / second_moment
-    current = (jnp.concatenate([current, current], axis=-1) * (Q @ Binv)).mean(axis=0)
-    history = jnp.einsum("nhm,h->nm", fmh_w_Q, decay1).mean(axis=0)
+    score = Q @ Binv
+    scaled_current = z ** 2 * fq / second_moment
+    current = (score[:, :, None] * scaled_current[:, None, :]).mean(axis=0)
 
     return (1 - beta1) * (current + history)
 
 
 @partial(jax.jit, static_argnames=["f", "num_samples", "history_length"])
+def phi_from_B(B, f, beta1, beta2, key, num_samples=100_000,
+               history_length=500, eps=0.0, noise_std=0.0):
+    """Legacy coordinate-decoupled view of :func:`drift_matrix_from_B`.
+
+    Existing scalar-output callers receive the same length-two vector as
+    before. New coupled-output dynamics should consume the full drift matrix.
+    """
+    V = drift_matrix_from_B(
+        B, f, beta1, beta2, key, num_samples=num_samples,
+        history_length=history_length, eps=eps, noise_std=noise_std,
+    )
+    m = V.shape[1]
+    return jnp.concatenate([jnp.diag(V[:m]), jnp.diag(V[m:])])
+
+
+@partial(jax.jit, static_argnames=["f", "num_samples", "history_length"])
 def sigma0_samples(B, f, beta1, beta2, key, corr_chol, *,
-                   num_samples=2000, history_length=50, eps=0.0):
+                   num_samples=2000, history_length=50, eps=0.0,
+                   noise_std=0.0):
     """Return finite-history samples of ``A_0`` from appendix eq. Sigma_0.
 
     ``corr_chol`` factors the normalized coordinate covariance ``C``. For
@@ -66,13 +95,16 @@ def sigma0_samples(B, f, beta1, beta2, key, corr_chol, *,
     """
     n, H, D = num_samples, history_length, corr_chol.shape[0]
     key_q, key_x = jax.random.split(key)
+    key_noise = jax.random.fold_in(key, 1)
     sequence = 2 * H - 1
     q = jax.random.multivariate_normal(
         key_q, jnp.zeros(B.shape[0]), B, shape=(n, sequence)
     )
     normal = jax.random.normal(key_x, (n, sequence, D))
     xi = normal * corr_chol if corr_chol.ndim == 1 else normal @ corr_chol.T
-    h = f(q)[:, :, None, :] ** 2 * xi[:, :, :, None] ** 2
+    fq = f(q)
+    fq = fq - noise_std * jax.random.normal(key_noise, fq.shape)
+    h = fq[:, :, None, :] ** 2 * xi[:, :, :, None] ** 2
 
     # Sample H-1 is sample 0.  G_l uses samples l, l-1, ... with the
     # corresponding beta2 weights 1, beta2, ... .  Keeping this orientation is
@@ -83,27 +115,29 @@ def sigma0_samples(B, f, beta1, beta2, key, corr_chol, *,
     decay2 = beta2 ** jnp.arange(H)
     denom = jnp.sqrt((1 - beta2) * jnp.einsum("h,nlhdm->nldm", decay2, windows) + eps)
     decay1 = (1 - beta1) * beta1 ** jnp.arange(H)
-    f0xi0 = f(q[:, H - 1])[:, None, :] * xi[:, H - 1, :, None]
+    f0xi0 = fq[:, H - 1, None, :] * xi[:, H - 1, :, None]
     return f0xi0 * jnp.einsum("l,nldm->ndm", decay1, 1.0 / denom)
 
 
 @partial(jax.jit, static_argnames=["f", "num_samples", "history_length"])
 def sigma0_diag(B, f, beta1, beta2, key, *,
-                num_samples=2000, history_length=50, eps=0.0):
+                num_samples=2000, history_length=50, eps=0.0,
+                noise_std=0.0):
     """Return ``A_0`` samples for one diagonal coordinate, shape ``(n, M)``."""
     return sigma0_samples(
         B, f, beta1, beta2, key, jnp.ones(1),
         num_samples=num_samples, history_length=history_length, eps=eps,
+        noise_std=noise_std,
     )[:, 0, :]
 
 
 @partial(jax.jit, static_argnames=["f", "num_samples", "history_length"])
 def cov_from_B(B, f, beta1, beta2, key, num_samples=100_000, history_length=100,
-               eps=0.0):
+               eps=0.0, noise_std=0.0):
     """Compatibility wrapper returning the diagonal-coordinate ``Sigma_0``."""
     samples = sigma0_diag(B, f, beta1, beta2, key,
                           num_samples=num_samples, history_length=history_length,
-                          eps=eps)
+                          eps=eps, noise_std=noise_std)
     return jnp.einsum("nm,nk->mk", samples, samples) / num_samples
 
 
@@ -156,7 +190,8 @@ def adam_U_samples(B, f, beta1, beta2, key, cov_chol, *,
 
 @partial(jax.jit, static_argnames=["f", "num_samples", "history_length"])
 def adam_noise_field(B, f, beta1, beta2, key, cov_chol, *,
-                     num_samples=2000, history_length=50, eps=0.0):
+                     num_samples=2000, history_length=50, eps=0.0,
+                     noise_std=0.0):
     """One draw of the HAdam SDE diffusion noise field, valid for a **general** ``K``.
 
     A Gaussian field with covariance ``Sigma_0`` is sampled as
@@ -166,14 +201,16 @@ def adam_noise_field(B, f, beta1, beta2, key, cov_chol, *,
     """
     key, k_zeta = jax.random.split(key)
     U = sigma0_samples(B, f, beta1, beta2, key, cov_chol,
-                       num_samples=num_samples, history_length=history_length, eps=eps)
+                       num_samples=num_samples, history_length=history_length,
+                       eps=eps, noise_std=noise_std)
     zeta = jax.random.normal(k_zeta, (num_samples,))
     return jnp.einsum("n,nik->ik", zeta, U) / jnp.sqrt(num_samples)
 
 
 @partial(jax.jit, static_argnames=["f", "num_samples", "history_length"])
 def adam_ode_diffusion(B, f, beta1, beta2, key, cov_chol, KL, R, *,
-                       num_samples=2000, history_length=50, eps=0.0):
+                       num_samples=2000, history_length=50, eps=0.0,
+                       noise_std=0.0):
     """Per-mode diffusion matrices for the Adam ODE under a **general** ``K``.
 
     The diffusion injected into the ``j``-th spectral mode ``p_j`` of ``B`` is the
@@ -185,7 +222,8 @@ def adam_ode_diffusion(B, f, beta1, beta2, key, cov_chol, KL, R, *,
     ``lr^2 / D`` prefactor (applied by the caller).
     """
     U = sigma0_samples(B, f, beta1, beta2, key, cov_chol,
-                       num_samples=num_samples, history_length=history_length, eps=eps)
+                       num_samples=num_samples, history_length=history_length,
+                       eps=eps, noise_std=noise_std)
     alpha = jnp.einsum("dj,ndk->njk", KL, U)     # (n, D, M): KL[:,j] . U_k
     beta = jnp.einsum("dj,ndl->njl", R, U)       # (n, D, M): R[:,j]  . U_l
     return jnp.einsum("njk,njl->jkl", alpha, beta) / num_samples   # (D, M, M)

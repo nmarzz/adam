@@ -32,23 +32,30 @@ def _lr_at(lr, k):
     return lr(k) if callable(lr) else lr
 
 
-def _sample_grad(problem: Problem, cov, optimal_params, params, key):
+def _sample_grad(problem: Problem, cov, optimal_params, params, key,
+                 label_noise_std=0.0):
     """One fresh streaming gradient at ``params``."""
     data = make_data(cov, key)
     target = problem.target(optimal_params, data)
+    if label_noise_std:
+        key_noise = jax.random.fold_in(key, 1)
+        target = target + label_noise_std * jax.random.normal(key_noise, target.shape)
     return problem.grad(params, data, target)
 
 
 # --------------------------------------------------------------------------- #
 # Optimizer factories
 # --------------------------------------------------------------------------- #
-def build_adam(problem, cov, optimal_params, lr, *, beta1, beta2, eps=0.0) -> Sim:
+def build_adam(problem, cov, optimal_params, lr, *, beta1, beta2, eps=0.0,
+               label_noise_std=0.0) -> Sim:
     def init(params):
         return (jnp.zeros_like(params), jnp.zeros_like(params))
 
     def step(params, state, key, k):
         m, v = state
-        g = _sample_grad(problem, cov, optimal_params, params, key)
+        g = _sample_grad(
+            problem, cov, optimal_params, params, key, label_noise_std
+        )
         m = beta1 * m + (1 - beta1) * g
         v = beta2 * v + (1 - beta2) * g ** 2
         params = params - _lr_at(lr, k) * m / jnp.sqrt(v + eps)
@@ -221,5 +228,42 @@ def run_many(sim: Sim, problem: Problem, params0, optimal_params, cov, num_steps
     def one(key):
         _, risks = run(sim, problem, params0, optimal_params, cov, num_steps, key=key)
         return risks
+
+    return jax.vmap(one)(keys)
+
+
+def run_with_B(sim: Sim, problem: Problem, params0, optimal_params, cov,
+               num_steps, *, key):
+    """Run a simulator and return ``(final_params, risks, B_path)``.
+
+    Like :func:`run`, observables are recorded immediately before each update.
+    ``B_path`` has shape ``(num_steps, M+M*, M+M*)``.
+    """
+    def scan_step(carry, k):
+        params, state, key = carry
+        B = make_B(params, optimal_params, cov)
+        risk = problem.risk_from_B(B)
+        key, sub = jax.random.split(key)
+        params, state = sim.step(params, state, sub, k)
+        return (params, state, key), (risk, B)
+
+    init_carry = (params0, sim.init(params0), key)
+    (params, _, _), (risks, B_path) = lax.scan(
+        scan_step, init_carry, jnp.arange(num_steps)
+    )
+    return params, risks, B_path
+
+
+def run_many_with_B(sim: Sim, problem: Problem, params0, optimal_params, cov,
+                    num_steps, *, keys):
+    """Vectorize :func:`run_with_B` over keys.
+
+    Returns ``(risks, B_paths)`` with leading dimension ``len(keys)``.
+    """
+    def one(key):
+        _, risks, B_path = run_with_B(
+            sim, problem, params0, optimal_params, cov, num_steps, key=key
+        )
+        return risks, B_path
 
     return jax.vmap(one)(keys)

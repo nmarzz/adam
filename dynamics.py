@@ -16,7 +16,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from discounts import (adam_noise_field, adam_ode_diffusion, compute_H, compute_I,
-                       cov_from_B, phi_from_B)
+                       cov_from_B, drift_matrix_from_B)
 from problems import Problem
 from utils import make_B
 
@@ -104,7 +104,10 @@ def _init_sgd_ode(cov, params, optimal_params):
 # --------------------------------------------------------------------------- #
 def run_adam_ode(problem: Problem, params, optimal_params, cov, T, lr, *,
                  beta1, beta2, dt=0.01, num_samples=100_000, eps=0.0,
-                 noise_samples=2000, noise_history=50, key):
+                 history_length=500, diffusion_samples=2000,
+                 diffusion_history=50, noise_samples=2000, noise_history=50,
+                 noise_std=0.0,
+                 return_B=False, key):
     """HAdam ODE. The diffusion term handles a **general** covariance ``K``.
 
     * Diagonal ``K``: cheap ``var_force[j] * sigma-hat`` per mode (Remark 1).
@@ -121,11 +124,12 @@ def run_adam_ode(problem: Problem, params, optimal_params, cov, T, lr, *,
         y, key = carry
         B = _make_B_adam(y, eigs)
         risk = problem.risk_from_B(B)
-        m = len(B) // 2
         key, k_phi, k_cov = jax.random.split(key, 3)
-        phi = phi_from_B(B, problem.f, beta1, beta2, k_phi,
-                 num_samples=num_samples, eps=eps)
-        phi1, phi2 = phi[:m], phi[m:]
+        V = drift_matrix_from_B(
+            B, problem.f, beta1, beta2, k_phi,
+            num_samples=num_samples, history_length=history_length,
+            eps=eps, noise_std=noise_std,
+        )
         p, u, q = y[:d], y[d:2 * d], y[2 * d:]
         lr_t = _lr_at(lr, i * dt)
         e = eigs[:, None, None]
@@ -133,21 +137,31 @@ def run_adam_ode(problem: Problem, params, optimal_params, cov, T, lr, *,
         if diagonal:
             var_force = diff_data[1]
             sigma = cov_from_B(B, problem.f, beta1, beta2, k_cov,
-                               num_samples=num_samples, eps=eps)
+                               num_samples=diffusion_samples,
+                               history_length=diffusion_history, eps=eps,
+                               noise_std=noise_std)
             diffusion = var_force[:, None, None] * sigma            # (D, M, M)
         else:
             _, KL, R, cov_chol = diff_data
             diffusion = adam_ode_diffusion(B, problem.f, beta1, beta2, k_cov, cov_chol,
                                            KL, R, num_samples=noise_samples,
-                                           history_length=noise_history, eps=eps)
+                                           history_length=noise_history, eps=eps,
+                                           noise_std=noise_std)
 
-        p_up = -2 * lr_t * e * (p * phi1 + u * phi2) + lr_t ** 2 * diffusion / d
-        u_up = -lr_t * e * (phi1 * u + phi2 * q)
+        pu = jnp.concatenate([p, u], axis=2)
+        pv = jnp.einsum("dij,jk->dik", pu, V)
+        p_up = -lr_t * e * (pv + jnp.swapaxes(pv, 1, 2))
+        p_up = p_up + lr_t ** 2 * diffusion / d
+        uq = jnp.concatenate([u, q], axis=1)
+        u_up = -lr_t * e * jnp.einsum("ij,djk->dik", V.T, uq)
         y = y + dt * jnp.concatenate([p_up, u_up, jnp.zeros_like(u_up)])
-        return (y, key), risk
+        return (y, key), (risk, B)
 
-    (_, _), risks = lax.scan(step, (y0, key), jnp.arange(iters))
-    return risks, jnp.arange(iters) * dt
+    (_, _), (risks, B_path) = lax.scan(step, (y0, key), jnp.arange(iters))
+    times = jnp.arange(iters) * dt
+    if return_B:
+        return risks, B_path, times
+    return risks, times
 
 
 def run_sgd_ode(problem: Problem, params, optimal_params, cov, T, lr, *,
@@ -181,7 +195,7 @@ def run_sgd_ode(problem: Problem, params, optimal_params, cov, T, lr, *,
 # --------------------------------------------------------------------------- #
 def run_adam_sde(problem: Problem, params, optimal_params, cov, T, lr, *,
                  beta1, beta2, dt=0.005, num_samples=100_000, eps=0.0,
-                 noise_samples=2000, noise_history=50, key):
+                 noise_samples=2000, noise_history=50, noise_std=0.0, key):
     """HAdam SDE. The diffusion term handles a **general** covariance ``K``.
 
     * Diagonal ``K`` (``cov.ndim == 1``): uses the cheap ``sigma-hat ⊗ Id``
@@ -204,23 +218,28 @@ def run_adam_sde(problem: Problem, params, optimal_params, cov, T, lr, *,
         B = make_B(params, optimal_params, cov)
         risk = problem.risk_from_B(B)
         key, k_phi, k_noise = jax.random.split(key, 3)
-        phi = phi_from_B(B, problem.f, beta1, beta2, k_phi,
-                 num_samples=num_samples, eps=eps)
+        V = drift_matrix_from_B(
+            B, problem.f, beta1, beta2, k_phi,
+            num_samples=num_samples, eps=eps, noise_std=noise_std,
+        )
+        stacked = jnp.concatenate([params, optimal_params], axis=1)
         if diagonal:
-            mean = covbar[:, None] * params * phi[:m] + covbar[:, None] * optimal_params * phi[m:]
+            mean = covbar[:, None] * (stacked @ V)
         else:
-            mean = covbar @ params * phi[:m] + covbar @ optimal_params * phi[m:]
+            mean = covbar @ stacked @ V
 
         if diagonal:
             k_cov, k_w = jax.random.split(k_noise)
             W = jax.random.normal(k_w, optimal_params.shape) * jnp.sqrt(dt)
             sigma = cov_from_B(B, problem.f, beta1, beta2, k_cov,
-                               num_samples=num_samples, eps=eps)
+                               num_samples=num_samples, eps=eps,
+                               noise_std=noise_std)
             noise = W @ jnp.linalg.cholesky(sigma)
         else:
             field = adam_noise_field(B, problem.f, beta1, beta2, k_noise, corr_chol,
                                      num_samples=noise_samples,
-                                     history_length=noise_history, eps=eps)
+                                     history_length=noise_history, eps=eps,
+                                     noise_std=noise_std)
             noise = field * jnp.sqrt(dt)
 
         lr_t = _lr_at(lr, i * dt)

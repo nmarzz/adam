@@ -17,9 +17,10 @@ from __future__ import annotations
 
 from typing import Callable, NamedTuple
 
+import jax
 import jax.numpy as jnp
 from jax import jit
-from jax.nn import sigmoid
+from jax.nn import log_softmax, sigmoid, softmax
 from numpy.polynomial.hermite import hermgauss
 
 
@@ -130,6 +131,63 @@ PROBLEMS = {
         _f_real_phase_ret, _risk_from_B_real_phase_ret,
     ),
 }
+
+
+def make_softmax_problem(classes: int, *, risk_samples: int = 8_192,
+                         risk_seed: int = 0) -> Problem:
+    """Create a ``classes``-class soft-label teacher--student problem.
+
+    The student and teacher use ``classes - 1`` free logits, with the last
+    class fixed as the reference logit.  This removes softmax's additive gauge
+    direction and keeps the Gaussian order parameter nonsingular.
+    The population cross-entropy is evaluated from ``B`` with fixed Gaussian
+    Monte Carlo draws, so repeated calls along an ODE path are deterministic.
+    """
+    if classes < 2:
+        raise ValueError("classes must be at least two")
+    rank = classes - 1
+    base = jax.random.normal(
+        jax.random.PRNGKey(risk_seed), (risk_samples, 2 * rank)
+    )
+
+    def probabilities(free_logits):
+        reference = jnp.zeros(free_logits.shape[:-1] + (1,))
+        return softmax(jnp.concatenate([free_logits, reference], axis=-1), axis=-1)
+
+    @jit
+    def grad(params, data, target):
+        return jnp.outer(data, probabilities(params.T @ data)[:-1] - target[:-1])
+
+    @jit
+    def target(optimal_params, data):
+        return probabilities(optimal_params.T @ data)
+
+    @jit
+    def f(q):
+        return probabilities(q[..., :rank])[..., :-1] - probabilities(
+            q[..., rank:]
+        )[..., :-1]
+
+    @jit
+    def risk_from_B(B):
+        symmetric = (B + B.T) / 2
+        scale = jnp.maximum(jnp.trace(symmetric) / (2 * rank), 1.0)
+        chol = jnp.linalg.cholesky(
+            symmetric + 1e-10 * scale * jnp.eye(2 * rank)
+        )
+        q = base @ chol.T
+        student_log_probability = log_softmax(
+            jnp.concatenate([q[:, :rank], jnp.zeros((risk_samples, 1))], axis=1),
+            axis=-1,
+        )
+        teacher_probability = probabilities(q[:, rank:])
+        return -jnp.mean(
+            jnp.sum(teacher_probability * student_log_probability, axis=-1)
+        )
+
+    return Problem(
+        f"softmax_{classes}", grad, target, f, risk_from_B
+    )
 
 
 def get_problem(name: str) -> Problem:
