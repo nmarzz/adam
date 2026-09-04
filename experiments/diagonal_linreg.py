@@ -42,16 +42,42 @@ def spectrum(d: int, kind: str, lower: float, upper: float, decay: float):
     return lower + (upper - lower) * raw
 
 
-def initialization(d: int, cov, target_norm: float, init_norm: float, overlap: float):
-    """Fix the initial geometry in whitened coordinates across dimensions."""
+def initialization(d: int, cov, target_norm: float, initial_excess_risk: float,
+                   overlap: float):
+    """Fix the initial risk and B geometry in whitened coordinates for every D."""
+    if initial_excess_risk <= 0:
+        raise ValueError("initial_excess_risk must be positive")
+    if not -1.0 < overlap < 1.0:
+        raise ValueError("init_overlap must lie strictly between -1 and 1")
     teacher_direction = jnp.ones(d) / jnp.sqrt(d)
+    teacher_direction /= jnp.linalg.norm(teacher_direction)
     orthogonal = jnp.cos(2 * jnp.pi * (jnp.arange(d) + 0.5) / d)
     orthogonal -= teacher_direction * (teacher_direction @ orthogonal)
     orthogonal /= jnp.linalg.norm(orthogonal)
     teacher_white = target_norm * teacher_direction
+    radicand = (
+        2.0 * initial_excess_risk
+        - target_norm**2 * (1.0 - overlap**2)
+    )
+    if radicand < 0:
+        minimum = 0.5 * target_norm**2 * (1.0 - overlap**2)
+        raise ValueError(
+            f"initial_excess_risk must be at least {minimum:g} for this "
+            "target norm and overlap"
+        )
+    init_norm = target_norm * overlap + np.sqrt(radicand)
+    if init_norm <= 0:
+        raise ValueError("the requested geometry gives a nonpositive initial norm")
     initial_white = init_norm * (
         overlap * teacher_direction + jnp.sqrt(1.0 - overlap**2) * orthogonal
     )
+    # Remove the last floating-point dependence on D: enforce the requested
+    # excess risk directly through ||theta_0-theta_*||_Sigma^2 / 2.
+    error_white = initial_white - teacher_white
+    error_white *= jnp.sqrt(
+        initial_excess_risk / (0.5 * jnp.sum(error_white**2))
+    )
+    initial_white = teacher_white + error_white
     return (initial_white[:, None] / jnp.sqrt(cov[:, None]),
             teacher_white[:, None] / jnp.sqrt(cov[:, None]))
 
@@ -65,7 +91,7 @@ def subsample(path, source_time, display_time):
 def run_case(d: int, kind: str, args, problem):
     cov = spectrum(d, kind, args.lambda_min, args.lambda_max, args.spectral_decay)
     theta0, teacher = initialization(
-        d, cov, args.target_norm, args.init_norm, args.init_overlap
+        d, cov, args.target_norm, args.initial_excess_risk, args.init_overlap
     )
     steps = int(round(args.horizon * d))
     sim = simulate.build_adam(
@@ -79,7 +105,7 @@ def run_case(d: int, kind: str, args, problem):
         sim, problem, theta0, teacher, cov, steps, keys=keys
     )
     adam_risk.block_until_ready()
-    adam_time = np.arange(steps) / d
+    adam_iteration = np.arange(steps)
 
     ode_risk, ode_B, ode_time = dynamics.run_adam_ode(
         problem, theta0, teacher, cov, args.horizon, args.eta,
@@ -92,42 +118,43 @@ def run_case(d: int, kind: str, args, problem):
         key=jax.random.PRNGKey(args.seed + 10_000 + d),
     )
     ode_risk.block_until_ready()
-    display_time = np.linspace(
-        0.0, min(adam_time[-1], float(ode_time[-1])), args.evaluations
+    ode_iteration = np.asarray(ode_time) * d
+    last_iteration = int(np.floor(min(adam_iteration[-1], ode_iteration[-1])))
+    display_iteration = np.unique(
+        np.rint(np.linspace(0, last_iteration, args.evaluations)).astype(int)
     )
     noise_floor = 0.5 * args.noise_std**2
     return {
-        "time": display_time,
-        "adam_risk": subsample(adam_risk, adam_time, display_time) + noise_floor,
-        "adam_B11": subsample(adam_B[..., 0, 0], adam_time, display_time),
-        "adam_B12": subsample(adam_B[..., 0, 1], adam_time, display_time),
-        "ode_risk": subsample(ode_risk, ode_time, display_time) + noise_floor,
-        "ode_B11": subsample(ode_B[..., 0, 0], ode_time, display_time),
-        "ode_B12": subsample(ode_B[..., 0, 1], ode_time, display_time),
+        "iteration": display_iteration,
+        "adam_risk": subsample(adam_risk, adam_iteration, display_iteration) + noise_floor,
+        "adam_B11": subsample(adam_B[..., 0, 0], adam_iteration, display_iteration),
+        "adam_B12": subsample(adam_B[..., 0, 1], adam_iteration, display_iteration),
+        "ode_risk": np.interp(display_iteration, ode_iteration, np.asarray(ode_risk))
+                    + noise_floor,
+        "ode_B11": np.interp(display_iteration, ode_iteration,
+                              np.asarray(ode_B[..., 0, 0])),
+        "ode_B12": np.interp(display_iteration, ode_iteration,
+                              np.asarray(ode_B[..., 0, 1])),
         "spectrum": np.asarray(cov),
     }
 
 
 def plot(kind: str, rows, output: Path):
     metrics = [("risk", "Population risk"), ("B11", r"$B_{11}$"), ("B12", r"$B_{12}$")]
-    figure, axes = plt.subplots(
-        len(rows), 3, figsize=(11.5, 2.65 * len(rows)), sharex=True, squeeze=False
-    )
-    for row, (d, result) in enumerate(rows):
+    figure, axes = plt.subplots(1, 3, figsize=(12.2, 3.7), squeeze=False)
+    colors = plt.cm.viridis(np.linspace(0.12, 0.82, len(rows)))
+    for color, (d, result) in zip(colors, rows):
         for column, (key, title) in enumerate(metrics):
             _, lower, upper = compute_ci(jnp.asarray(result[f"adam_{key}"]), alpha=0.2)
-            axis = axes[row, column]
-            axis.fill_between(result["time"], lower, upper, color="#4C78A8", alpha=0.30, linewidth=0)
-            axis.plot(result["time"], result[f"ode_{key}"], color="#111111", lw=2)
+            axis = axes[0, column]
+            axis.fill_between(result["iteration"], lower, upper,
+                              color=color, alpha=0.20, linewidth=0)
+            axis.plot(result["iteration"], result[f"ode_{key}"],
+                      color=color, lw=2, label=f"ODE, D = {d}")
             axis.grid(alpha=0.18)
-            if row == 0:
-                axis.set_title(title)
-            if column == 0:
-                axis.set_ylabel(f"D = {d}")
-            if row == len(rows) - 1:
-                axis.set_xlabel(r"Rescaled time $t=k/D$")
-    axes[0, 0].plot([], [], color="#111111", lw=2, label="ODE")
-    axes[0, 0].fill_between([], [], [], color="#4C78A8", alpha=0.30,
+            axis.set_title(title)
+            axis.set_xlabel(r"Algorithm iteration $k$")
+    axes[0, 0].fill_between([], [], [], color="0.5", alpha=0.20,
                             label="Adam central 80%")
     axes[0, 0].legend(frameon=False)
     label = ("Isotropic covariance" if kind == "isotropic"
@@ -153,7 +180,7 @@ def parse_args():
     parser.add_argument("--epsilon", type=float, default=0.1)
     parser.add_argument("--noise-std", type=float, default=0.5)
     parser.add_argument("--target-norm", type=float, default=1.0)
-    parser.add_argument("--init-norm", type=float, default=0.7)
+    parser.add_argument("--initial-excess-risk", type=float, default=0.6)
     parser.add_argument("--init-overlap", type=float, default=0.2)
     parser.add_argument("--lambda-min", type=float, default=0.25)
     parser.add_argument("--lambda-max", type=float, default=2.0)

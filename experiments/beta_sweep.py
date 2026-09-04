@@ -44,7 +44,8 @@ def run_sweep(args):
     cov = spectrum(args.dimension, args.covariance, args.lambda_min,
                    args.lambda_max, args.spectral_decay)
     theta0, teacher = initialization(
-        args.dimension, cov, args.target_norm, args.init_norm, args.init_overlap
+        args.dimension, cov, args.target_norm, args.initial_excess_risk,
+        args.init_overlap
     )
     beta1 = np.linspace(args.beta1_min, args.beta1_max, args.grid_size)
     beta2 = np.linspace(args.beta2_min, args.beta2_max, args.grid_size)
@@ -115,7 +116,7 @@ def parse_args():
     parser.add_argument("--epsilon", type=float, default=0.1)
     parser.add_argument("--noise-std", type=float, default=0.5)
     parser.add_argument("--target-norm", type=float, default=1.0)
-    parser.add_argument("--init-norm", type=float, default=0.7)
+    parser.add_argument("--initial-excess-risk", type=float, default=0.6)
     parser.add_argument("--init-overlap", type=float, default=0.2)
     parser.add_argument("--lambda-min", type=float, default=0.25)
     parser.add_argument("--lambda-max", type=float, default=2.0)
