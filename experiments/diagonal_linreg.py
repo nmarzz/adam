@@ -105,7 +105,7 @@ def run_case(d: int, kind: str, args, problem):
         sim, problem, theta0, teacher, cov, steps, keys=keys
     )
     adam_risk.block_until_ready()
-    adam_iteration = np.arange(steps)
+    adam_time = np.arange(steps) / d
 
     ode_risk, ode_B, ode_time = dynamics.run_adam_ode(
         problem, theta0, teacher, cov, args.horizon, args.eta,
@@ -118,22 +118,21 @@ def run_case(d: int, kind: str, args, problem):
         key=jax.random.PRNGKey(args.seed + 10_000 + d),
     )
     ode_risk.block_until_ready()
-    ode_iteration = np.asarray(ode_time) * d
-    last_iteration = int(np.floor(min(adam_iteration[-1], ode_iteration[-1])))
-    display_iteration = np.unique(
-        np.rint(np.linspace(0, last_iteration, args.evaluations)).astype(int)
+    ode_time = np.asarray(ode_time)
+    display_time = np.linspace(
+        0.0, min(adam_time[-1], ode_time[-1]), args.evaluations
     )
     noise_floor = 0.5 * args.noise_std**2
     return {
-        "iteration": display_iteration,
-        "adam_risk": subsample(adam_risk, adam_iteration, display_iteration) + noise_floor,
-        "adam_B11": subsample(adam_B[..., 0, 0], adam_iteration, display_iteration),
-        "adam_B12": subsample(adam_B[..., 0, 1], adam_iteration, display_iteration),
-        "ode_risk": np.interp(display_iteration, ode_iteration, np.asarray(ode_risk))
+        "time": display_time,
+        "adam_risk": subsample(adam_risk, adam_time, display_time) + noise_floor,
+        "adam_B11": subsample(adam_B[..., 0, 0], adam_time, display_time),
+        "adam_B12": subsample(adam_B[..., 0, 1], adam_time, display_time),
+        "ode_risk": np.interp(display_time, ode_time, np.asarray(ode_risk))
                     + noise_floor,
-        "ode_B11": np.interp(display_iteration, ode_iteration,
+        "ode_B11": np.interp(display_time, ode_time,
                               np.asarray(ode_B[..., 0, 0])),
-        "ode_B12": np.interp(display_iteration, ode_iteration,
+        "ode_B12": np.interp(display_time, ode_time,
                               np.asarray(ode_B[..., 0, 1])),
         "spectrum": np.asarray(cov),
     }
@@ -147,13 +146,13 @@ def plot(kind: str, rows, output: Path):
         for column, (key, title) in enumerate(metrics):
             _, lower, upper = compute_ci(jnp.asarray(result[f"adam_{key}"]), alpha=0.2)
             axis = axes[0, column]
-            axis.fill_between(result["iteration"], lower, upper,
+            axis.fill_between(result["time"], lower, upper,
                               color=color, alpha=0.20, linewidth=0)
-            axis.plot(result["iteration"], result[f"ode_{key}"],
+            axis.plot(result["time"], result[f"ode_{key}"],
                       color=color, lw=2, label=f"ODE, D = {d}")
             axis.grid(alpha=0.18)
             axis.set_title(title)
-            axis.set_xlabel(r"Algorithm iteration $k$")
+            axis.set_xlabel(r"Scaled time $t=k/D$")
     axes[0, 0].fill_between([], [], [], color="0.5", alpha=0.20,
                             label="Adam central 80%")
     axes[0, 0].legend(frameon=False)
