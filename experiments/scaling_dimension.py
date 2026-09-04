@@ -33,15 +33,15 @@ from utils import compute_ci
 
 # ----------------------------- experiment knobs ---------------------------- #
 PROBLEM = "linreg"
-DIMS = [128, 256, 512]
+DIMS = [128, 256, 512, 1024]
 N_SEEDS = 12
 T = 10.0
 SDE_LR = 0.7                 # learning rate in continuous-time units
-BETA1, BETA2 = 0.9, 0.99
+BETA1, BETA2 = 0.9, 0.9
 NORM0, NORMSTAR = 9.0, 1.0   # fixed squared Sigma-norms
 INITIAL_OVERLAP = 0.0         # Sigma cosine between theta0 and theta*
 ODE_DIM = 512                 # dimension at which to draw the limiting ODE curve
-NUM_SAMPLES = 20_000
+NUM_SAMPLES = 30_000
 
 
 def fixed_spectrum(d):
@@ -92,8 +92,8 @@ def main():
         t = jnp.arange(int(T * d)) / d
         mean, lo, hi = compute_ci(risks)
         ax.fill_between(
-            t, lo, hi, color=color, alpha=0.24, linewidth=0,
-            label=f"Adam central 80%, d={d}",
+            t, lo, hi, color=color, alpha=0.4, linewidth=0,
+            label=f"Adam 80% CI, d={d}",
         )
         print(f"d={d:4d}: R0={float(mean[0]):.4f} RT={float(mean[-1]):.4f}")
 
@@ -109,6 +109,7 @@ def main():
     ax.set_xlabel("rescaled time  t = k / d")
     ax.set_ylabel("risk")
     ax.set_yscale("log")
+    # ax.set_xscale("log")
     ax.legend(frameon=False, fontsize=9)
     fig.tight_layout()
 
