@@ -4,9 +4,9 @@ Hold the *risk* fixed while the data covariance scales in a natural way, then
 show that the finite-dimensional Adam simulator concentrates onto the
 d-independent HAdam SDE / ODE limit as the ambient dimension grows.
 
-* Covariance: diagonal with eigenvalues placed by a **fixed quantile function**
-  ``lambda_j = q((j-0.5)/d)`` normalized to unit mean. The empirical spectral
-  distribution is therefore the same measure for every ``d``.
+* Covariance: isotropic, ``Sigma = I``. Together with the fixed initial order
+  parameter, this makes the deterministic ODE path dimension-independent and
+  leaves finite-dimensional concentration as the only changing effect.
 * Initial conditions: student and teacher are constructed in whitened
   coordinates with fixed Sigma-norms and fixed overlap. Consequently
   ``risk(theta0) = ||theta0-theta*||_Sigma^2 / 2`` is exactly the same for every
@@ -45,10 +45,8 @@ NUM_SAMPLES = 20_000
 
 
 def fixed_spectrum(d):
-    """Diagonal Sigma from a fixed quantile function, normalized to unit mean."""
-    u = (jnp.arange(1, d + 1) - 0.5) / d
-    lam = 0.1 + u
-    return lam / lam.mean()
+    """Isotropic covariance for a clean dimension-scaling comparison."""
+    return jnp.ones(d)
 
 
 def fixed_risk_init(d, key):
