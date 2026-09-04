@@ -25,6 +25,9 @@ import matplotlib.pyplot as plt
 import dynamics
 import problems
 from experiments.diagonal_linreg import initialization, spectrum
+from experiments.plot_style import apply_paper_style, polish_axis
+
+apply_paper_style()
 
 
 def first_hitting_time(risk, time, tolerance):
@@ -72,7 +75,7 @@ def run_sweep(args):
 
 def plot(beta1, beta2, hitting, args, output):
     display = np.where(np.isfinite(hitting), hitting, args.horizon)
-    figure, axis = plt.subplots(figsize=(7.4, 5.8))
+    figure, axis = plt.subplots(figsize=(9.0, 7.2), constrained_layout=True)
     image = axis.imshow(
         display, origin="lower", aspect="auto", interpolation="nearest",
         extent=[beta1[0], beta1[-1], beta2[0], beta2[-1]],
@@ -82,8 +85,9 @@ def plot(beta1, beta2, hitting, args, output):
     if np.any(missing):
         axis.contourf(beta1, beta2, missing, levels=[0.5, 1.5],
                       colors="none", hatches=["////"])
-    colorbar = figure.colorbar(image, ax=axis, pad=0.02)
+    colorbar = figure.colorbar(image, ax=axis, pad=0.025, fraction=0.055)
     colorbar.set_label(r"First time $P(t)\leq\varepsilon_{\rm risk}$")
+    colorbar.ax.tick_params(labelsize=15, width=1.15, length=5)
     axis.set_xlabel(r"$\beta_1$")
     axis.set_ylabel(r"$\beta_2$")
     axis.set_title(
@@ -91,12 +95,12 @@ def plot(beta1, beta2, hitting, args, output):
     )
     if np.any(missing):
         axis.text(0.99, 0.02, f"hatched: not reached by T={args.horizon:g}",
-                  transform=axis.transAxes, ha="right", va="bottom", fontsize=9,
+                  transform=axis.transAxes, ha="right", va="bottom", fontsize=13,
                   color="white",
                   bbox={"facecolor": "black", "alpha": 0.45,
                         "edgecolor": "none", "pad": 3})
-    figure.tight_layout()
-    figure.savefig(output.with_suffix(".png"), dpi=220, bbox_inches="tight")
+    polish_axis(axis, grid=False)
+    figure.savefig(output.with_suffix(".png"), dpi=300, bbox_inches="tight")
     figure.savefig(output.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(figure)
 

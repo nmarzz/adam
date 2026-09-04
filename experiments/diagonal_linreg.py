@@ -31,7 +31,10 @@ import matplotlib.pyplot as plt
 import dynamics
 import problems
 import simulate
+from experiments.plot_style import apply_paper_style, polish_axis
 from utils import compute_ci
+
+apply_paper_style()
 
 
 def spectrum(d: int, kind: str, lower: float, upper: float, decay: float):
@@ -140,27 +143,28 @@ def run_case(d: int, kind: str, args, problem):
 
 def plot(kind: str, rows, output: Path):
     metrics = [("risk", "Population risk"), ("B11", r"$B_{11}$"), ("B12", r"$B_{12}$")]
-    figure, axes = plt.subplots(1, 3, figsize=(12.2, 3.7), squeeze=False)
+    figure, axes = plt.subplots(
+        1, 3, figsize=(16.0, 5.1), squeeze=False, constrained_layout=True
+    )
     colors = plt.cm.viridis(np.linspace(0.12, 0.82, len(rows)))
     for color, (d, result) in zip(colors, rows):
         for column, (key, title) in enumerate(metrics):
             _, lower, upper = compute_ci(jnp.asarray(result[f"adam_{key}"]), alpha=0.2)
             axis = axes[0, column]
             axis.fill_between(result["time"], lower, upper,
-                              color=color, alpha=0.20, linewidth=0)
+                              color=color, alpha=0.25, linewidth=0)
             axis.plot(result["time"], result[f"ode_{key}"],
-                      color=color, lw=2, label=f"ODE, D = {d}")
-            axis.grid(alpha=0.18)
+                      color=color, lw=3.0, label=f"ODE, $D={d}$")
+            polish_axis(axis)
             axis.set_title(title)
             axis.set_xlabel(r"Scaled time $t=k/D$")
-    axes[0, 0].fill_between([], [], [], color="0.5", alpha=0.20,
+    axes[0, 0].fill_between([], [], [], color="0.5", alpha=0.25,
                             label="Adam central 80%")
-    axes[0, 0].legend(frameon=False)
+    axes[0, 0].legend(frameon=False, loc="best")
     label = ("Isotropic covariance" if kind == "isotropic"
              else "Lower-bounded decaying diagonal covariance")
-    figure.suptitle(label, y=0.995)
-    figure.tight_layout()
-    figure.savefig(output.with_suffix(".png"), dpi=220, bbox_inches="tight")
+    figure.suptitle(label)
+    figure.savefig(output.with_suffix(".png"), dpi=300, bbox_inches="tight")
     figure.savefig(output.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(figure)
 

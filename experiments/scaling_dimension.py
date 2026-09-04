@@ -29,7 +29,10 @@ import matplotlib.pyplot as plt
 import dynamics
 import problems
 import simulate
+from experiments.plot_style import apply_paper_style, polish_axis
 from utils import compute_ci
+
+apply_paper_style()
 
 # ----------------------------- experiment knobs ---------------------------- #
 PROBLEM = "linreg"
@@ -77,7 +80,7 @@ def fixed_risk_init(d, key):
 
 def main():
     prob = problems.get_problem(PROBLEM)
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax = plt.subplots(figsize=(9.0, 6.4), constrained_layout=True)
     colors = plt.cm.viridis(jnp.linspace(0.15, 0.8, len(DIMS)))
 
     for color, d in zip(colors, DIMS):
@@ -92,8 +95,13 @@ def main():
         t = jnp.arange(int(T * d)) / d
         mean, lo, hi = compute_ci(risks)
         ax.fill_between(
+<<<<<<< HEAD
             t, lo, hi, color=color, alpha=0.4, linewidth=0,
             label=f"Adam 80% CI, d={d}",
+=======
+            t, lo, hi, color=color, alpha=0.28, linewidth=0,
+            label=f"Adam central 80%, $D={d}$",
+>>>>>>> 00c39a4 (asd)
         )
         print(f"d={d:4d}: R0={float(mean[0]):.4f} RT={float(mean[-1]):.4f}")
 
@@ -103,20 +111,26 @@ def main():
         beta1=BETA1, beta2=BETA2, dt=0.02,
         num_samples=NUM_SAMPLES, key=jax.random.PRNGKey(0),
     )
-    ax.plot(ode_t, ode_risk, "k--", lw=2.0, label="HAdam ODE limit")
+    ax.plot(ode_t, ode_risk, "k--", lw=3.2, label="HAdam ODE limit")
     print(f"ODE : R0={float(ode_risk[0]):.4f} RT={float(ode_risk[-1]):.4f}")
 
     ax.set_xlabel("rescaled time  t = k / d")
     ax.set_ylabel("risk")
     ax.set_yscale("log")
+<<<<<<< HEAD
     # ax.set_xscale("log")
     ax.legend(frameon=False, fontsize=9)
     fig.tight_layout()
+=======
+    polish_axis(ax)
+    ax.legend(frameon=False, loc="best")
+>>>>>>> 00c39a4 (asd)
 
     out = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "figs"
     )
-    fig.savefig(os.path.join(out, "scaling_dimension.png"), dpi=150)
+    fig.savefig(os.path.join(out, "scaling_dimension.png"), dpi=300,
+                bbox_inches="tight")
     fig.savefig(os.path.join(out, "scaling_dimension.pdf"))
     print(f"saved -> {out}/scaling_dimension.{{png,pdf}}")
 

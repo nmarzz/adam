@@ -33,7 +33,10 @@ import dynamics
 import problems
 import simulate
 from experiments.diagonal_linreg import spectrum, subsample
+from experiments.plot_style import apply_paper_style, polish_axis
 from utils import compute_ci
+
+apply_paper_style()
 
 
 def initialization(d, classes, cov, target_scale, init_scale, overlap, seed):
@@ -126,30 +129,30 @@ def plot(classes, rows, output):
         ("B12_trace", r"$\frac{\mathrm{tr}(B_{12})}{C-1}$"),
     ]
     figure, axes = plt.subplots(
-        len(rows), 3, figsize=(11.5, 2.65 * len(rows)), sharex=True, squeeze=False
+        len(rows), 3, figsize=(16.0, 4.25 * len(rows)),
+        sharex=True, squeeze=False, constrained_layout=True
     )
     for row, (d, result) in enumerate(rows):
         for column, (key, title) in enumerate(metrics):
             _, lower, upper = compute_ci(jnp.asarray(result[f"adam_{key}"]), alpha=0.2)
             axis = axes[row, column]
             axis.fill_between(result["time"], lower, upper,
-                              color="#E45756", alpha=0.28, linewidth=0)
+                              color="#E45756", alpha=0.32, linewidth=0)
             axis.plot(result["time"], result[f"ode_{key}"],
-                      color="#111111", lw=2)
-            axis.grid(alpha=0.18)
+                      color="#111111", lw=3.0)
+            polish_axis(axis)
             if row == 0:
                 axis.set_title(title)
             if column == 0:
-                axis.set_ylabel(f"D = {d}")
+                axis.set_ylabel(f"$D={d}$")
             if row == len(rows) - 1:
                 axis.set_xlabel(r"Rescaled time $t=k/D$")
-    axes[0, 0].plot([], [], color="#111111", lw=2, label="ODE")
-    axes[0, 0].fill_between([], [], [], color="#E45756", alpha=0.28,
+    axes[0, 0].plot([], [], color="#111111", lw=3.0, label="ODE")
+    axes[0, 0].fill_between([], [], [], color="#E45756", alpha=0.32,
                             label="Adam central 80%")
-    axes[0, 0].legend(frameon=False)
-    figure.suptitle(f"{classes}-class softmax teacher--student", y=0.995)
-    figure.tight_layout()
-    figure.savefig(output.with_suffix(".png"), dpi=220, bbox_inches="tight")
+    axes[0, 0].legend(frameon=False, loc="best")
+    figure.suptitle(f"{classes}-class softmax teacher--student")
+    figure.savefig(output.with_suffix(".png"), dpi=300, bbox_inches="tight")
     figure.savefig(output.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(figure)
 
