@@ -95,13 +95,8 @@ def main():
         t = jnp.arange(int(T * d)) / d
         mean, lo, hi = compute_ci(risks)
         ax.fill_between(
-<<<<<<< HEAD
             t, lo, hi, color=color, alpha=0.4, linewidth=0,
             label=f"Adam 80% CI, d={d}",
-=======
-            t, lo, hi, color=color, alpha=0.28, linewidth=0,
-            label=f"Adam central 80%, $D={d}$",
->>>>>>> 00c39a4 (asd)
         )
         print(f"d={d:4d}: R0={float(mean[0]):.4f} RT={float(mean[-1]):.4f}")
 
@@ -117,14 +112,9 @@ def main():
     ax.set_xlabel("rescaled time  t = k / d")
     ax.set_ylabel("risk")
     ax.set_yscale("log")
-<<<<<<< HEAD
     # ax.set_xscale("log")
     ax.legend(frameon=False, fontsize=9)
     fig.tight_layout()
-=======
-    polish_axis(ax)
-    ax.legend(frameon=False, loc="best")
->>>>>>> 00c39a4 (asd)
 
     out = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "figs"
