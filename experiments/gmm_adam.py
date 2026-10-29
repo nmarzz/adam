@@ -2,7 +2,8 @@
 """Adam on Gaussian-mixture classification: simulations vs the GMM ODEs.
 
 Data ``x | c ~ N(mu_c, K)`` with shared diagonal ``K`` and ``||mu_c|| = O(1)``;
-batch-one streaming Adam with ``eps * K_ii`` stability and step ``eta(k/D)/D``.
+streaming Adam with ``eps * K_ii`` stability and step ``eta(k/D)/D``, batch size one
+unless stated (``batch`` uses a fixed mini-batch ``b`` independent of ``D``).
 All ODE/coefficient code lives in ``gmm.py``; this file only builds scenarios,
 runs them and plots.
 
@@ -17,7 +18,10 @@ Subcommands
   sweep   binary_iso at one D for several (beta1, beta2, eps): Adam, ODE and the
           beta2 -> 1 (preconditioned SGD) ODE; base setting also without diffusion
   drift   frozen-parameter check of the drift (first moment) at several D
+  batch   every scenario for several batch sizes b at fixed D (and optionally
+          several D at one b): Adam, ODE and the beta2 -> 1 ODE
   plot    make every figure from the saved npz files
+  table   print the numbers quoted in paper/gmm_adam.tex
 """
 from __future__ import annotations
 
@@ -124,16 +128,16 @@ def observables(name, B, Mbar):
             "B": np.diagonal(B, axis1=-2, axis2=-1)}
 
 
-def run_ode(sc, horizon, dt, seed, variant="adam"):
+def run_ode(sc, horizon, dt, seed, variant="adam", batch=1):
     hp = sc["hp"]
     return gmm.run_gmm_ode(
         sc["problem"], sc["theta0"], sc["cov"], sc["means"], sc["probs"],
         lr=hp["lr"], beta1=hp["beta1"], beta2=hp["beta2"], eps=hp["eps"],
         T=horizon, dt=dt, key=jax.random.PRNGKey(seed), variant=variant,
-        config=gmm.coefficient_config(hp["beta1"], hp["beta2"]))
+        config=gmm.coefficient_config(hp["beta1"], hp["beta2"], batch=batch))
 
 
-def run_simulation(sc, D, horizon, runs, records_per_unit, seed):
+def run_simulation(sc, D, horizon, runs, records_per_unit, seed, batch=1):
     hp = sc["hp"]
     record_every = max(1, D // records_per_unit)
     steps = int(round(horizon * D)) // record_every * record_every
@@ -141,7 +145,7 @@ def run_simulation(sc, D, horizon, runs, records_per_unit, seed):
     B, Mbar = gmm.run_adam(sc["problem"], sc["theta0"], sc["cov"], sc["means"],
                            sc["probs"], lr=hp["lr"], beta1=hp["beta1"],
                            beta2=hp["beta2"], eps=hp["eps"], num_steps=steps,
-                           record_every=record_every, keys=keys)
+                           record_every=record_every, keys=keys, batch=batch)
     risk, err = gmm.risks_from_paths(sc["problem"], B, Mbar, sc["probs"])
     return np.arange(B.shape[1]) * record_every / D, np.asarray(B), np.asarray(Mbar), risk, err
 
@@ -219,6 +223,40 @@ def cmd_sweep(args):
             for v in variants), flush=True)
 
 
+def cmd_batch(args):
+    """Mini-batch Adam: each step averages ``b`` fresh samples, ``b`` fixed as D grows."""
+    for name in args.scenarios:
+        for D in args.batch_dimensions:
+            for b in args.batches:
+                path = args.output_dir / f"gmm_batch_{name}_b{b}_D{D}.npz"
+                if path.exists() and not args.overwrite:
+                    print(f"skip {path.name}")
+                    continue
+                sc = build_scenario(name, D, args.seed, args.horizon)
+                t0 = time.time()
+                t_adam, B, Mbar, risk, err = run_simulation(
+                    sc, D, args.horizon, args.batch_runs, args.records_per_unit,
+                    args.seed + 7 * D + 101 * b, batch=b)
+                t1 = time.time()
+                result = {"time": t_adam, "adam_risk": risk, "adam_error": err,
+                          "D": D, "batch": b}
+                for variant in args.batch_variants:
+                    ode = run_ode(sc, args.horizon, args.ode_dt, args.seed + 11 * D + b,
+                                  variant, batch=b)
+                    result[f"ode_{variant}"] = interp_ode(ode.times, ode.risk, t_adam)
+                    if variant == "adam":
+                        result["ode_risk"] = result["ode_adam"]
+                        result["ode_error"] = interp_ode(ode.times, ode.error, t_adam)
+                        result["ode_time_fine"] = ode.times
+                        result["ode_risk_fine"] = ode.risk
+                np.savez_compressed(path, **result)
+                gap = np.max(np.abs(risk.mean(0) - result["ode_risk"]))
+                psgd = (f" (psgd {np.max(np.abs(risk.mean(0) - result['ode_psgd'])):.4f})"
+                        if "ode_psgd" in result else "")
+                print(f"batch {name} b={b} D={D}: adam {t1 - t0:.0f}s ode {time.time() - t1:.0f}s "
+                      f"sup|mean risk - ode| = {gap:.4f}{psgd}", flush=True)
+
+
 def cmd_drift(args):
     """Average Adam direction at a frozen Theta vs the predicted drift."""
     name = "binary_aniso"
@@ -267,7 +305,9 @@ def central(x, alpha=0.2):
 
 def save(fig, args, stem):
     fig.savefig(args.output_dir / f"{stem}.png", dpi=300, bbox_inches="tight")
-    fig.savefig(args.output_dir / f"{stem}.pdf", bbox_inches="tight")
+    # No creation date, so unchanged figures are byte-identical across reruns.
+    fig.savefig(args.output_dir / f"{stem}.pdf", bbox_inches="tight",
+                metadata={"CreationDate": None})
     plt.close(fig)
 
 
@@ -530,6 +570,138 @@ def plot_drift(args):
     save(fig, args, "gmm_drift_check")
 
 
+BATCH_COLORS = ["#86b6ef", "#3987e5", "#1c5cab", "#0d366b"]   # ordinal blue (b)
+
+
+def batch_colors(args):
+    """One ordinal colour per batch size, shared by all batch figures."""
+    sizes = sorted(set(args.batches) | {args.scaling_batch})
+    return dict(zip(sizes, BATCH_COLORS + [INK] * max(0, len(sizes) - len(BATCH_COLORS))))
+
+
+def load_batch(args, name, b, D):
+    path = args.output_dir / f"gmm_batch_{name}_b{b}_D{D}.npz"
+    return dict(np.load(path)) if path.exists() else None
+
+
+def plot_batch(args):
+    D = args.batch_dimensions[0]
+    batches = sorted(args.batches)
+    if load_batch(args, args.scenarios[0], batches[0], D) is None:
+        return
+    colors = batch_colors(args)
+    markers = dict(zip(batches, ["o", "s", "^", "D"]))
+    n = len(args.scenarios)
+    fig, axes = plt.subplots(2, n, figsize=(6.0 * n, 9.0), constrained_layout=True,
+                             squeeze=False)
+    for col, name in enumerate(args.scenarios):
+        for b in batches:
+            r = load_batch(args, name, b, D)
+            if r is None:
+                continue
+            idx = marker_times(r["time"])
+            for row, scale in ((0, 1.0), (1, float(b))):
+                ax = axes[row, col]
+                # The samples axis is logarithmic: start at the first positive time.
+                fine = slice(1, None) if row == 1 else slice(None)
+                ax.plot(scale * r["ode_time_fine"][fine], r["ode_risk_fine"][fine],
+                        color=colors[b], lw=2.0, zorder=2, label=f"$b={b}$")
+                adam_markers(ax, scale * r["time"], r["adam_risk"], idx, colors[b],
+                             markers[b], ms=5.5)
+        for row in range(2):
+            polish_axis(axes[row, col])
+        axes[0, col].set_title(TITLES[name])
+        axes[0, col].set_xlabel(r"iterations / $D$")
+        axes[1, col].set_xlabel(r"samples / $D$ $=b\,t$")
+        axes[1, col].set_xscale("log")
+    axes[0, 0].set_ylabel("Population risk")
+    axes[1, 0].set_ylabel("Population risk")
+    handles = [matplotlib.lines.Line2D([], [], color=colors[b], marker=markers[b], lw=2.0,
+                                       mec="white", label=f"$b={b}$") for b in batches]
+    axes[0, 0].legend(handles=handles, frameon=False, fontsize=12.5, loc="upper right",
+                      title="lines: ODE, markers: Adam", title_fontsize=11.5)
+    runs = load_batch(args, args.scenarios[0], batches[0], D)["adam_risk"].shape[0]
+    fig.suptitle(f"Mini-batch Adam, fixed $b$, $D={D}$ "
+                 f"({runs} runs; bars: central 80%)", fontsize=17)
+    save(fig, args, "gmm_batch")
+
+
+def plot_batch_checks(args):
+    D = args.batch_dimensions[0]
+    batches = sorted(args.batches)
+    if load_batch(args, args.scenarios[0], batches[0], D) is None:
+        return
+    colors = batch_colors(args)
+    fig, axes = plt.subplots(1, 2, figsize=(13.0, 5.8), constrained_layout=True)
+    ax = axes[0]
+    hi = 0.0
+    for name in args.scenarios:
+        _, marker = SCENARIO_STYLE[name]
+        for b in batches:
+            r = load_batch(args, name, b, D)
+            if r is None:
+                continue
+            idx = marker_times(r["time"])
+            pred, obs = r["ode_risk"][idx], r["adam_risk"][:, idx]
+            lo, up = central(obs)
+            mean = obs.mean(0)
+            ax.errorbar(pred, mean, yerr=[mean - lo, up - mean], fmt=marker, ms=7,
+                        color=colors[b], mec="white", mew=0.9, elinewidth=1.3, capsize=0)
+            hi = max(hi, pred.max(), up.max())
+    lim = 1.05 * hi
+    ax.plot((0, lim), (0, lim), color=MUTED, lw=1.5, zorder=0)
+    ax.set_xlim(0, lim)
+    ax.set_ylim(0, lim)
+    ax.set_aspect("equal")
+    polish_axis(ax)
+    ax.set_xlabel("ODE-predicted risk")
+    ax.set_ylabel("Adam risk")
+    ax.set_title(f"Risk vs predicted risk, $D={D}$")
+    handles = ([matplotlib.lines.Line2D([], [], color=colors[b], lw=0, marker="o", ms=8,
+                                        label=f"$b={b}$") for b in batches]
+               + [matplotlib.lines.Line2D([], [], color=MUTED, lw=0, marker=SCENARIO_STYLE[s][1],
+                                          ms=8, label=TITLES[s]) for s in args.scenarios])
+    ax.legend(handles=handles, frameon=False, fontsize=11, loc="upper left")
+
+    ax = axes[1]
+    name, b = args.scaling_scenario, args.scaling_batch
+
+    def bias_series(paths):
+        """|mean Adam risk - ODE| at its largest point, with 2 s.e. of the mean there."""
+        dims, gaps, errs = [], [], []
+        for path in sorted(paths, key=lambda p: int(str(p).split("_D")[-1].split(".")[0])):
+            r = dict(np.load(path))
+            gap = r["adam_risk"].mean(0) - r["ode_risk"]
+            k = int(np.argmax(np.abs(gap)))
+            dims.append(int(r["D"]))
+            gaps.append(abs(gap[k]))
+            errs.append(2 * r["adam_risk"][:, k].std(ddof=1) / np.sqrt(r["adam_risk"].shape[0]))
+        return np.array(dims), np.array(gaps), np.array(errs)
+
+    series = [(1, sorted(args.output_dir.glob(f"gmm_{name}_D*.npz")), colors[1], "o"),
+              (b, sorted(args.output_dir.glob(f"gmm_batch_{name}_b{b}_D*.npz")),
+               colors[b], "s")]
+    all_dims = []
+    for bb, paths, color, marker in series:
+        if len(paths) < 2:
+            continue
+        dims, gaps, errs = bias_series(paths)
+        all_dims.extend(dims)
+        ax.errorbar(dims, gaps, yerr=errs, color=color, marker=marker, ms=8, lw=2.0,
+                    capsize=0, mec="white", mew=1.0, label=f"$b={bb}$")
+        ax.plot(dims, gaps[0] * dims[0] / dims, color=color, lw=1.2, ls=(0, (4, 3)))
+    if all_dims:
+        dims = np.array(sorted(set(all_dims)))
+        log_dimension_axis(ax, dims)
+        ax.plot([], [], color=MUTED, lw=1.2, ls=(0, (4, 3)), label=r"$\propto D^{-1}$")
+        ax.legend(frameon=False, fontsize=12, loc="upper right")
+    polish_axis(ax)
+    ax.set_xlabel("Dimension $D$")
+    ax.set_ylabel(r"$\max_{t\leq 6}\,|\overline{\mathcal{R}}(t)-\mathscr{R}(t)|$")
+    ax.set_title(f"Bias of the mean risk ({TITLES[name]})", fontsize=15)
+    save(fig, args, "gmm_batch_checks")
+
+
 def cmd_table(args):
     """Print the numbers quoted in paper/gmm_adam.tex."""
     print("scenario & D & sup_t|mean Adam - ODE| & median per-run sup error & "
@@ -568,6 +740,16 @@ def cmd_table(args):
             excess = np.sqrt(max(np.sum((meas - pred) ** 2) - np.sum(se_coord ** 2), 0.0))
             out.append(f"{k}: proj rel {rel_proj:+.4f}, vec rel {excess / np.linalg.norm(pred):.4f}")
         print(path.stem, f"measured <d,mu+> = {m:.4f} +- {se:.4f};", "; ".join(out))
+    for path in sorted(args.output_dir.glob("gmm_batch_*.npz")):
+        r = dict(np.load(path))
+        mean = r["adam_risk"].mean(0)
+        per_run = np.median(np.max(np.abs(r["adam_risk"] - r["ode_risk"][None]), axis=1))
+        psgd = (f"psgd gap {np.max(np.abs(mean - r['ode_psgd'])):.4f}" if "ode_psgd" in r
+                else "psgd -")
+        print(path.stem, f"mean gap {np.max(np.abs(mean - r['ode_risk'])):.4f}",
+              f"per-run {per_run:.4f}", psgd,
+              f"risk {r['ode_risk'][0]:.3f}->{r['ode_risk'][-1]:.3f}",
+              f"max run std {np.max(r['adam_risk'].std(0)):.4f}")
 
 
 def cmd_plot(args):
@@ -577,12 +759,15 @@ def cmd_plot(args):
     plot_dimension_scaling(args)
     plot_sweep(args)
     plot_drift(args)
+    plot_batch(args)
+    plot_batch_checks(args)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["main", "sweep", "drift", "plot", "table", "all"])
+    parser.add_argument("command",
+                        choices=["main", "sweep", "drift", "batch", "plot", "table", "all"])
     parser.add_argument("--scenarios", nargs="+", default=list(SCENARIOS), choices=SCENARIOS)
     parser.add_argument("--dimensions", type=int, nargs="+",
                         default=[250, 500, 1000, 2000, 4000])
@@ -598,6 +783,13 @@ def parse_args():
                         help="suffix for the sweep npz files (e.g. _D8000)")
     parser.add_argument("--drift-dimensions", type=int, nargs="+", default=[1000, 4000])
     parser.add_argument("--drift-steps", type=int, default=150_000)
+    parser.add_argument("--batches", type=int, nargs="+", default=[1, 4, 16])
+    parser.add_argument("--batch-dimensions", type=int, nargs="+", default=[2000])
+    parser.add_argument("--batch-runs", type=int, default=16)
+    parser.add_argument("--batch-variants", nargs="+", default=["adam", "psgd"],
+                        choices=list(gmm.VARIANTS))
+    parser.add_argument("--scaling-scenario", default="binary_aniso", choices=SCENARIOS)
+    parser.add_argument("--scaling-batch", type=int, default=8)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "figs" / "experiments")
@@ -607,9 +799,10 @@ def parse_args():
 def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    commands = {"main": cmd_main, "sweep": cmd_sweep, "drift": cmd_drift, "plot": cmd_plot,
-                "table": cmd_table}
-    for name in (["main", "sweep", "drift", "plot"] if args.command == "all" else [args.command]):
+    commands = {"main": cmd_main, "sweep": cmd_sweep, "drift": cmd_drift, "batch": cmd_batch,
+                "plot": cmd_plot, "table": cmd_table}
+    order = ["main", "sweep", "drift", "batch", "plot"]
+    for name in (order if args.command == "all" else [args.command]):
         commands[name](args)
     with (args.output_dir / "gmm_config.json").open("w") as handle:
         json.dump({k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},

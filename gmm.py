@@ -38,6 +38,20 @@ for ``p_j`` [``P``] and ``o_j`` [``V``] are
 
 with ``B = sum_j p_j`` and ``O = sum_j o_j``.
 
+Mini-batches
+------------
+With a batch of ``b`` samples per step (``b`` fixed as ``D`` grows) the same ODEs
+hold with batch coefficients: ``xi_0 f_r(q_0)`` is replaced by the normalized batch
+gradient ``y_{0,r} = (1/b) sum_beta f_r(q_{0,beta}) xi_{0,beta}``, so
+``A_r = c_beta y_{0,r} sum_l beta1^l S_{l,r}^{-1/2}`` with ``S`` built from ``y^2``, and
+
+* ``phi[s, r] = sum_beta E[ d/dq_{0,beta}^s (xi_{0,beta} A_r) ]``
+* ``chi[c, r] = sum_beta E[ 1{c_{0,beta} = c} xi_{0,beta} A_r ]``
+* ``sigma[r, s] = E[ A_r A_s ]``
+
+(``CoefficientConfig.batch``; ``run_adam(..., batch=b)``).  Time is still
+``t = k / D`` in iterations; ``b t`` counts samples per ``D``.
+
 The expectations are estimated with long simulated sample paths: one forward
 recursion builds every denominator ``S_t`` and one backward recursion builds the
 discounted future sums, so each time index of each path is a valid "sample 0".
@@ -158,14 +172,21 @@ class CoefficientConfig(NamedTuple):
     burn_in: int = 400        # warm-up so S_t sees its whole past (beta2^burn_in ~ 0)
     num_used: int = 2048      # time indices per path used as "sample 0"
     tail: int = 200           # look-ahead so the beta1-discounted future sum converges
+    batch: int = 1            # samples per Adam step (b), fixed as D grows
 
 
-def coefficient_config(beta1, beta2, *, num_paths=128, num_used=2048,
+def coefficient_config(beta1, beta2, *, batch=1, num_paths=None, num_used=2048,
                        tol=1e-8) -> CoefficientConfig:
-    """Burn-in/look-ahead lengths so that ``beta2^burn_in, beta1^tail < tol``."""
+    """Burn-in/look-ahead lengths so that ``beta2^burn_in, beta1^tail < tol``.
+
+    By default the number of paths shrinks for large batches so that the number
+    of simulated samples (paths x time x batch) stays bounded.
+    """
     burn = int(np.ceil(np.log(tol) / np.log(beta2))) if beta2 > 0 else 1
     tail = int(np.ceil(np.log(tol) / np.log(beta1))) if beta1 > 0 else 1
-    return CoefficientConfig(num_paths, max(burn, 1), num_used, max(tail, 1))
+    if num_paths is None:
+        num_paths = 128 if batch <= 4 else max(16, 512 // batch)
+    return CoefficientConfig(num_paths, max(burn, 1), num_used, max(tail, 1), batch)
 
 
 class BaseNoise(NamedTuple):
@@ -174,19 +195,20 @@ class BaseNoise(NamedTuple):
     Reusing the same draws at every ODE step (common random numbers) makes the
     estimated coefficients smooth deterministic functions of ``(B, Mbar)``.
     """
-    u: jnp.ndarray    # (L, n) uniforms -> class labels
-    z: jnp.ndarray    # (L, n, M) standard normals -> q = Mbar[:, c] + B^{1/2} z
-    xi: jnp.ndarray   # (L, n) standard normals -> normalized data coordinate
+    u: jnp.ndarray    # (L, n, b) uniforms -> class labels
+    z: jnp.ndarray    # (L, n, b, M) standard normals -> q = Mbar[:, c] + B^{1/2} z
+    xi: jnp.ndarray   # (L, n, b) standard normals -> normalized data coordinate
 
 
 def draw_base_noise(key, num_outputs: int,
                     config: CoefficientConfig = CoefficientConfig(),
                     dtype=jnp.float64) -> BaseNoise:
     L = config.burn_in + config.num_used + config.tail
+    shape = (L, config.num_paths, config.batch)
     k_u, k_z, k_x = jax.random.split(key, 3)
-    return BaseNoise(jax.random.uniform(k_u, (L, config.num_paths), dtype),
-                     jax.random.normal(k_z, (L, config.num_paths, num_outputs), dtype),
-                     jax.random.normal(k_x, (L, config.num_paths), dtype))
+    return BaseNoise(jax.random.uniform(k_u, shape, dtype),
+                     jax.random.normal(k_z, shape + (num_outputs,), dtype),
+                     jax.random.normal(k_x, shape, dtype))
 
 
 def adam_coefficients(B, Mbar, probs, key, *, problem: GMMProblem, beta1, beta2,
@@ -195,7 +217,8 @@ def adam_coefficients(B, Mbar, probs, key, *, problem: GMMProblem, beta1, beta2,
 
     ``phi[s, r]`` multiplies ``Kbar Theta`` (row ``s`` indexes logits, column ``r``
     outputs), ``chi[c, r]`` multiplies ``Dinv xbar_c`` and ``sigma`` is the
-    one-coordinate diffusion matrix for diagonal ``K``.
+    one-coordinate diffusion matrix for diagonal ``K``.  ``config.batch`` is the
+    mini-batch size ``b``.
     """
     noise = draw_base_noise(key, B.shape[0], config, B.dtype)
     return adam_coefficients_from_noise(B, Mbar, probs, noise, problem=problem,
@@ -207,23 +230,34 @@ def adam_coefficients(B, Mbar, probs, key, *, problem: GMMProblem, beta1, beta2,
 def adam_coefficients_from_noise(B, Mbar, probs, noise: BaseNoise, *,
                                  problem: GMMProblem, beta1, beta2, eps,
                                  config: CoefficientConfig = CoefficientConfig()):
-    """Same as :func:`adam_coefficients` with the randomness supplied."""
-    n, H0, T, H1 = config.num_paths, config.burn_in, config.num_used, config.tail
+    """Same as :func:`adam_coefficients` with the randomness supplied.
+
+    With batch size ``b`` the normalized gradient of one coordinate at step ``t``
+    is ``y_t = (1/b) sum_beta f(q_{t,beta}) xi_{t,beta}`` and, with ``A`` the total
+    contribution of batch 0 (``c_beta y_0 R1``),
+
+        phi[s, r]   = sum_beta E[ d/dq_{0,beta}^s (xi_{0,beta} A_r) ]
+                    = (c_beta / b) E[ sum_beta d_s f_r(q_{0,beta}) xi_{0,beta}^2 (R1_r - y_{0,r}^2 R3_r) ]
+        chi[c, r]   = sum_beta E[ 1{c_{0,beta} = c} xi_{0,beta} A_r ]
+        sigma[r, s] = E[ A_r A_s ]
+
+    which reduce to the batch-one formulas for ``b = 1``.
+    """
+    n, H0, T, bsz = config.num_paths, config.burn_in, config.num_used, config.batch
     M, C = B.shape[0], probs.shape[0]
     dtype = B.dtype
-    c = jnp.minimum(jnp.searchsorted(jnp.cumsum(probs), noise.u), C - 1)
-    xi = noise.xi
-    q = Mbar.T[c] + noise.z @ psd_sqrt(B).T                              # (L, n, M)
-    fq = problem.f(q, c)                                                 # (L, n, M)
-    xi2 = xi[..., None] ** 2
-    h = fq ** 2 * xi2
+    c = jnp.minimum(jnp.searchsorted(jnp.cumsum(probs), noise.u), C - 1)  # (L, n, b)
+    xi = noise.xi                                                          # (L, n, b)
+    q = Mbar.T[c] + noise.z @ psd_sqrt(B).T                                # (L, n, b, M)
+    fq = problem.f(q, c)                                                   # (L, n, b, M)
+    y = jnp.mean(fq * xi[..., None], axis=2)                               # (L, n, M)
     delta = eps / (1.0 - beta2)
 
     def forward(S, h_t):
         S = beta2 * S + h_t
         return S, S
 
-    _, S = lax.scan(forward, jnp.zeros((n, M), dtype), h)
+    _, S = lax.scan(forward, jnp.zeros((n, M), dtype), y ** 2)
     S = S + delta
     inv_half = lax.rsqrt(S)
     inv_three_half = inv_half / S
@@ -241,40 +275,41 @@ def adam_coefficients_from_noise(B, Mbar, probs, noise: BaseNoise, *,
 
     sl = slice(H0, H0 + T)
     cb = (1.0 - beta1) / jnp.sqrt(1.0 - beta2)
-    f_u, xi_u, xi2_u, R1_u, R3_u = fq[sl], xi[sl], xi2[sl], R1[sl], R3[sl]
+    y_u, R1_u, R3_u, xi_u = y[sl], R1[sl], R3[sl], xi[sl]
     count = T * n
 
-    A = cb * f_u * xi_u[..., None] * R1_u                               # (T, n, M)
+    A = cb * y_u * R1_u                                                    # (T, n, M)
     sigma = jnp.einsum("tnr,tns->rs", A, A) / count
 
-    weight = cb * xi2_u * (R1_u - f_u ** 2 * xi2_u * R3_u)              # (T, n, M)
-    J = problem.jac(q[sl], c[sl])                                        # (T, n, M, M)
-    phi = jnp.einsum("tnrs,tnr->sr", J, weight) / count
+    weight = (cb / bsz) * (R1_u - y_u ** 2 * R3_u)                         # (T, n, M)
+    J = problem.jac(q[sl], c[sl])                                          # (T, n, b, M, M)
+    phi = jnp.einsum("tnbrs,tnb,tnr->sr", J, xi_u ** 2, weight) / count
 
-    onehot = jax.nn.one_hot(c[sl], C, dtype=dtype)
-    chi = cb * jnp.einsum("tnc,tnr->cr", onehot, f_u * xi2_u * R1_u) / count
+    onehot = jax.nn.one_hot(c[sl], C, dtype=dtype)                         # (T, n, b, C)
+    chi = cb * jnp.einsum("tnbc,tnb,tnr->cr", onehot, xi_u, y_u * R1_u) / count
     return phi, chi, sigma
 
 
 def psgd_coefficients(B, Mbar, probs, noise: BaseNoise, *, problem: GMMProblem,
                       eps, config: CoefficientConfig = CoefficientConfig()):
     """``beta2 -> 1`` limit: Adam replaced by momentum SGD with the deterministic
-    preconditioner ``1 / sqrt(E v + eps)``.  Used as a baseline only.
+    preconditioner ``1 / sqrt(E v + eps)``, where ``E v = E f^2 / b``.  Baseline only.
 
-        phi[s, r]   = E[d_s f_r] / sqrt(E f_r^2 + eps)
-        chi[c, r]   = E[1{c} f_r] / sqrt(E f_r^2 + eps)
-        sigma[r, s] = E[f_r f_s] / sqrt((E f_r^2 + eps)(E f_s^2 + eps))
+        phi[s, r]   = E[d_s f_r] / sqrt(E f_r^2 / b + eps)
+        chi[c, r]   = E[1{c} f_r] / sqrt(E f_r^2 / b + eps)
+        sigma[r, s] = (E[f_r f_s] / b) / sqrt((E f_r^2 / b + eps)(E f_s^2 / b + eps))
     """
-    C = probs.shape[0]
+    C, bsz = probs.shape[0], config.batch
     c = jnp.minimum(jnp.searchsorted(jnp.cumsum(probs), noise.u), C - 1)
     q = Mbar.T[c] + noise.z @ psd_sqrt(B).T
     fq = problem.f(q, c)
-    count = fq.shape[0] * fq.shape[1]
-    scale = lax.rsqrt(jnp.mean(fq ** 2, axis=(0, 1)) + eps)                # (M,)
-    phi = jnp.einsum("lnrs->sr", problem.jac(q, c)) / count * scale[None, :]
+    count = fq.shape[0] * fq.shape[1] * fq.shape[2]
+    scale = lax.rsqrt(jnp.mean(fq ** 2, axis=(0, 1, 2)) / bsz + eps)            # (M,)
+    phi = jnp.einsum("lnbrs->sr", problem.jac(q, c)) / count * scale[None, :]
     onehot = jax.nn.one_hot(c, C, dtype=B.dtype)
-    chi = jnp.einsum("lnc,lnr->cr", onehot, fq) / count * scale[None, :]
-    sigma = jnp.einsum("lnr,lns->rs", fq, fq) / count * scale[:, None] * scale[None, :]
+    chi = jnp.einsum("lnbc,lnbr->cr", onehot, fq) / count * scale[None, :]
+    second = jnp.einsum("lnbr,lnbs->rs", fq, fq) / count / bsz
+    sigma = second * scale[:, None] * scale[None, :]
     return phi, chi, sigma
 
 
@@ -435,17 +470,19 @@ def run_isotropic_ode(problem: GMMProblem, B0, Mbar0, gram, probs, *, lr, beta1,
 # --------------------------------------------------------------------------- #
 # Streaming Adam on mixture data
 # --------------------------------------------------------------------------- #
-def sample_mixture(key, cov_sqrt, means, probs):
+def sample_mixture(key, cov_sqrt, means, probs, batch=1):
+    """Draw ``batch`` i.i.d. samples: returns ``x (batch, D)`` and labels ``(batch,)``."""
     k_c, k_x = jax.random.split(key)
-    c = jax.random.categorical(k_c, jnp.log(probs))
-    x = means[:, c] + cov_sqrt * jax.random.normal(k_x, cov_sqrt.shape, means.dtype)
-    return x, c
+    c = jax.random.categorical(k_c, jnp.log(probs), shape=(batch,))
+    noise = jax.random.normal(k_x, (batch,) + cov_sqrt.shape, means.dtype)
+    return means[:, c].T + cov_sqrt * noise, c
 
 
 def run_adam(problem: GMMProblem, theta0, cov_diag, means, probs, *, lr, beta1,
-             beta2, eps, num_steps, record_every, keys):
-    """Streaming batch-one Adam (no bias correction) vmapped over ``keys``.
+             beta2, eps, num_steps, record_every, keys, batch=1):
+    """Streaming mini-batch Adam (no bias correction) vmapped over ``keys``.
 
+    Each step averages the gradient over ``batch`` fresh samples.
     ``lr`` is the *rescaled* profile: step ``k`` uses ``lr(k / D) / D``.  The
     stability array is ``eps * K_ii`` as in the main paper.  Returns the order
     parameters recorded *before* steps ``0, record_every, 2 record_every, ...``
@@ -464,8 +501,8 @@ def run_adam(problem: GMMProblem, theta0, cov_diag, means, probs, *, lr, beta1,
         def step(carry, k):
             theta, m, v, key = carry
             key, sub = jax.random.split(key)
-            x, c = sample_mixture(sub, cov_sqrt, means, probs)
-            g = jnp.outer(x, problem.f(theta.T @ x, c))
+            x, c = sample_mixture(sub, cov_sqrt, means, probs, batch)
+            g = x.T @ problem.f(x @ theta, c) / batch
             m = beta1 * m + (1.0 - beta1) * g
             v = beta2 * v + (1.0 - beta2) * g ** 2
             theta = theta - (lr_at(k / D) / D) * m / jnp.sqrt(v + eps_arr)
@@ -511,7 +548,7 @@ def predicted_drift(theta, cov_diag, means, coeffs):
 
 def frozen_adam_mean_update(problem: GMMProblem, theta, cov_diag, means, probs, *,
                             beta1, beta2, eps, num_steps, burn_in, key,
-                            num_chains=8):
+                            num_chains=8, batch=1):
     """Average Adam direction ``m / sqrt(v + eps)`` with ``Theta`` held fixed.
 
     Runs ``num_chains`` independent chains for ``burn_in + num_steps`` steps and
@@ -525,8 +562,8 @@ def frozen_adam_mean_update(problem: GMMProblem, theta, cov_diag, means, probs, 
         def step(carry, k):
             m, v, acc, key = carry
             key, sub = jax.random.split(key)
-            x, c = sample_mixture(sub, cov_sqrt, means, probs)
-            g = jnp.outer(x, problem.f(theta.T @ x, c))
+            x, c = sample_mixture(sub, cov_sqrt, means, probs, batch)
+            g = x.T @ problem.f(x @ theta, c) / batch
             m = beta1 * m + (1.0 - beta1) * g
             v = beta2 * v + (1.0 - beta2) * g ** 2
             acc = acc + jnp.where(k >= burn_in, m / jnp.sqrt(v + eps_arr), 0.0)
