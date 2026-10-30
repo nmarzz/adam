@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 from functools import partial
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -368,3 +369,237 @@ def stationary_coefficients(B, O, priors, draws, f, beta1, beta2, eps, *,
         "sigma": c_beta ** 2 * sigma / count,
         "tau": c_beta ** 2 * (tau + tau.T) / (2 * count),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Softmax mixtures with many rare classes (experiments/zipf_adam_plan.md)
+#
+# Every coefficient is a sum over the class of one "sample 0",
+# ``coef = sum_c pi_c E[contribution | c_{01} = c]``. The class-conditional
+# expectations are estimated from pooled events: every window sample of
+# ordinary paths (classes ~ pi), plus forced events -- one sample whose class is
+# set by hand -- on extra paths for classes too rare to be seen often enough.
+# A forced path carries one event per rare class (so a class never contaminates
+# its own denominator), and events are spaced so that forced samples are at most
+# ``forced_fraction`` of all samples. The softmax Jacobian
+# ``d f_r / d q_s = p_r (delta_rs - p_s)`` is contracted on the fly, and paths are
+# processed in chunks, so no ``(paths, T, b, C, C)`` tensor is ever formed.
+# --------------------------------------------------------------------------- #
+class SoftmaxLayout(NamedTuple):
+    """Static shapes of a :func:`softmax_coefficients` estimate (hashable)."""
+    classes: int
+    batch: int
+    burn: int
+    window: int          # "sample 0" times per ordinary path
+    tail: int
+    plain_paths: int
+    plain_chunk: int     # ordinary paths per chunk
+    forced_paths: int
+    forced_chunk: int
+    events: int          # forced events per forced path (= number of rare classes)
+    spacing: int         # steps between forced events
+
+
+class SoftmaxPlan(NamedTuple):
+    """Arrays of a :func:`softmax_coefficients` estimate (common random numbers)."""
+    key_plain: jnp.ndarray
+    key_forced: jnp.ndarray
+    forced: jnp.ndarray   # (forced_paths, events) class of each forced event
+    weights: jnp.ndarray  # (C,) pi_c / pooled number of class-c events
+    counts: jnp.ndarray   # (2, C) ordinary and forced class-c events
+
+
+def _softmax_chunk_draws(key, index, paths, length, batch, classes, cdf):
+    k_u, k_z, k_x = jax.random.split(jax.random.fold_in(key, index), 3)
+    u = jax.random.uniform(k_u, (paths, length, batch))
+    labels = jnp.searchsorted(cdf, u, side="right")
+    z = jax.random.normal(k_z, (paths, length, batch, classes))
+    xi = jax.random.normal(k_x, (paths, length, batch))
+    return labels, z, xi
+
+
+def softmax_plan(key, priors, beta1, beta2, *, batch=1, plain_batches=2 ** 18,
+                 window=1024, min_events=1000, forced_fraction=0.02,
+                 chunk_elements=2 ** 24, min_chunks=1, tol=1e-8):
+    """Layout and common random numbers for :func:`softmax_coefficients`.
+
+    ``plain_batches`` ordinary batches (paths x window) are used as "sample 0";
+    every class with fewer than ``min_events`` ordinary events gets
+    ``min_events`` forced events. ``min_chunks > 1`` splits both kinds of paths
+    into at least that many chunks (for batch-means standard errors).
+    """
+    priors = jnp.asarray(priors)
+    C = len(priors)
+    burn, window, tail = path_layout(beta1, beta2, window, tol)
+    plain_length = burn + window + tail
+    plain_chunk = max(1, min(plain_batches // window // min_chunks,
+                             chunk_elements // (plain_length * batch * C)))
+    plain_paths = plain_chunk * max(1, -(-(plain_batches // window) // plain_chunk))
+    k_plain, k_forced, k_perm = jax.random.split(key, 3)
+    cdf = jnp.cumsum(priors)[:-1]
+
+    @jax.jit
+    def chunk_counts(i):
+        u = jax.random.uniform(jax.random.split(jax.random.fold_in(k_plain, i), 3)[0],
+                               (plain_chunk, plain_length, batch))
+        labels = jnp.searchsorted(cdf, u[:, burn:burn + window], side="right")
+        return jnp.bincount(labels.ravel(), length=C)
+
+    plain = sum(chunk_counts(i) for i in range(plain_paths // plain_chunk))
+    rare = jnp.flatnonzero(plain < min_events)
+    events = int(len(rare))
+    spacing = max(1, math.ceil(1 / (forced_fraction * batch)))
+    forced_paths = min_events if events else 0
+    forced_length = burn + max(events - 1, 0) * spacing + 1 + tail
+    forced_chunk = max(1, min(max(forced_paths // min_chunks, 1),
+                              chunk_elements // (forced_length * batch * C)))
+    forced_paths = forced_chunk * -(-forced_paths // forced_chunk) if events else 0
+    keys = jax.random.split(k_perm, max(forced_paths, 1))
+    forced = jax.vmap(lambda k: jax.random.permutation(k, rare))(keys) if events \
+        else jnp.zeros((1, 1), int)
+    forced_counts = jnp.zeros(C, int).at[rare].set(forced_paths)
+    total = plain + forced_counts
+    layout = SoftmaxLayout(C, batch, burn, window, tail, plain_paths, plain_chunk,
+                           forced_paths, forced_chunk, max(events, 1), spacing)
+    plan = SoftmaxPlan(k_plain, k_forced, forced,
+                       priors / jnp.maximum(total, 1), jnp.stack([plain, forced_counts]))
+    return layout, plan
+
+
+@partial(jax.jit, static_argnames=["layout", "mode", "stein", "diagnostics"])
+def softmax_coefficients(B, O, priors, plan: SoftmaxPlan, beta1, beta2, eps, *,
+                         layout: SoftmaxLayout, mode="adam", stein=False,
+                         diagnostics=False):
+    """``phi``, ``chi``, ``sigma`` (and ``tau = sigma``) for ``C``-class softmax
+    regression on a mixture with ``M = C`` logits and no teacher.
+
+    ``mode="adam"`` gives the mini-batch Adam coefficients of
+    :func:`stationary_coefficients` (derivative or ``stein`` form of ``phi``);
+    ``"sgd"`` gives ``E[grad f]``, ``diag(pi) E[f|c]``, ``E[f f^T]/b``; ``"psgd"``
+    is the ``beta2 -> 1`` limit, SGD coefficients with the deterministic
+    preconditioner ``(E f_r^2 / b + eps)^{-1/2}`` on output ``r``.
+    ``tau`` is not estimated: it does not enter for ``K = Id``.
+
+    With ``diagnostics=True`` also returns per-chunk contributions to the
+    diagonals of ``chi``, ``phi`` and ``sigma`` (for batch-means standard errors).
+    """
+    C, b = layout.classes, layout.batch
+    root = sym_sqrt(B)
+    cdf = jnp.cumsum(priors)[:-1]
+    c_beta = (1 - beta1) / jnp.sqrt(1 - beta2)
+    floor = eps / (1 - beta2)
+    weights = plan.weights
+
+    def accumulate(labels, noise, p, f, xi, y, R, Rp):
+        """Weighted sums over events ``(n, T, b_e)``; ``y, R, Rp`` are batch level."""
+        w = weights[labels]
+        if mode != "adam":
+            out = {
+                "phi": jnp.diag(jnp.einsum("ntb,ntbr->r", w, p))
+                - jnp.einsum("ntbs,ntbr->sr", w[..., None] * p, p),
+                "chi": jax.ops.segment_sum((w[..., None] * f).reshape(-1, C),
+                                           labels.ravel(), C),
+                "second": jnp.einsum("ntbr,ntbs->rs", w[..., None] * f, f),
+            }
+            return out
+        A = c_beta * y * R
+        if stein:
+            phi = jnp.einsum("ntbs,ntr->sr", (w * b * xi)[..., None] * noise, A)
+        else:
+            weight = (w * c_beta * xi ** 2)[..., None] * p
+            W = R - y ** 2 * Rp
+            phi = (jnp.diag(jnp.einsum("ntbr,ntr->r", weight, W))
+                   - jnp.einsum("ntbs,ntbr->sr", weight, p * W[:, :, None, :]))
+        values = (w * b * xi)[..., None] * A[:, :, None, :]
+        chi = jax.ops.segment_sum(values.reshape(-1, C), labels.ravel(), C)
+        sigma = jnp.einsum("ntbr,nts->rs",
+                           (w * c_beta * xi)[..., None] * f * R[:, :, None, :], A)
+        return {"phi": phi, "chi": chi, "sigma": sigma}
+
+    def chunk(key, index, paths, length, forced_rows=None, times=None):
+        labels, z, xi = _softmax_chunk_draws(key, index, paths, length, b, C, cdf)
+        if forced_rows is not None:
+            labels = labels.at[:, times, 0].set(forced_rows.astype(labels.dtype))
+        noise = z @ root
+        p = jax.nn.softmax(O.T[labels] + noise, axis=-1)
+        f = p - jax.nn.one_hot(labels, C, dtype=p.dtype)
+        y = R = Rp = None
+        if mode == "adam":
+            y = jnp.mean(f * xi[..., None], axis=2)
+            S = _recurrence(beta2, y ** 2) + floor
+            R = _recurrence(beta1, S ** -0.5, reverse=True)
+            Rp = None if stein else _recurrence(beta1 * beta2, S ** -1.5, reverse=True)
+        if forced_rows is None:
+            window = slice(layout.burn, layout.burn + layout.window)
+            pick = lambda a: None if a is None else a[:, window]
+            return accumulate(labels[:, window], noise[:, window], p[:, window],
+                              f[:, window], xi[:, window], pick(y), pick(R), pick(Rp))
+        pick = lambda a: None if a is None else a[:, times]
+        first = lambda a: a[:, times, :1]
+        return accumulate(first(labels), first(noise), first(p), first(f), first(xi),
+                          pick(y), pick(R), pick(Rp))
+
+    def diag_of(part):
+        if mode != "adam":
+            return jnp.stack([jnp.diag(part["chi"]), jnp.diag(part["phi"]),
+                              jnp.diag(part["second"])])
+        return jnp.stack([jnp.diag(part["chi"]), jnp.diag(part["phi"]),
+                          jnp.diag(part["sigma"])])
+
+    def run(n_chunks, body):
+        def step(total, i):
+            part = body(i)
+            return jax.tree.map(jnp.add, total, part), diag_of(part)
+        first = body(0)
+        rest, diags = lax.scan(step, first, jnp.arange(1, n_chunks))
+        return rest, jnp.concatenate([diag_of(first)[None], diags])
+
+    plain_length = layout.burn + layout.window + layout.tail
+    total, plain_diag = run(
+        layout.plain_paths // layout.plain_chunk,
+        lambda i: chunk(plan.key_plain, i, layout.plain_chunk, plain_length))
+    forced_diag = jnp.zeros((0, 3, C))
+    if layout.forced_paths:
+        times = layout.burn + layout.spacing * jnp.arange(layout.events)
+        forced_length = (layout.burn + (layout.events - 1) * layout.spacing + 1
+                         + layout.tail)
+
+        def forced_body(i):
+            rows = lax.dynamic_slice_in_dim(plan.forced, i * layout.forced_chunk,
+                                            layout.forced_chunk)
+            return chunk(plan.key_forced, i, layout.forced_chunk, forced_length,
+                         rows, times)
+
+        extra, forced_diag = run(layout.forced_paths // layout.forced_chunk, forced_body)
+        total = jax.tree.map(jnp.add, total, extra)
+
+    if mode == "adam":
+        phi = jnp.linalg.solve(B, total["phi"]) if stein else total["phi"]
+        sigma = (total["sigma"] + total["sigma"].T) / 2
+        out = {"phi": phi, "chi": total["chi"], "sigma": sigma, "tau": sigma}
+    else:
+        second = total["second"]
+        scale = jnp.ones(C) if mode == "sgd" else lax.rsqrt(jnp.diag(second) / b + eps)
+        sigma = second / b * scale[:, None] * scale[None, :]
+        out = {"phi": total["phi"] * scale[None, :], "chi": total["chi"] * scale[None, :],
+               "sigma": sigma, "tau": sigma}
+    if diagnostics:
+        out["plain_diag"], out["forced_diag"] = plain_diag, forced_diag
+    return out
+
+
+def softmax_standard_errors(B, O, priors, plan: SoftmaxPlan, beta1, beta2, eps, *,
+                            layout: SoftmaxLayout, mode="adam", stein=False):
+    """Diagonals of ``chi``, ``phi``, ``sigma`` with batch-means standard errors.
+
+    Chunks of ordinary paths are i.i.d., and so are chunks of forced paths; the
+    estimate is the sum of all chunk contributions, so its variance is
+    ``n_p var(plain chunk) + n_f var(forced chunk)``. Use a plan built with
+    ``min_chunks >= 16``. Returns ``(estimate, standard_error)``, each ``(3, C)``.
+    """
+    out = softmax_coefficients(B, O, priors, plan, beta1, beta2, eps, layout=layout,
+                               mode=mode, stein=stein, diagnostics=True)
+    estimate = out["plain_diag"].sum(0) + out["forced_diag"].sum(0)
+    var = sum(len(d) * jnp.var(d, axis=0, ddof=1) for d in (out["plain_diag"], out["forced_diag"])
+              if len(d) > 1)
+    return estimate, jnp.sqrt(var)
