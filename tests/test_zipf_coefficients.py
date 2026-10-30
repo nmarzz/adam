@@ -140,6 +140,30 @@ def test_moment_estimator():
               f"max relative difference {rel:.4f}")
 
 
+def test_psi_route(seeds=8):
+    """psi-route phi, chi == forced-event estimator (C = 16, alpha = 2)."""
+    pi, B, O = zipf_state(16, 2.0)
+    pri = jnp.asarray(pi)
+    for b in (1, 16):
+        psi, ref = [], []
+        for s in range(seeds):
+            nb = 2 ** 17 if b == 1 else 2 ** 14
+            lp, pp = discounts.softmax_psi_plan(jax.random.PRNGKey(300 + s), pi, 0.9, 0.95,
+                                                batch=b, plain_batches=nb)
+            lr, pr = discounts.softmax_plan(jax.random.PRNGKey(400 + s), pi, 0.9, 0.95,
+                                            batch=b, plain_batches=nb, min_events=2000)
+            co = discounts.softmax_psi_coefficients(B, O, pri, pp, 0.9, 0.95, 1e-2, layout=lp)
+            cr = discounts.softmax_coefficients(B, O, pri, pr, 0.9, 0.95, 1e-2, layout=lr)
+            # sigma is the same plain-path average in both (heavy-tailed rare kicks);
+            # the psi-route changes phi and chi only
+            psi.append(np.concatenate([np.ravel(co[k]) for k in ("phi", "chi")]))
+            ref.append(np.concatenate([np.ravel(cr[k]) for k in ("phi", "chi")]))
+        z = zscores(psi, ref)
+        rms = float(np.sqrt(np.mean(z ** 2)))
+        check(f"psi-route vs forced-event estimator, C=16, b={b}", rms < 1.6,
+              f"rms z {rms:.2f}, max |z| {np.abs(z).max():.2f} over {z.size} entries")
+
+
 def test_isotropic_collapse():
     """Aggregated K = Id state == mode-resolved ODE (D = 500)."""
     from zipf_scaling import zipf_model
@@ -202,6 +226,7 @@ def main():
     test_forced_matches_plain()
     test_psgd_is_scaled_sgd()
     test_moment_estimator()
+    test_psi_route()
     full, problem = test_isotropic_collapse()
     test_logtime_ode(full, problem)
     test_simulator_grid()

@@ -83,7 +83,16 @@ def moment_draws(classes, samples=2 ** 15, seed=0):
 
 @functools.lru_cache(maxsize=None)
 def coefficient_fn(layout, mode, stein):
-    """A hashable coefficient callable for ``dynamics.run_mode_ode_logtime``."""
+    """A hashable coefficient callable for ``dynamics.run_mode_ode_logtime``: the
+    psi-route (``discounts.softmax_psi_coefficients``, default) or the forced-event
+    estimator (``discounts.softmax_coefficients``), chosen by the plan's layout."""
+    if isinstance(layout, discounts.PsiLayout):
+        def fn(B, O, aux):
+            priors, plan, beta1, beta2, eps = aux
+            return discounts.softmax_psi_coefficients(B, O, priors, plan, beta1, beta2, eps,
+                                                      layout=layout)
+        return fn
+
     def fn(B, O, aux):
         priors, plan, beta1, beta2, eps = aux
         return discounts.softmax_coefficients(B, O, priors, plan, beta1, beta2, eps,
@@ -92,18 +101,22 @@ def coefficient_fn(layout, mode, stein):
 
 
 def make_plan(priors, beta1, beta2, batch, *, seed=0, plain_batches=None,
-              window=None, min_events=1000, min_chunks=1):
+              window=None, estimator="psi", min_events=1000, min_chunks=1):
     """Coefficient plan. By default ``max(2^14, 2^18 / b)`` ordinary batches (a
     fixed number of samples), and long ``beta2`` memories get longer windows so
-    that the burn-in is amortized."""
+    that the burn-in is amortized. ``estimator``: ``"psi"`` (explicit-frequency
+    route, default) or ``"forced"`` (forced-class events)."""
     if plain_batches is None:
         plain_batches = max(2 ** 14, 2 ** 18 // batch)
     if window is None:
         window = 1024 if beta2 <= 0.99 else 8192
-    return discounts.softmax_plan(jax.random.PRNGKey(seed), priors, beta1, beta2,
-                                  batch=batch, plain_batches=plain_batches,
-                                  window=window, min_events=min_events,
-                                  min_chunks=min_chunks)
+    key = jax.random.PRNGKey(seed)
+    if estimator == "psi":
+        return discounts.softmax_psi_plan(key, priors, beta1, beta2, batch=batch,
+                                          plain_batches=plain_batches, window=window)
+    return discounts.softmax_plan(key, priors, beta1, beta2, batch=batch,
+                                  plain_batches=plain_batches, window=window,
+                                  min_events=min_events, min_chunks=min_chunks)
 
 
 def solve(priors, theta0, means, times, *, lr, beta1, beta2, eps, batch, mode="adam",
@@ -284,7 +297,8 @@ def run_precision(args):
                   "mid": (0.3 * jnp.eye(classes) + 0.01, 2.0 * jnp.eye(classes))}
         for beta2 in (0.95, 0.99):
             for batch in (1, 16):
-                layout, plan = make_plan(priors, 0.9, beta2, batch, min_chunks=16)
+                layout, plan = make_plan(priors, 0.9, beta2, batch, estimator="forced",
+                                         min_chunks=16)
                 events = np.asarray(plan.counts).sum(0)
                 for name, (B, O) in states.items():
                     est, se = discounts.softmax_standard_errors(
@@ -452,22 +466,28 @@ def run_rates(args):
     for beta2, batch, eps in rate_configs(args):
         t0 = time.time()
         tag = f"b2{beta2:g}_b{batch}_e{eps:g}"
-        layout, plan = make_plan(priors, args.beta1, beta2, batch, min_chunks=16)
+        plans = [make_plan(priors, args.beta1, beta2, batch, seed=s)
+                 for s in range(args.rates_seeds)]
         draws = moment_draws(C)
         for name, (B, O) in states.items():
-            est, se = discounts.softmax_standard_errors(B, O, priors, plan, args.beta1, beta2,
+            rates = []
+            for layout, plan in plans:
+                co = discounts.softmax_psi_coefficients(B, O, priors, plan, args.beta1, beta2,
                                                         eps, layout=layout)
-            co = discounts.softmax_coefficients(B, O, priors, plan, args.beta1, beta2, eps,
-                                                layout=layout)
-            results[f"{name}_{tag}_adam"] = frozen_rate(co, O)
-            results[f"{name}_{tag}_chi_relse"] = np.asarray(se[0] / jnp.abs(est[0]))
+                rates.append(frozen_rate(co, O))
+            rates = np.array(rates)
+            results[f"{name}_{tag}_adam"] = rates.mean(0)
+            results[f"{name}_{tag}_adam_se"] = rates.std(0, ddof=1) / np.sqrt(len(rates))
+            results[f"{name}_{tag}_psi"] = np.asarray(co["psi"])
+            results[f"{name}_{tag}_dpsi"] = np.asarray(co["dpsi"])
+            results["f_grid"] = np.asarray(co["f_grid"])
             for mode in ("psgd", "sgd"):
                 cm = discounts.softmax_moment_coefficients(B, O, priors, draws, eps, batch,
                                                            mode=mode)
                 results[f"{name}_{tag}_{mode}"] = frozen_rate(cm, O)
-        results[f"events_{tag}"] = np.asarray(plan.counts).sum(0)
-        print(f"rates {tag}: [{time.time() - t0:.0f}s]  max rel s.e. of chi_cc at init "
-              f"{results[f'init_{tag}_chi_relse'].max():.3f}", flush=True)
+        rel = results[f"init_{tag}_adam_se"] / np.abs(results[f"init_{tag}_adam"])
+        print(f"rates {tag}: [{time.time() - t0:.0f}s]  max rel s.e. of the Adam rate at"
+              f" init {rel.max():.3f}", flush=True)
     if args.rates_check:
         results.update(frozen_simulation_check(priors, data, theta0, args))
     np.savez_compressed(OUT / "rates.npz", **results)
@@ -592,8 +612,7 @@ def run_exponents(args):
                     path = OUT / f"exponents_{mode}_{tag}.npz"
                     plan = None
                     if mode == "adam":
-                        plan = make_plan(priors, args.beta1, cfg["beta2"], cfg["batch"],
-                                         min_events=args.exponent_min_events)
+                        plan = make_plan(priors, args.beta1, cfg["beta2"], cfg["batch"])
                     res = ode_on_grid(path, priors, data.means, times, cache=True,
                                       overwrite=args.overwrite, lr=eta, beta1=args.beta1,
                                       beta2=cfg["beta2"], eps=cfg["eps"], batch=cfg["batch"],
@@ -890,7 +909,7 @@ def parse_args():
     p.add_argument("--exponent-classes", type=int, nargs="+", default=[128])
     p.add_argument("--exponent-alphas", type=float, nargs="+", default=[1.25, 1.5, 2.0, 3.0])
     p.add_argument("--exponent-horizon", type=float, default=1e4)
-    p.add_argument("--exponent-min-events", type=int, default=1000)
+    p.add_argument("--rates-seeds", type=int, default=4)
     p.add_argument("--batch-classes", type=int, default=64)
     p.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 16, 64])
     p.add_argument("--batch-eps", type=float, nargs="+", default=[1e-8, 1e-4])

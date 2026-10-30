@@ -636,3 +636,178 @@ def softmax_moment_coefficients(B, O, priors, draws, eps, batch, *, mode="sgd"):
     sigma = second / batch * scale[:, None] * scale[None, :]
     return {"phi": phi * scale[None, :], "chi": chi * scale[None, :], "sigma": sigma,
             "tau": sigma}
+
+
+# --------------------------------------------------------------------------- #
+# Explicit-frequency ("psi-route") coefficients for softmax mixtures
+# (experiments/zipf_adam_plan.md, Appendix A)
+#
+# Fix output r and put one sample with gradient profile f in slot 1 of the batch
+# at lag l: y_l = f xi / b + Y_l and S = S^{(-l)} + beta2^l y_l^2, where Y_l (the
+# rest of that batch) and S^{(-l)} (all other lags) have the stationary law and are
+# independent of the sample. With
+#     psi_r(f)  = b c_beta sum_l beta1^l E[xi y_l S^{-1/2}],
+#     psi_r'(f) =   c_beta sum_l beta1^l E[xi^2 (S^{-1/2} - beta2^l y_l^2 S^{-3/2})],
+# eq. batch_chi and eq. batch_phi become exactly
+#     chi[c, r] = pi_c E[psi_r(f_r(q; c))],  phi = sum_c pi_c E[grad_q psi(f(q; c))],
+# q ~ N(O[:, c], B): SGD's coefficients with f replaced by psi o f. The prior enters
+# only as the factor pi_c, so rare classes cost nothing extra. psi_r is odd and is
+# tabulated on |f| in [0, 1] (asinh grid) from ordinary background paths;
+# sigma = E[A_r A_s] is not of this form and still comes from the paths.
+# --------------------------------------------------------------------------- #
+class PsiLayout(NamedTuple):
+    """Static shapes of :func:`softmax_psi_coefficients` (hashable)."""
+    classes: int
+    batch: int
+    burn: int
+    window: int
+    tail: int
+    paths: int
+    chunk: int
+    lags: int      # lags l with beta1^l above lag_tol
+    stride: int    # spacing of the update times used for psi
+    grid: int      # psi grid points on |f| in [0, 1]
+
+
+class PsiPlan(NamedTuple):
+    """Arrays of :func:`softmax_psi_coefficients` (common random numbers)."""
+    key_paths: jnp.ndarray
+    key_xi: jnp.ndarray
+    u_grid: jnp.ndarray   # (grid,) uniform in u = asinh(|f| / f0)
+    f0: jnp.ndarray
+    draws: jnp.ndarray    # (n, C) standard normals for the per-class integrals
+
+
+def softmax_psi_plan(key, priors, beta1, beta2, *, batch=1, plain_batches=2 ** 18,
+                     window=1024, psi_times=8192, grid=48, f0=1e-4, draws=2 ** 17,
+                     lag_tol=1e-4, chunk_elements=2 ** 25, tol=1e-8):
+    """Layout and common random numbers for :func:`softmax_psi_coefficients`.
+
+    ``psi`` is tabulated from about ``psi_times`` update times spread over the
+    background paths (``sigma`` uses all ``plain_batches``)."""
+    C = len(priors)
+    burn, window, tail = path_layout(beta1, beta2, window, tol)
+    lags = 1 if beta1 == 0 else min(tail, int(math.ceil(math.log(lag_tol) / math.log(beta1))))
+    length = burn + window + tail
+    paths_total = max(1, plain_batches // window)
+    stride = max(1, paths_total * (window + tail - lags) // psi_times)
+    n_times = (window + tail - lags) // stride
+    per_path = max(length * batch * C, n_times * C * grid)
+    paths = max(1, plain_batches // window)
+    chunk = max(1, min(paths, chunk_elements // per_path))
+    paths = chunk * -(-paths // chunk)
+    k_paths, k_xi, k_draws = jax.random.split(key, 3)
+    u_max = math.asinh(1.0 / f0)
+    plan = PsiPlan(k_paths, k_xi, jnp.linspace(0.0, u_max, grid), jnp.asarray(f0),
+                   jax.random.normal(k_draws, (draws, C)))
+    return PsiLayout(C, batch, burn, window, tail, paths, chunk, lags, stride, grid), plan
+
+
+def _interp_columns(u, u_grid, table):
+    """Four-point (cubic Lagrange) interpolation of per-column tables ``table``
+    (``(C, G)``, functions of ``|f|`` on the uniform ``u`` grid, even in ``u``) at
+    ``u`` (``(n, C)``); index ``-1`` is reflected to ``1`` (evenness at ``f = 0``)."""
+    G = len(u_grid)
+    x = jnp.clip(u / (u_grid[1] - u_grid[0]), 0.0, G - 1.000001)
+    k = jnp.floor(x).astype(jnp.int32)
+    t = x - k
+    weights = (-t * (t - 1) * (t - 2) / 6, (t + 1) * (t - 1) * (t - 2) / 2,
+               -(t + 1) * t * (t - 2) / 2, (t + 1) * t * (t - 1) / 6)
+    out = 0.0
+    for offset, weight in zip((-1, 0, 1, 2), weights):
+        index = jnp.clip(jnp.abs(k + offset), 0, G - 1)
+        out = out + weight * jnp.take_along_axis(table.T, index, axis=0)
+    return out
+
+
+@partial(jax.jit, static_argnames=["layout", "mode"])
+def softmax_psi_coefficients(B, O, priors, plan: PsiPlan, beta1, beta2, eps, *,
+                             layout: PsiLayout, mode="adam"):
+    """``phi``, ``chi`` by the psi-route and ``sigma`` from paths, for ``C``-class
+    softmax regression on a mixture (``M = C`` logits, no teacher). Also returns
+    the tables ``psi``, ``dpsi`` (``(C, G)``) on ``f_grid`` (``|f|``). ``tau`` is set
+    to ``sigma`` (it does not enter for ``K = Id``). ``mode="psi_only"`` skips
+    ``sigma`` (no forward-sum recursion).
+    """
+    C, b = layout.classes, layout.batch
+    root = sym_sqrt(B)
+    cdf = jnp.cumsum(priors)[:-1]
+    c_beta = (1 - beta1) / jnp.sqrt(1 - beta2)
+    floor = eps / (1 - beta2)
+    f_grid = plan.f0 * jnp.sinh(plan.u_grid)
+    decay1 = beta1 ** jnp.arange(layout.lags)
+    decay2 = beta2 ** jnp.arange(layout.lags)
+    length = layout.burn + layout.window + layout.tail
+    times = layout.burn + layout.lags + layout.stride * jnp.arange(
+        (layout.window + layout.tail - layout.lags) // layout.stride)
+    window = slice(layout.burn, layout.burn + layout.window)
+
+    def chunk(i):
+        labels, z, xi = _softmax_chunk_draws(plan.key_paths, i, layout.chunk, length, b, C, cdf)
+        p = jax.nn.softmax(O.T[labels] + z @ root, axis=-1)
+        f = p - jax.nn.one_hot(labels, C, dtype=p.dtype)
+        y = jnp.mean(f * xi[..., None], axis=2)                      # (n, L, C)
+        rest = y - f[:, :, 0, :] * xi[:, :, 0, None] / b             # batch without slot 1
+        S = _recurrence(beta2, y ** 2) + floor
+        if mode == "psi_only":
+            sigma = jnp.zeros((C, C), y.dtype)
+        else:
+            R = _recurrence(beta1, S ** -0.5, reverse=True)
+            A = c_beta * y[:, window] * R[:, window]
+            sigma = jnp.einsum("ntr,nts->rs", A, A)
+        S_t = S[:, times]                                            # (n, T, C)
+
+        def lag(acc, l):
+            fresh = jax.random.normal(jax.random.fold_in(jax.random.fold_in(plan.key_xi, i), l),
+                                      S_t.shape[:2])                 # (n, T)
+            old = y[:, times - l]
+            others = jnp.maximum(S_t - decay2[l] * old ** 2, floor)
+            new = (f_grid * (fresh / b)[..., None, None]
+                   + rest[:, times - l][..., None])                  # (n, T, C, G)
+            inv = lax.rsqrt(others[..., None] + decay2[l] * new ** 2)
+            val = fresh[..., None, None] * new * inv
+            dval = fresh[..., None, None] ** 2 * (inv - decay2[l] * new ** 2 * inv ** 3)
+            return (acc[0] + decay1[l] * val.sum((0, 1)), acc[1] + decay1[l] * dval.sum((0, 1))), None
+
+        zero = jnp.zeros((C, layout.grid), y.dtype)
+        (psi, dpsi), _ = lax.scan(lag, (zero, zero), jnp.arange(layout.lags))
+        return psi, dpsi, sigma
+
+    def body(total, i):
+        return jax.tree.map(jnp.add, total, chunk(i)), None
+
+    total, _ = lax.scan(body, chunk(0), jnp.arange(1, layout.paths // layout.chunk))
+    count = layout.paths * len(times)
+    psi = b * c_beta * total[0] / count
+    dpsi = c_beta * total[1] / count
+    sigma = total[2] / (layout.paths * layout.window)      # A already carries c_beta
+
+    noise = plan.draws @ root
+    n = noise.shape[0]
+    # interpolate the smooth, positive log(psi(f)/f) and log psi'(f) (psi is odd and
+    # increasing); psi grows like sinh(u) in the linear regime, where linear
+    # interpolation of psi itself in u would err by ~du^2/8
+    # psi = integral of psi' (positive sample by sample), trapezoid in u: monotone and
+    # positive by construction. The direct estimate of psi at small |f| is dominated by
+    # the zero-mean term xi * Y (b > 1) and can come out negative.
+    du = plan.u_grid[1] - plan.u_grid[0]
+    integrand = dpsi * plan.f0 * jnp.cosh(plan.u_grid)
+    psi = jnp.concatenate([jnp.zeros((C, 1), dpsi.dtype),
+                           jnp.cumsum((integrand[:, 1:] + integrand[:, :-1]) * du / 2, axis=1)],
+                          axis=1)
+    safe_grid = jnp.where(f_grid > 0, f_grid, 1.0)
+    log_ratio = jnp.log(jnp.where(f_grid > 0, psi / safe_grid, dpsi))
+    log_slope = jnp.log(dpsi)
+
+    def one_class(acc, c):
+        p = jax.nn.softmax(O[:, c][None, :] + noise, axis=-1)
+        f = p - jax.nn.one_hot(c, C, dtype=p.dtype)
+        u = jnp.arcsinh(jnp.abs(f) / plan.f0)
+        psi_f = f * jnp.exp(_interp_columns(u, plan.u_grid, log_ratio))
+        w = jnp.exp(_interp_columns(u, plan.u_grid, log_slope)) * p
+        phi_c = jnp.diag(w.mean(0)) - (p.T @ w) / n
+        return acc + priors[c] * phi_c, priors[c] * psi_f.mean(0)
+
+    phi, chi = lax.scan(one_class, jnp.zeros((C, C), noise.dtype), jnp.arange(C))
+    return {"phi": phi, "chi": chi, "sigma": sigma, "tau": sigma, "psi": psi, "dpsi": dpsi,
+            "f_grid": f_grid}
