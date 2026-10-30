@@ -350,6 +350,41 @@ def _mode_state(modes):
     return state, constants
 
 
+def isotropic_modes(params, teacher, means):
+    """Mode-summed state for ``K = Id`` (``Kbar = Id``: every ``nu_j = 1`` and
+    ``w_iso_j = w_cov_j = 1``), where summing the mode ODEs over ``j`` is exact.
+
+    Returns ``(modes, initial)`` for :func:`run_mixture_ode` (``initial=``) or
+    :func:`run_mode_ode_logtime`: one aggregated mode with ``P = Theta^T Theta``,
+    ``U = Theta^T Theta*``, ``O = Theta^T Xbar`` (no rank-one outer products),
+    ``nu = 1`` and ``w_iso = w_cov = D``, so the Ito term is ``eta^2 sigma``.
+    """
+    d = params.shape[0]
+    state = (params.T @ params, params.T @ teacher, params.T @ means)
+    constants = (teacher.T @ teacher, teacher.T @ means, means.T @ means)
+    lift = lambda x: x[None]
+    modes = Modes(jnp.ones(1), jnp.zeros((1, params.shape[1])),
+                  jnp.zeros((1, teacher.shape[1])), jnp.zeros((1, means.shape[1])),
+                  jnp.full(1, float(d)), jnp.full(1, float(d)))
+    return modes, (tuple(map(lift, state)), tuple(map(lift, constants)))
+
+
+def _mode_field(state, constants, nu, w_iso, w_cov, co, eta, dimension):
+    """Right-hand side of eq. gmm_system for every mode (``nu``, ``w`` are ``(J,1,1)``)."""
+    P, U, Ob = state
+    N, Os, G = constants
+    phi, chi, sigma, tau = co["phi"], co["chi"], co["sigma"], co["tau"]
+    drift = (jnp.einsum("jab,bc->jac", jnp.concatenate([P, U], axis=2), phi)
+             + jnp.einsum("jac,cd->jad", Ob, chi))
+    dP = (-eta * nu * (drift + jnp.swapaxes(drift, 1, 2))
+          + eta ** 2 / dimension * ((sigma - tau) * w_iso + tau * w_cov))
+    dU = -eta * nu * (jnp.einsum("ba,jbc->jac", phi, jnp.concatenate([U, N], axis=1))
+                      + jnp.einsum("ca,jdc->jad", chi, Os))
+    dOb = -eta * (nu * jnp.einsum("ba,jbc->jac", phi, jnp.concatenate([Ob, Os], axis=1))
+                  + jnp.einsum("ca,jcd->jad", chi, G))
+    return (dP, dU, dOb)
+
+
 def _order_parameters(state, constants):
     P, U, Ob = state
     N, Os, _ = constants
@@ -359,30 +394,20 @@ def _order_parameters(state, constants):
 
 @partial(jax.jit, static_argnames=["f", "schedule", "burn", "tail", "sgd",
                                    "steps", "record_every", "dimension", "stein"])
-def _mixture_ode_scan(modes, lr, priors, draws, beta1, beta2, eps, dt, *, f,
+def _mixture_ode_scan(modes, lr, priors, draws, beta1, beta2, eps, dt, initial, *, f,
                       schedule, burn, tail, sgd, steps, record_every, dimension,
                       stein):
-    state, constants = _mode_state(modes)
-    N, Os, G = constants
+    state, constants = _mode_state(modes) if initial is None else initial
+    N = constants[0]
     nu = modes.nu[:, None, None]
     w_iso, w_cov = modes.w_iso[:, None, None], modes.w_cov[:, None, None]
 
     def field(t, state):
-        P, U, Ob = state
         B, O = _order_parameters(state, constants)
         co = stationary_coefficients(B, O, priors, draws, f, beta1, beta2, eps,
                                      burn=burn, tail=tail, sgd=sgd, stein=stein)
-        phi, chi, sigma, tau = co["phi"], co["chi"], co["sigma"], co["tau"]
         eta = lr * (schedule(t) if schedule is not None else 1.0)
-        drift = (jnp.einsum("jab,bc->jac", jnp.concatenate([P, U], axis=2), phi)
-                 + jnp.einsum("jac,cd->jad", Ob, chi))
-        dP = (-eta * nu * (drift + jnp.swapaxes(drift, 1, 2))
-              + eta ** 2 / dimension * ((sigma - tau) * w_iso + tau * w_cov))
-        dU = -eta * nu * (jnp.einsum("ba,jbc->jac", phi, jnp.concatenate([U, N], axis=1))
-                          + jnp.einsum("ca,jdc->jad", chi, Os))
-        dOb = -eta * (nu * jnp.einsum("ba,jbc->jac", phi, jnp.concatenate([Ob, Os], axis=1))
-                      + jnp.einsum("ca,jcd->jad", chi, G))
-        return (dP, dU, dOb)
+        return _mode_field(state, constants, nu, w_iso, w_cov, co, eta, dimension)
 
     def heun(state, i):
         t = i * dt
@@ -411,7 +436,7 @@ def _mixture_ode_scan(modes, lr, priors, draws, beta1, beta2, eps, dt, *, f,
 
 def run_mixture_ode(problem, modes, lr, T, *, beta1, beta2, eps, draws, layout,
                     dimension, dt=0.02, record_every=1, schedule=None, sgd=False,
-                    stein=False):
+                    stein=False, initial=None):
     """Integrate the mode ODEs (Heun) for a :class:`problems.MixtureProblem`.
 
     ``modes`` comes from :func:`adam_modes` (or :func:`sgd_modes` with
@@ -421,12 +446,13 @@ def run_mixture_ode(problem, modes, lr, T, *, beta1, beta2, eps, draws, layout,
     estimator of ``phi`` (see :func:`discounts.stationary_coefficients`). Returns a dict with ``time``, ``B``,
     ``O``, ``risk``, ``error`` and ``mode_error`` (the per-mode excess
     ``tr(p_j - u_j - u_j^T + N_j)`` when ``M = M*``), recorded every
-    ``record_every`` steps.
+    ``record_every`` steps. ``initial`` (from :func:`isotropic_modes`, with its
+    ``modes``) replaces the rank-one per-mode initial state.
     """
     steps = int(round(T / dt))
     steps -= steps % record_every
     B, O, mode_error = _mixture_ode_scan(
-        modes, lr, problem.priors, draws, beta1, beta2, eps, dt, f=problem.f,
+        modes, lr, problem.priors, draws, beta1, beta2, eps, dt, initial, f=problem.f,
         schedule=schedule, burn=layout[0], tail=layout[2], sgd=sgd, steps=steps,
         record_every=record_every, dimension=dimension, stein=stein)
     risk = jax.vmap(problem.risk)(B, O)
@@ -434,3 +460,68 @@ def run_mixture_ode(problem, modes, lr, T, *, beta1, beta2, eps, draws, layout,
     time = jnp.arange(len(B)) * dt * record_every
     return {"time": time, "B": B, "O": O, "risk": risk, "error": error,
             "mode_error": mode_error}
+
+
+@partial(jax.jit, static_argnames=["coefficients", "schedule", "dimension", "safety",
+                                   "max_steps"])
+def _logtime_scan(aux, modes, initial, lr, times, dt_max, *, coefficients, schedule,
+                  dimension, safety, max_steps):
+    state, constants = initial
+    nu = modes.nu[:, None, None]
+    w_iso, w_cov = modes.w_iso[:, None, None], modes.w_cov[:, None, None]
+    gram = jnp.linalg.norm(constants[2].sum(0), 2) if constants[2].size else 0.0
+    eta_at = lambda t: lr * (schedule(t) if schedule is not None else 1.0)
+
+    def evaluate(t, state):
+        B, O = _order_parameters(state, constants)
+        co = coefficients(B, O, aux)
+        return co, _mode_field(state, constants, nu, w_iso, w_cov, co, eta_at(t), dimension)
+
+    def interval(carry, t_next):
+        def cond(c):
+            t, _, n = c
+            return (t < t_next) & (n < max_steps)
+
+        def body(c):
+            t, state, n = c
+            co, k1 = evaluate(t, state)
+            rate = eta_at(t) * jnp.max(jnp.sum(jnp.abs(co["phi"]), axis=0)) * (1.0 + gram)
+            dt = jnp.minimum(jnp.minimum(t_next - t, safety / rate), dt_max)
+            guess = jax.tree.map(lambda y, k: y + dt * k, state, k1)
+            _, k2 = evaluate(t + dt, guess)
+            state = jax.tree.map(lambda y, a, b: y + dt / 2 * (a + b), state, k1, k2)
+            return t + dt, state, n + 1
+
+        t, state, n = carry
+        t, state, n_new = lax.while_loop(cond, body, (t, state, jnp.zeros((), int)))
+        co, _ = evaluate(t, state)
+        B, O = _order_parameters(state, constants)
+        diag = jnp.stack([jnp.diag(co["phi"]), jnp.diag(co["chi"]), jnp.diag(co["sigma"])])
+        return (t, state, n + n_new), (B, O, diag, n_new)
+
+    t0 = jnp.asarray(times[0], dtype=state[0].dtype)
+    B0, O0 = _order_parameters(state, constants)
+    co0 = coefficients(B0, O0, aux)
+    _, (B, O, diag, steps) = lax.scan(interval, (t0, state, jnp.zeros((), int)), times[1:])
+    diag0 = jnp.stack([jnp.diag(co0["phi"]), jnp.diag(co0["chi"]), jnp.diag(co0["sigma"])])
+    stack = lambda first, rest: jnp.concatenate([first[None], rest])
+    return stack(B0, B), stack(O0, O), stack(diag0, diag), steps
+
+
+def run_mode_ode_logtime(coefficients, aux, modes, initial, lr, times, *, dimension,
+                         schedule=None, safety=0.2, dt_max=jnp.inf, max_steps=100_000):
+    """Mode ODEs with adaptive Heun steps, recorded at ``times`` (e.g. log-spaced).
+
+    ``coefficients(B, O, aux) -> {"phi", "chi", "sigma", "tau"}`` is a static
+    callable and ``aux`` its array arguments (e.g. a :class:`discounts.SoftmaxPlan`).
+    Each step uses ``dt = min(safety / (eta ||phi||_1 (1 + ||G||)), dt_max)``,
+    shortened to land on every record time, so steps grow as the dynamics
+    slow down. Returns ``B``, ``O``, the diagonals of ``(phi, chi, sigma)``
+    (shape ``(len(times), 3, M)``) and the number of steps per interval.
+    """
+    times = jnp.asarray(times, dtype=float)
+    B, O, diag, steps = _logtime_scan(aux, modes, initial, lr, times, dt_max,
+                                      coefficients=coefficients, schedule=schedule,
+                                      dimension=dimension, safety=safety,
+                                      max_steps=max_steps)
+    return {"time": times, "B": B, "O": O, "coef_diag": diag, "steps": steps}
