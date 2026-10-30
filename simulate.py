@@ -368,3 +368,39 @@ def run_mixture_many(sim: Sim, data: MixtureData, params0, num_steps, *,
     return jax.vmap(lambda key: run_mixture(sim, data, params0, num_steps,
                                             record_every=record_every, key=key,
                                             basis=basis))(keys)
+
+
+def run_mixture_at(sim: Sim, data: MixtureData, params0, record_steps, *, key):
+    """Like :func:`run_mixture`, but record ``(B, O)`` at the given increasing step
+    indices (``record_steps[0]`` is usually 0), e.g. a log-spaced grid. Segments
+    between records have data-dependent lengths (``lax.fori_loop`` with traced
+    bounds), so one compilation serves any grid of the same size."""
+    cov = mixture_covariance(data)
+    record_steps = jnp.asarray(record_steps)
+
+    def observe(params):
+        W = jnp.concatenate([params, data.teacher], axis=1)
+        KW = cov[:, None] * W if cov.ndim == 1 else cov @ W
+        return W.T @ KW, W.T @ data.means
+
+    def advance(k, carry):
+        params, state, key = carry
+        key, sub = jax.random.split(key)
+        params, state = sim.step(params, state, sub, k)
+        return params, state, key
+
+    def segment(carry, bounds):
+        carry = lax.fori_loop(bounds[0], bounds[1], advance, carry)
+        return carry, observe(carry[0])
+
+    carry = lax.fori_loop(0, record_steps[0], advance, (params0, sim.init(params0), key))
+    first = observe(carry[0])
+    _, (B, O) = lax.scan(segment, carry, jnp.stack([record_steps[:-1], record_steps[1:]], 1))
+    stack = lambda end, path: jnp.concatenate([end[None], path])
+    return stack(first[0], B), stack(first[1], O)
+
+
+def run_mixture_at_many(sim: Sim, data: MixtureData, params0, record_steps, *, keys):
+    """``vmap`` :func:`run_mixture_at` over PRNG keys."""
+    return jax.vmap(lambda key: run_mixture_at(sim, data, params0, record_steps,
+                                               key=key))(keys)
