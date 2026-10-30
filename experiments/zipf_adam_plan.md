@@ -119,6 +119,21 @@ the one-hot bigram. H1–H4 concern the tail. Say this explicitly in the write-u
    - If that is too expensive, implement a stratified estimator: force the class of one sample
      at well-separated times, spaced more than burn + tail apart, and reweight by `π_c`. Validate
      it against the plain estimator at moderate `π_c`.
+   - **Useful alternative: the ψ-route estimator (Appendix A).** It is exact and avoids the
+     rare-class problem altogether.
+     - Tabulate one scalar function `ψ_r(f)` and its derivative per output, from background
+       paths. No rare event has to occur for this.
+     - Get `χ` and `φ` from per-class Gaussian integrals over `q ~ N(O_c, B)`.
+     - The frequency appears only as the explicit factor `π_c`, so rare classes cost nothing
+       extra.
+     - `σ̂` is not of this form; keep estimating it from paths. For a rare output that is still
+       an event-driven quantity, so check its s.e.
+     - A prototype check against the path estimator, at two seeds with 4.8·10^5 samples:
+       binary logistic, π = (0.3, 0.7), B = 0.5, O = (−0.4, 0.6), β = (0.9, 0.95), eps = 1e-3.
+       `χ` and `φ` agreed to ≤ 0.3% for `b = 1`. A smaller run with `b = 4` agreed to about 1%,
+       which is within MC error at that size.
+     - Implement both estimators and cross-check them at `C = 5` and `C = 16` before choosing.
+       The ψ-route is likely the better default for large `C` and small `π_C`.
    - Unit test: at `C = 5` (the `multiclass_batch.py` mixture) and `b ∈ {1, 16}`, the new
      coefficients must match the old ones within MC error.
 3. **Collapsed isotropic ODE.** For `K = I` every mode has `ν = 1` and `w_iso = w_cov = 1`, so
@@ -243,6 +258,67 @@ before E2 (e.g. the softmax background `p_c²` or the off-diagonal `O_ck` domina
 4. **Commits:** small and descriptive, author as configured on the machine, ending with the
    session attribution lines your harness provides. Push the branch to `origin` if credentials
    allow; otherwise say so.
+
+## Appendix A. Explicit-frequency form of the coefficients (the ψ-route)
+
+This is derived from `eq:gmm_phi`, `eq:gmm_chi`, `eq:batch_phi` and `eq:batch_chi`, and it is
+exact under the same stationary i.i.d.-lag assumptions. Fix output `r`. At lag `ℓ`, write the
+batch average as `y_ℓ = f ξ / b + Y_ℓ`, where `Y_ℓ` is the rest of that batch. Let
+`S_r^{(-ℓ)} = S_r - β2^ℓ y_ℓ²` be the denominator without lag `ℓ`. Define
+
+```
+ψ_r(f)  = b c_β Σ_ℓ β1^ℓ E[ ξ y_ℓ / sqrt(β2^ℓ y_ℓ² + S_r^{(-ℓ)}) ]        (ξ ~ N(0,1) fresh)
+ψ_r'(f) =   c_β Σ_ℓ β1^ℓ E[ ξ² ( S^{-1/2} - β2^ℓ y_ℓ² S^{-3/2} ) ]          (S = β2^ℓ y_ℓ² + S^{(-ℓ)})
+```
+
+The expectation is over `ξ`, `Y_ℓ` and `S^{(-ℓ)}`, which have the stationary mixture law. For
+`b = 1`, `ψ_r(f) = f w_r(f²)`. `ψ_r` is odd and increasing:
+
+- **Small errors:** linear with slope about `(E f_r² + eps)^{-1/2}`, the preconditioned-SGD
+  behaviour.
+- **Errors large against the background RMS:** it saturates, the sign-like behaviour.
+
+Applying ψ componentwise,
+
+```
+φ = Σ_c π_c Φ_c,      Φ_c = E_{q ~ N(O_{·c}, B)}[ ∇_q ψ(f(q; c)) ]          (M+ × M)
+χ = diag(π) Ψ̄,        Ψ̄_{c·} = E_{q ~ N(O_{·c}, B)}[ ψ(f(q; c)) ]           (C × M)
+```
+
+So these are SGD's coefficients `E[∇f]` and `diag(π) E[f | c]` with `f` replaced by `ψ∘f`. The
+diffusion is `σ̂ = Σ_c π_c E[Ω(f(q;c)) | c]`, but `Ω ≠ ψψ^T`, so estimate it from paths.
+
+**Isotropic `K`, orthogonal means of norm `ρ`** (the main Zipf setting), with
+`o_c = O_{·c} ∈ R^C`:
+
+```
+dB/dt   = -η Σ_c π_c Sym( B Φ_c + o_c ψ̄_c^T ) + η² σ̂
+do_c/dt = -η ( φ^T o_c + ρ² π_c ψ̄_c ),        c = 1..C
+```
+
+Each class's logit means feel a shared, prior-averaged restoring operator `φ^T` and their own
+forcing `ρ² π_c ψ̄_c`. For softmax the own-logit forcing is about `ρ² π_c |ψ_c(-1)|` before the
+class is learned. The hypothesis table in Section 1 is a statement about where `|f| = 1` falls on
+the curve `ψ_c`:
+
+- **Linear part:** the `sqrt(bπ_c)` window.
+- **Saturated part:** the rare-event regime.
+- **Floor `δ_ε`:** the ε regime.
+
+Plot `ψ_c` for a frequent, a middle and a rare class in E1. It is the most direct picture of
+the mechanism.
+
+**Implementation sketch.**
+
+1. Simulate background paths once per ODE step, or reuse common random numbers.
+2. For each lag `ℓ`, form `Y_ℓ` and `S^{(-ℓ)}` (subtract lag `ℓ`'s own-sample contribution).
+3. Evaluate `ψ_r` and `ψ_r'` on a grid of `f` values (`[-1, 1]` for softmax/logistic), with
+   fresh `ξ`.
+4. Interpolate and integrate per class over `q ~ N(o_c, B)`. Use Gauss–Hermite or fixed
+   Gaussian draws; for softmax, `f_r` depends on all `C` logits, so use draws.
+
+The cost is `O(C · grid · paths · window)` for `ψ`, plus the per-class integrals, and the
+variance does not grow as `π_c → 0`.
 
 ## 5. Ground rules
 - Do not modify `main.tex`, `gmm_adam.tex` or existing results/figures. Do not change
