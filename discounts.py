@@ -11,10 +11,14 @@ by samples of ``A_0`` so neither the SDE nor the ODE needs a fourth-order tensor
 """
 from __future__ import annotations
 
+import math
 from functools import partial
 
 import jax
 import jax.numpy as jnp
+from jax import lax
+
+from utils import sym_sqrt
 
 
 def _decay(beta, length, scale_by_one_minus=False, start=0):
@@ -246,3 +250,121 @@ def compute_H(B, f, key, n_samples=10_000):
     Q = Q.squeeze(axis=1)
     fq = jnp.concatenate([fq, fq], axis=1)
     return jnp.mean(fq * (Q @ Binv), axis=0)
+
+
+# --------------------------------------------------------------------------- #
+# Stationary coefficients from simulated paths (gmm_adam.tex, "Numerical
+# evaluation of the coefficients"), with mini-batches and class means.
+# --------------------------------------------------------------------------- #
+def path_layout(beta1, beta2, window, tol=1e-8):
+    """``(burn, window, tail)`` so that ``beta2**burn, beta1**tail < tol``."""
+    burn = 0 if beta2 == 0 else int(math.ceil(math.log(tol) / math.log(beta2)))
+    tail = 0 if beta1 == 0 else int(math.ceil(math.log(tol) / math.log(beta1)))
+    return burn, window, tail
+
+
+def draw_paths(key, paths, layout, *, batch, inputs, outputs):
+    """Common random numbers for :func:`stationary_coefficients`.
+
+    Reusing one draw at every ODE step makes the vector field a smooth
+    deterministic function of ``(B, O)``.
+    """
+    burn, window, tail = layout
+    length = burn + window + tail
+    k = jax.random.split(key, 5)
+    return {
+        "z": jax.random.normal(k[0], (paths, length, batch, inputs)),
+        "u": jax.random.uniform(k[1], (paths, length, batch)),
+        "w": jax.random.normal(k[2], (paths, length, batch, outputs)),
+        "xi": jax.random.normal(k[3], (paths, length, batch)),
+        "xi2": jax.random.normal(k[4], (paths, length, batch)),
+    }
+
+
+def _recurrence(decay, values, reverse=False):
+    """``x_t = decay * x_{t-1} + values_t`` along axis 1 (``x_{t+1}`` if reverse)."""
+    def combine(left, right):
+        return left[0] * right[0], right[0] * left[1] + right[1]
+
+    decays = jnp.full(values.shape, decay, values.dtype)
+    return lax.associative_scan(combine, (decays, values), reverse=reverse, axis=1)[1]
+
+
+@partial(jax.jit, static_argnames=["f", "burn", "tail", "sgd", "stein"])
+def stationary_coefficients(B, O, priors, draws, f, beta1, beta2, eps, *,
+                            burn, tail, sgd=False, stein=False):
+    """Coefficients of the mini-batch Adam ODE at ``(B, O)``.
+
+    Paths of the stationary Adam recursion on batch-averaged normalized
+    gradients ``y_t = b^{-1} sum_beta f(q_{t beta}; c_{t beta}) xi_{t beta}`` give,
+    with ``R_t = sum_l beta1^l S_{t+l}^{-1/2}`` and
+    ``R'_t = sum_l (beta1 beta2)^l S_{t+l}^{-3/2}`` (every window step is a
+    valid "batch 0"),
+
+    * ``phi`` ``(M+, M)``: drift along ``Kbar Theta^+`` (eq. batch_phi),
+    * ``chi`` ``(C, M)``: drift along ``D^{-1} Xbar`` (eq. batch_chi),
+    * ``sigma`` ``(M, M)``: ``E[A_r A_s]``, the diagonal diffusion ``sigma-hat``,
+    * ``tau`` ``(M, M)``: ``sum_beta E_q[E(xi_0beta A_r|q) E(xi_0beta A_s|q)]``, the
+      coefficient of the coordinate correlation ``C_ik`` in the off-diagonal
+      diffusion, ``Sigma_ik = C_ik tau + O(C_ik^3)``.
+
+    ``stein=True`` estimates ``phi`` from ``B phi = sum_beta E[(q_beta - O_c) xi_beta A]``
+    (needs ``B`` nonsingular). The derivative form contains
+    ``S^{-1/2} - y^2 S^{-3/2}``, which is close to a delta function at ``y = 0``
+    when ``eps`` is tiny and ``beta2`` small, so its Monte-Carlo error blows up
+    there; the Stein form has no such term.
+
+    ``sgd=True`` returns the SGD analogues ``E[grad f]``, ``diag(pi) E[f|c]`` and
+    ``E[f f^T] / b`` (with ``tau = sigma``).
+    """
+    z, u, w, xi, xi2 = draws["z"], draws["u"], draws["w"], draws["xi"], draws["xi2"]
+    length, batch = xi.shape[1], xi.shape[2]
+    window = slice(burn, length - tail)
+    classes = jnp.searchsorted(jnp.cumsum(priors)[:-1], u, side="right")
+    onehot = jax.nn.one_hot(classes[:, window], len(priors), dtype=z.dtype)
+    q = O.T[classes] + z @ sym_sqrt(B)
+    profile = jnp.vectorize(f, signature="(p),(),(m)->(m)")(q, classes, w)
+    jacobian = jnp.vectorize(jax.jacfwd(f), signature="(p),(),(m)->(m,p)")(
+        q[:, window], classes[:, window], w[:, window])          # (n, T, b, M, M+)
+
+    if sgd:
+        fw = profile[:, window]
+        count = fw.shape[0] * fw.shape[1] * batch
+        sigma = jnp.einsum("ntbr,ntbs->rs", fw, fw) / count / batch
+        return {
+            "phi": jnp.einsum("ntbrs->sr", jacobian) / count,
+            "chi": jnp.einsum("ntbc,ntbr->cr", onehot, fw) / count,
+            "sigma": sigma,
+            "tau": sigma,
+        }
+
+    c_beta = (1 - beta1) / jnp.sqrt(1 - beta2)
+    floor = eps / (1 - beta2)
+
+    def contributions(normal):
+        y = jnp.mean(profile * normal[..., None], axis=2)                    # (n, L, M)
+        S = _recurrence(beta2, y ** 2) + floor
+        R = _recurrence(beta1, S ** -0.5, reverse=True)
+        return y[:, window], S, R[:, window]
+
+    y, S, R = contributions(xi)
+    y2, _, R2 = contributions(xi2)
+    Rp = _recurrence(beta1 * beta2, S ** -1.5, reverse=True)[:, window]
+    xw, xw2 = xi[:, window], xi2[:, window]
+    count = y.shape[0] * y.shape[1]
+
+    if stein:
+        centered = q[:, window] - O.T[classes[:, window]]
+        phi = batch * jnp.linalg.solve(
+            B, jnp.einsum("ntbp,ntb,ntr->pr", centered, xw, y * R))
+    else:
+        phi = jnp.einsum("ntb,ntbrs,ntr->sr", xw ** 2, jacobian, R - y ** 2 * Rp)
+    chi = jnp.einsum("ntbc,ntb,ntr->cr", onehot, xw, y * R)
+    sigma = jnp.einsum("ntr,nts->rs", y * R, y * R)
+    tau = jnp.einsum("ntb,ntr,nts->rs", xw * xw2, y * R, y2 * R2)
+    return {
+        "phi": c_beta * phi / (batch * count),
+        "chi": c_beta * chi / count,
+        "sigma": c_beta ** 2 * sigma / count,
+        "tau": c_beta ** 2 * (tau + tau.T) / (2 * count),
+    }

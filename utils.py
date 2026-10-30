@@ -29,3 +29,19 @@ def make_B(params, optimal_params, cov):
     else:
         B = W. T @ cov @ W   
     return B
+
+def sym_sqrt(B):
+    """Symmetric square root of a PSD matrix (eigenvalues clipped at zero).
+
+    Unlike a Cholesky factor it is defined for singular ``B`` (e.g. a zero
+    student at initialization), so Monte-Carlo laws ``O + sym_sqrt(B) @ g`` stay
+    valid on the whole PSD cone.
+    """
+    vals, vecs = jnp.linalg.eigh((B + B.T) / 2)
+    return (vecs * jnp.sqrt(jnp.clip(vals, 0.0))) @ vecs.T
+
+
+def haar_orthogonal(key, d):
+    """Haar-distributed ``d x d`` orthogonal matrix (QR with sign correction)."""
+    Q, R = jnp.linalg.qr(jax.random.normal(key, (d, d)))
+    return Q * jnp.sign(jnp.diag(R))[None, :]

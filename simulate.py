@@ -267,3 +267,104 @@ def run_many_with_B(sim: Sim, problem: Problem, params0, optimal_params, cov,
         return risks, B_path
 
     return jax.vmap(one)(keys)
+
+
+# --------------------------------------------------------------------------- #
+# Mini-batch optimizers on Gaussian-mixture data (gmm_adam.tex)
+# --------------------------------------------------------------------------- #
+class MixtureData(NamedTuple):
+    """``x | c ~ N(means[:, c], K)`` with ``K = factor**2`` (diagonal, ``(D,)``)
+    or ``K = factor @ factor.T`` (dense, ``(D, D)``; e.g. ``O diag(sqrt(lam))``
+    for a Haar-rotated spectrum). Centered data use one zero-mean class."""
+    factor: jnp.ndarray    # (D,) or (D, D)
+    means: jnp.ndarray     # (D, C)
+    teacher: jnp.ndarray   # (D, M*)
+
+
+def mixture_covariance(data: MixtureData):
+    """``K`` as a ``(D,)`` diagonal or a dense ``(D, D)`` matrix."""
+    f = data.factor
+    return f ** 2 if f.ndim == 1 else f @ f.T
+
+
+def _mixture_grad(problem, data, params, key, batch):
+    """Batch-averaged gradient ``b^{-1} sum_beta x_beta (x) f(q_beta; c_beta, w_beta)``."""
+    k_c, k_z, k_w = jax.random.split(key, 3)
+    d = data.means.shape[0]
+    classes = jax.random.categorical(k_c, jnp.log(problem.priors), shape=(batch,))
+    z = jax.random.normal(k_z, (batch, d))
+    noise = z * data.factor if data.factor.ndim == 1 else z @ data.factor.T
+    x = data.means.T[classes] + noise
+    w = jax.random.normal(k_w, (batch, problem.outputs))
+    q = x @ jnp.concatenate([params, data.teacher], axis=1)
+    return x.T @ jax.vmap(problem.f)(q, classes, w) / batch
+
+
+def build_mixture_adam(problem, data: MixtureData, lr, *, beta1, beta2, eps=0.0,
+                       batch=1) -> Sim:
+    """Adam with batch size ``batch`` and stability array ``eps * K_ii``."""
+    cov = mixture_covariance(data)
+    stability = eps * (cov if cov.ndim == 1 else jnp.diag(cov))[:, None]
+
+    def init(params):
+        return (jnp.zeros_like(params), jnp.zeros_like(params))
+
+    def step(params, state, key, k):
+        m, v = state
+        g = _mixture_grad(problem, data, params, key, batch)
+        m = beta1 * m + (1 - beta1) * g
+        v = beta2 * v + (1 - beta2) * g ** 2
+        params = params - _lr_at(lr, k) * m / jnp.sqrt(v + stability)
+        return params, (m, v)
+
+    return Sim(init, step)
+
+
+def build_mixture_sgd(problem, data: MixtureData, lr, *, batch=1) -> Sim:
+    def init(params):
+        return ()
+
+    def step(params, state, key, k):
+        g = _mixture_grad(problem, data, params, key, batch)
+        return params - _lr_at(lr, k) * g, ()
+
+    return Sim(init, step)
+
+
+def run_mixture(sim: Sim, data: MixtureData, params0, num_steps, *, record_every,
+                key, basis=None):
+    """Scan ``sim`` and record, every ``record_every`` steps (including step 0
+    and the last step), ``B = (Theta^+)^T K Theta^+``, ``O = (Theta^+)^T Xbar``
+    and, if ``basis`` (``(D, J)``) is given, ``basis^T Theta``."""
+    cov = mixture_covariance(data)
+
+    def observe(params):
+        W = jnp.concatenate([params, data.teacher], axis=1)
+        KW = cov[:, None] * W if cov.ndim == 1 else cov @ W
+        modes = basis.T @ params if basis is not None else jnp.zeros((0,) + params.shape[1:])
+        return W.T @ KW, W.T @ data.means, modes
+
+    def inner(carry, k):
+        params, state, key = carry
+        key, sub = jax.random.split(key)
+        params, state = sim.step(params, state, sub, k)
+        return (params, state, key), None
+
+    def outer(carry, r):
+        out = observe(carry[0])
+        carry, _ = lax.scan(inner, carry, r * record_every + jnp.arange(record_every))
+        return carry, out
+
+    carry = (params0, sim.init(params0), key)
+    carry, (B, O, modes) = lax.scan(outer, carry, jnp.arange(num_steps // record_every))
+    last = observe(carry[0])
+    stack = lambda path, end: jnp.concatenate([path, end[None]])
+    return stack(B, last[0]), stack(O, last[1]), stack(modes, last[2])
+
+
+def run_mixture_many(sim: Sim, data: MixtureData, params0, num_steps, *,
+                     record_every, keys, basis=None):
+    """``vmap`` :func:`run_mixture` over PRNG keys (leading axis = run)."""
+    return jax.vmap(lambda key: run_mixture(sim, data, params0, num_steps,
+                                            record_every=record_every, key=key,
+                                            basis=basis))(keys)
