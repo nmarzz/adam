@@ -195,3 +195,128 @@ def get_problem(name: str) -> Problem:
         return PROBLEMS[name]
     except KeyError:
         raise NotImplementedError(f"Problem {name!r} not implemented") from None
+
+
+# --------------------------------------------------------------------------- #
+# Label-dependent losses on Gaussian-mixture data (gmm_adam.tex)
+# --------------------------------------------------------------------------- #
+class MixtureProblem(NamedTuple):
+    """A linear composite loss whose gradient profile may depend on the label.
+
+    Data are ``c ~ priors`` and ``x | c ~ N(xbar_c, K)``. ``f(q, c, w)`` is the
+    single-sample gradient profile (shape ``(M,)``) at predictions
+    ``q = (Theta^+)^T x`` (``M+`` entries), class ``c`` and a standard Gaussian
+    label-noise draw ``w`` (``M`` entries). ``risk(B, O)`` / ``error(B, O)`` are
+    population quantities as functions of ``B`` and the mean overlaps
+    ``O = (Theta^+)^T Xbar`` (gmm_adam.tex eq. gmm_risk). Centered
+    teacher--student problems are the one-class, zero-mean case.
+    """
+    name: str
+    outputs: int          # M
+    priors: jnp.ndarray   # (C,)
+    f: Callable           # (q, c, w) -> (M,)
+    risk: Callable        # (B, O) -> scalar
+    error: Callable       # (B, O) -> scalar, or None
+
+
+def _gaussian_draws(dim, samples, seed):
+    return jax.random.normal(jax.random.PRNGKey(seed), (samples, dim))
+
+
+def make_mixture_linreg(outputs: int = 1, noise_std: float = 0.0) -> MixtureProblem:
+    """Teacher--student least squares on centered data, ``f = q_1 - q_2 - sigma w``.
+
+    The risk includes the label-noise floor ``M sigma^2 / 2``.
+    """
+    m = outputs
+
+    def f(q, c, w):
+        return q[:m] - q[m:] - noise_std * w
+
+    def risk(B, O):
+        return (jnp.trace(B[:m, :m]) - 2 * jnp.trace(B[:m, m:])
+                + jnp.trace(B[m:, m:]) + m * noise_std ** 2) / 2
+
+    return MixtureProblem(f"linreg_m{m}", m, jnp.ones(1), f, risk, None)
+
+
+def make_mixture_softmax_teacher(classes: int, *, risk_samples: int = 2 ** 15,
+                                 risk_seed: int = 0) -> MixtureProblem:
+    """Soft-label softmax teacher--student with ``classes - 1`` free logits.
+
+    Same model as :func:`make_softmax_problem`, written as a mixture problem
+    (one centered class).
+    """
+    rank = classes - 1
+    g = _gaussian_draws(2 * rank, risk_samples, risk_seed)
+
+    def probabilities(free_logits):
+        reference = jnp.zeros(free_logits.shape[:-1] + (1,))
+        return softmax(jnp.concatenate([free_logits, reference], axis=-1), axis=-1)
+
+    def f(q, c, w):
+        return probabilities(q[:rank])[:-1] - probabilities(q[rank:])[:-1]
+
+    def risk(B, O):
+        from utils import sym_sqrt
+        q = g @ sym_sqrt(B)
+        student = jnp.concatenate([q[:, :rank], jnp.zeros((risk_samples, 1))], axis=1)
+        return -jnp.mean(jnp.sum(probabilities(q[:, rank:]) * log_softmax(student, axis=-1),
+                                 axis=-1))
+
+    return MixtureProblem(f"softmax_teacher_{classes}", rank, jnp.ones(1), f, risk, None)
+
+
+def make_gmm_logistic(priors=(0.5, 0.5)) -> MixtureProblem:
+    """Binary logistic regression on a two-component mixture (labels 0/1).
+
+    ``f(q; c) = sigmoid(q) - c``; risk and error by Gauss--Hermite quadrature.
+    """
+    priors = jnp.asarray(priors)
+    nodes, weights = hermgauss(64)
+    nodes = jnp.asarray(nodes) * jnp.sqrt(2.0)
+    weights = jnp.asarray(weights) / jnp.sqrt(jnp.pi)
+    signs = jnp.array([-1.0, 1.0])
+
+    def f(q, c, w):
+        return sigmoid(q[:1]) - c
+
+    def risk(B, O):
+        q = O[0][:, None] + jnp.sqrt(jnp.maximum(B[0, 0], 0.0)) * nodes[None, :]
+        return jnp.sum(priors * (jnp.log1p(jnp.exp(-signs[:, None] * q)) @ weights))
+
+    def error(B, O):
+        scale = jnp.sqrt(jnp.maximum(B[0, 0], 1e-300))
+        return jnp.sum(priors * jax.scipy.stats.norm.cdf(-signs * O[0] / scale))
+
+    return MixtureProblem("gmm_logistic", 1, priors, f, risk, error)
+
+
+def make_gmm_softmax(priors, *, risk_samples: int = 2 ** 15,
+                     risk_seed: int = 0) -> MixtureProblem:
+    """``C``-class softmax regression on a ``C``-component mixture, ``M = C`` logits.
+
+    ``f(q; c) = softmax(q) - e_c``. Risk and error use fixed Gaussian draws, so
+    they are deterministic functions of ``(B, O)`` shared by Adam and the ODE.
+    """
+    priors = jnp.asarray(priors)
+    classes = len(priors)
+    g = _gaussian_draws(classes, risk_samples, risk_seed)
+
+    def f(q, c, w):
+        return softmax(q) - jax.nn.one_hot(c, classes, dtype=q.dtype)
+
+    def logits(B, O):
+        from utils import sym_sqrt
+        return O.T[:, None, :] + (g @ sym_sqrt(B))[None]          # (C, n, C)
+
+    def risk(B, O):
+        q = logits(B, O)
+        own = jnp.take_along_axis(q, jnp.arange(classes)[:, None, None], axis=2)[..., 0]
+        return jnp.sum(priors * jnp.mean(jax.nn.logsumexp(q, axis=2) - own, axis=1))
+
+    def error(B, O):
+        wrong = jnp.argmax(logits(B, O), axis=2) != jnp.arange(classes)[:, None]
+        return jnp.sum(priors * jnp.mean(wrong.astype(priors.dtype), axis=1))
+
+    return MixtureProblem(f"gmm_softmax_{classes}", classes, priors, f, risk, error)

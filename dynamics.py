@@ -11,12 +11,15 @@ Drift/diffusion come from :mod:`discounts`.
 """
 from __future__ import annotations
 
+from functools import partial
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 from discounts import (adam_noise_field, adam_ode_diffusion, compute_H, compute_I,
-                       cov_from_B, drift_matrix_from_B)
+                       cov_from_B, drift_matrix_from_B, stationary_coefficients)
 from problems import Problem
 from utils import make_B
 
@@ -80,11 +83,16 @@ def _init_adam_ode(cov, params, optimal_params):
         p, u, q = _diag_modes(cov, params, optimal_params)
         diff_data = ("diag", cov)           # var_force == cov
     else:
-        covbar = cov / jnp.sqrt(jnp.diag(cov))
-        eigs, L, R = _real_eig(covbar)
-        A = cov @ L                         # = K L
+        # Kbar = D^{-1} K has right eigenvectors mu_j = D^{-1/2} w_j and left
+        # eigenvectors rho_j = D^{1/2} w_j (w_j eigenvectors of D^{-1/2} K D^{-1/2}),
+        # and p_j = Theta^T K Pi_j Theta with Pi_j = mu_j rho_j^T.
+        scale = jnp.sqrt(jnp.diag(cov))
+        root = jnp.sqrt(scale)
+        eigs, w = jnp.linalg.eigh(cov / root[:, None] / root[None, :])
+        A = cov @ (w / root[:, None])       # = K mu
+        R = root[:, None] * w               # = rho
         p, u, q = _modes(A, R, params, optimal_params)
-        corr = cov / jnp.sqrt(jnp.diag(cov))[:, None]
+        corr = cov / scale[:, None] / scale[None, :]
         diff_data = ("dense", A, R, jnp.linalg.cholesky(corr))
     return jnp.concatenate([p, u, q]), eigs, diff_data
 
@@ -208,7 +216,7 @@ def run_adam_sde(problem: Problem, params, optimal_params, cov, T, lr, *,
     diagonal = cov.ndim == 1
     covbar = cov / jnp.sqrt(cov) if diagonal else cov / jnp.sqrt(jnp.diag(cov))[:, None]
     corr_chol = jnp.ones(1) if diagonal else jnp.linalg.cholesky(
-        cov / jnp.sqrt(jnp.diag(cov))[:, None]
+        cov / jnp.sqrt(jnp.diag(cov))[:, None] / jnp.sqrt(jnp.diag(cov))[None, :]
     )
     d, m = params.shape
     iters = int(T / dt)
@@ -277,3 +285,152 @@ def run_sgd_sde(problem: Problem, params, optimal_params, cov, T, lr, *,
 
     (_, _), risks = lax.scan(step, (params, key), jnp.arange(iters))
     return risks, jnp.arange(iters) * dt
+
+
+# --------------------------------------------------------------------------- #
+# Mode ODEs for mixture data, mini-batches and general (dense) K
+# (gmm_adam.tex eq. gmm_system)
+# --------------------------------------------------------------------------- #
+class Modes(NamedTuple):
+    """Spectral data of the deterministic equivalent, one row per mode ``j``.
+
+    ``Kbar = sum_j nu_j mu_j rho_j^T`` with left/right eigenvectors
+    ``rho_j = D^{1/2} w_j``, ``mu_j = D^{-1/2} w_j`` (``w_j`` orthonormal
+    eigenvectors of ``D^{-1/2} K D^{-1/2}``), so ``K Pi_j = nu_j rho_j rho_j^T``,
+    ``p_j = nu_j (rho_j^T Theta)(rho_j^T Theta)^T``, ``o_j = (Theta^T rho_j)(mu_j^T Xbar)``.
+
+    The Ito term of mode ``j`` is ``(sigma - tau) w_iso_j + tau w_cov_j`` with
+    ``w_iso_j = tr(K Pi_j)`` and ``w_cov_j = <C, K Pi_j>``, ``C`` the correlation
+    matrix of the coordinates seen by the optimizer: this is
+    ``<Sigma, K Pi_j>`` for ``Sigma_ik = sigma 1{i=k} + tau C_ik`` (``i != k``),
+    exact for diagonal ``K`` and to first order in the off-diagonal
+    correlations otherwise (e.g. Haar-rotated ``K``).
+    """
+    nu: jnp.ndarray        # (J,)
+    student: jnp.ndarray   # (J, M)  rho_j^T Theta_0
+    teacher: jnp.ndarray   # (J, M*) rho_j^T Theta*
+    means: jnp.ndarray     # (J, C)  mu_j^T Xbar
+    w_iso: jnp.ndarray     # (J,)
+    w_cov: jnp.ndarray     # (J,)
+
+
+def adam_modes(cov, params, teacher, means):
+    """Modes of ``Kbar = diag(K)^{-1/2} K`` for a diagonal (``(D,)``) or dense ``K``.
+
+    Also returns the left eigenvectors ``rho`` (``None`` for diagonal ``K``,
+    where they are scaled coordinate vectors) so per-mode statistics of an
+    optimizer run can be compared with the ODE.
+    """
+    if cov.ndim == 1:
+        quarter = cov ** 0.25
+        return Modes(jnp.sqrt(cov), quarter[:, None] * params,
+                     quarter[:, None] * teacher, means / quarter[:, None],
+                     cov, cov), None
+    scale = jnp.sqrt(jnp.diag(cov))
+    root = jnp.sqrt(scale)
+    nu, w = jnp.linalg.eigh(cov / root[:, None] / root[None, :])
+    rho, mu = root[:, None] * w, w / root[:, None]
+    return Modes(nu, rho.T @ params, rho.T @ teacher, mu.T @ means,
+                 nu * (scale @ w ** 2), nu ** 2), rho
+
+
+def sgd_modes(cov, params, teacher, means):
+    """Modes of ``K`` itself: SGD sees unnormalized coordinates (``D = Id``)."""
+    if cov.ndim == 1:
+        return Modes(cov, params, teacher, means, cov, cov ** 2), None
+    lam, w = jnp.linalg.eigh(cov)
+    return Modes(lam, w.T @ params, w.T @ teacher, w.T @ means, lam, lam ** 2), w
+
+
+def _mode_state(modes):
+    a, b, m, nu = modes.student, modes.teacher, modes.means, modes.nu[:, None, None]
+    outer = lambda x, y: jnp.einsum("ja,jb->jab", x, y)
+    state = (nu * outer(a, a), nu * outer(a, b), outer(a, m))
+    constants = (nu * outer(b, b), outer(b, m), outer(m, m))
+    return state, constants
+
+
+def _order_parameters(state, constants):
+    P, U, Ob = state
+    N, Os, _ = constants
+    B = jnp.block([[P.sum(0), U.sum(0)], [U.sum(0).T, N.sum(0)]])
+    return B, jnp.concatenate([Ob.sum(0), Os.sum(0)], axis=0)
+
+
+@partial(jax.jit, static_argnames=["f", "schedule", "burn", "tail", "sgd",
+                                   "steps", "record_every", "dimension", "stein"])
+def _mixture_ode_scan(modes, lr, priors, draws, beta1, beta2, eps, dt, *, f,
+                      schedule, burn, tail, sgd, steps, record_every, dimension,
+                      stein):
+    state, constants = _mode_state(modes)
+    N, Os, G = constants
+    nu = modes.nu[:, None, None]
+    w_iso, w_cov = modes.w_iso[:, None, None], modes.w_cov[:, None, None]
+
+    def field(t, state):
+        P, U, Ob = state
+        B, O = _order_parameters(state, constants)
+        co = stationary_coefficients(B, O, priors, draws, f, beta1, beta2, eps,
+                                     burn=burn, tail=tail, sgd=sgd, stein=stein)
+        phi, chi, sigma, tau = co["phi"], co["chi"], co["sigma"], co["tau"]
+        eta = lr * (schedule(t) if schedule is not None else 1.0)
+        drift = (jnp.einsum("jab,bc->jac", jnp.concatenate([P, U], axis=2), phi)
+                 + jnp.einsum("jac,cd->jad", Ob, chi))
+        dP = (-eta * nu * (drift + jnp.swapaxes(drift, 1, 2))
+              + eta ** 2 / dimension * ((sigma - tau) * w_iso + tau * w_cov))
+        dU = -eta * nu * (jnp.einsum("ba,jbc->jac", phi, jnp.concatenate([U, N], axis=1))
+                          + jnp.einsum("ca,jdc->jad", chi, Os))
+        dOb = -eta * (nu * jnp.einsum("ba,jbc->jac", phi, jnp.concatenate([Ob, Os], axis=1))
+                      + jnp.einsum("ca,jcd->jad", chi, G))
+        return (dP, dU, dOb)
+
+    def heun(state, i):
+        t = i * dt
+        k1 = field(t, state)
+        guess = jax.tree.map(lambda y, k: y + dt * k, state, k1)
+        k2 = field(t + dt, guess)
+        return jax.tree.map(lambda y, a, b: y + dt / 2 * (a + b), state, k1, k2), None
+
+    def record(state):
+        P, U, _ = state
+        B, O = _order_parameters(state, constants)
+        mode_error = jnp.trace(P - U - jnp.swapaxes(U, 1, 2) + N, axis1=1, axis2=2) \
+            if P.shape[1] == N.shape[1] else jnp.zeros(P.shape[0])
+        return B, O, mode_error
+
+    def block(state, r):
+        out = record(state)
+        state, _ = lax.scan(heun, state, r * record_every + jnp.arange(record_every))
+        return state, out
+
+    state, (B, O, mode_error) = lax.scan(block, state, jnp.arange(steps // record_every))
+    last = record(state)
+    stack = lambda path, end: jnp.concatenate([path, end[None]])
+    return stack(B, last[0]), stack(O, last[1]), stack(mode_error, last[2])
+
+
+def run_mixture_ode(problem, modes, lr, T, *, beta1, beta2, eps, draws, layout,
+                    dimension, dt=0.02, record_every=1, schedule=None, sgd=False,
+                    stein=False):
+    """Integrate the mode ODEs (Heun) for a :class:`problems.MixtureProblem`.
+
+    ``modes`` comes from :func:`adam_modes` (or :func:`sgd_modes` with
+    ``sgd=True``); ``draws``/``layout`` from :func:`discounts.draw_paths` /
+    :func:`discounts.path_layout` with the batch size of the optimizer. The
+    learning rate is ``lr * schedule(t)``; ``stein`` selects the Stein-form
+    estimator of ``phi`` (see :func:`discounts.stationary_coefficients`). Returns a dict with ``time``, ``B``,
+    ``O``, ``risk``, ``error`` and ``mode_error`` (the per-mode excess
+    ``tr(p_j - u_j - u_j^T + N_j)`` when ``M = M*``), recorded every
+    ``record_every`` steps.
+    """
+    steps = int(round(T / dt))
+    steps -= steps % record_every
+    B, O, mode_error = _mixture_ode_scan(
+        modes, lr, problem.priors, draws, beta1, beta2, eps, dt, f=problem.f,
+        schedule=schedule, burn=layout[0], tail=layout[2], sgd=sgd, steps=steps,
+        record_every=record_every, dimension=dimension, stein=stein)
+    risk = jax.vmap(problem.risk)(B, O)
+    error = jax.vmap(problem.error)(B, O) if problem.error is not None else None
+    time = jnp.arange(len(B)) * dt * record_every
+    return {"time": time, "B": B, "O": O, "risk": risk, "error": error,
+            "mode_error": mode_error}
