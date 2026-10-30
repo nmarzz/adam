@@ -123,6 +123,23 @@ def test_psgd_is_scaled_sgd():
     check("psgd = sgd with preconditioner (E f^2/b + eps)^-1/2", err < 1e-12, f"max err {err:.1e}")
 
 
+def test_moment_estimator():
+    """Path-free SGD/PSGD coefficients == path-based sgd/psgd modes."""
+    pi, B, O = zipf_state(8, 1.5)
+    pri = jnp.asarray(pi)
+    draws = jax.random.normal(jax.random.PRNGKey(0), (2 ** 16, 8))
+    layout, plan = discounts.softmax_plan(jax.random.PRNGKey(1), pi, 0.0, 0.0, batch=4,
+                                          plain_batches=2 ** 17)
+    for mode in ("sgd", "psgd"):
+        fast = discounts.softmax_moment_coefficients(B, O, pri, draws, 1e-3, 4, mode=mode)
+        slow = discounts.softmax_coefficients(B, O, pri, plan, 0.0, 0.0, 1e-3, layout=layout,
+                                              mode=mode)
+        rel = max(float(np.linalg.norm(np.asarray(fast[k]) - np.asarray(slow[k]))
+                        / np.linalg.norm(np.asarray(slow[k]))) for k in ("phi", "chi", "sigma"))
+        check(f"softmax_moment_coefficients ({mode}) vs path-based", rel < 0.01,
+              f"max relative difference {rel:.4f}")
+
+
 def test_isotropic_collapse():
     """Aggregated K = Id state == mode-resolved ODE (D = 500)."""
     from zipf_scaling import zipf_model
@@ -184,6 +201,7 @@ def main():
     test_matches_stationary_coefficients()
     test_forced_matches_plain()
     test_psgd_is_scaled_sgd()
+    test_moment_estimator()
     full, problem = test_isotropic_collapse()
     test_logtime_ode(full, problem)
     test_simulator_grid()

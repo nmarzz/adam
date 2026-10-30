@@ -603,3 +603,36 @@ def softmax_standard_errors(B, O, priors, plan: SoftmaxPlan, beta1, beta2, eps, 
     var = sum(len(d) * jnp.var(d, axis=0, ddof=1) for d in (out["plain_diag"], out["forced_diag"])
               if len(d) > 1)
     return estimate, jnp.sqrt(var)
+
+
+@partial(jax.jit, static_argnames=["mode"])
+def softmax_moment_coefficients(B, O, priors, draws, eps, batch, *, mode="sgd"):
+    """SGD (``mode="sgd"``) or ``beta2 -> 1`` PSGD (``"psgd"``) coefficients for
+    softmax on a mixture, from exactly class-stratified expectations.
+
+    These coefficients are plain expectations over one sample, so no Adam paths
+    are needed: with fixed draws ``g`` (``(n, C)``, common random numbers) and
+    ``q | c = O[:, c] + sym_sqrt(B) g``, every class gets all ``n`` draws and is
+    weighted by ``pi_c`` -- rare classes are as accurate as frequent ones.
+    Returns the same dictionary as :func:`softmax_coefficients`.
+    """
+    C = len(priors)
+    noise = draws @ sym_sqrt(B)
+    n = noise.shape[0]
+
+    def one_class(acc, c):
+        p = jax.nn.softmax(O[:, c][None, :] + noise, axis=-1)
+        f = p - jax.nn.one_hot(c, C, dtype=p.dtype)
+        mean_p, mean_f = p.mean(0), f.mean(0)
+        acc = (acc[0] + priors[c] * mean_p, acc[1] + priors[c] * (p.T @ p) / n,
+               acc[2] + priors[c] * (f.T @ f) / n)
+        return acc, priors[c] * mean_f
+
+    zero = jnp.zeros((C, C), noise.dtype)
+    (mean_p, outer_p, second), chi = lax.scan(one_class, (jnp.zeros(C, noise.dtype), zero, zero),
+                                              jnp.arange(C))
+    phi = jnp.diag(mean_p) - outer_p
+    scale = jnp.ones(C) if mode == "sgd" else lax.rsqrt(jnp.diag(second) / batch + eps)
+    sigma = second / batch * scale[:, None] * scale[None, :]
+    return {"phi": phi * scale[None, :], "chi": chi * scale[None, :], "sigma": sigma,
+            "tau": sigma}
