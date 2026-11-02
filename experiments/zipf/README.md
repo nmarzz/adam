@@ -578,6 +578,48 @@ head sets the optimal `eta` and the tail would take a larger one. At `t = 900` A
   to 1.5x, `R = 0.133`, and `N_cc/B_cc` up to 64% (33/64 learned at `eps = 1e-4`). This is the only E4 case where a
   noise-driven tail limit (H5) is plausible. It was not analysed further.
 
+#### E4 diagnostics: where the fixed point ends
+
+```
+real/bin/python experiments/zipf_scaling.py noise --safety 1 --noise-eps 1e-6 1e-5 --noise-adam-etas 0.3 --noise-modes adam   # 11 min
+real/bin/python experiments/zipf_scaling.py noise --safety 1 --noise-eps 1e-8 --noise-adam-etas 3 --noise-modes psgd adam      # 2 min
+real/bin/python experiments/zipf_scaling.py exponents --safety 1 --exponent-alphas 2 --exponent-batches 4 --exponent-modes adam --exponent-horizon 3000   # 14 min
+real/bin/python experiments/zipf_scaling.py noise --safety 1 --beta2 0.999 --noise-eps 1e-8 --noise-adam-etas 0.3 --noise-modes adam   # 4 min
+```
+
+Every run below is Adam, `C = 64`, `alpha = 2`, and changes one setting from the reference run (`b = 1`,
+`beta2 = 0.99`, `eps = 1e-8`, `eta = 0.3`, `T = 3000`). Stationarity is defined as in the E4 table: the largest change
+of the logit gaps over the last half-decade, relative to the largest gap. "Above initial" counts classes whose
+`ell_c(T)` exceeds `ell_c(0)`. `s` is the slope of `log gap_c` against `log pi_c` over classes 16-64.
+
+| change | R(T) | learned | above initial | stationarity | gap_64 | s | phi_64(T) |
+|---|---|---|---|---|---|---|---|
+| none (reference) | 0.0741 | 29 | 26 | 2.9e-4 | 0.58 | 1.12 | 0.062 |
+| `eps = 1e-6` | 0.0622 | 32 | 20 | 2.0e-3 | 0.95 | 0.91 | 0.038 |
+| `eps = 1e-5` | 0.0238 | 58 | 0 | 0.11 | 4.8 | 0.33 | 0.0063 |
+| `eps = 1e-4` | 0.0116 | 64 | 0 | 0.20 | 11.3 | 0.14 | 0.0011 |
+| `b = 4` | 0.0380 | 43 | 8 | 6.3e-5 | 1.54 | 0.73 | 0.087 |
+| `beta2 = 0.999` | 0.0228 | 64 | 0 | 0.24 | 15.1 | 0.17 | 0.0039 |
+| `eta = 1` (`T = 900`) | 0.0775 | 35 | 18 | 0.14 | 5.1 | 0.50 | 0.0060 |
+| `eta = 3` (`T = 300`) | 0.174 | 24 | 26 | 0.31 | 22.8 | 0.30 | 0.0002 |
+| PSGD, `eta = 3` (`T = 300`) | 0.423 | 13 | 44 | 0.44 | 96.6 | 0.19 | 0.0008 |
+
+* **`eps`.** The stall fades between `eps = 1e-6` (still nearly stationary, 32 learned) and `1e-5` (no fixed point, 58
+  learned, no class above its initial loss). The floor matters once the background second moment of a rare output falls
+  below about `eps`, which matches the verification estimate that the reference fixed point sits about 7x above the
+  `eps = 1e-8` floor in background scale.
+* **`b = 4` moves the fixed point without removing it.** The `t = 750` (E3) and `t = 3000` runs end at the same state:
+  43 learned, `R = 0.0380`, gaps stationary to 6e-5. Its rare margins are larger (`gap_64` 1.54 vs 0.58) and flatter in
+  `pi` (`s` = 0.73). Whether `b = 16`, which learns all 64 classes, also sits at a fixed point is being checked with a
+  `t = 3000` run.
+* **`beta2 = 0.999` removes it.** All 64 classes are learned, although its kink (`kappa (1-beta2) = 1.6e-3`) still puts
+  classes 21-64 in the rare-event regime. A 1000-step memory keeps a rare class's own events in its denominator much of
+  the time, so the curvature is no longer normalized by the background alone. The fixed point needs a memory that is
+  short compared with the time between a class's own events.
+* **More noise helps only up to a point.** `eta = 1` learns 35 classes and is still moving at `T = 900`. At `eta = 3`
+  the diffusion dominates: the margins are large but so is the differential logit variance, and the risk is 0.17 for
+  Adam (24 learned) and 0.42 for PSGD (13 learned).
+
 ### E2 `exponents`: risk exponents (H2, H3)
 
 ```
