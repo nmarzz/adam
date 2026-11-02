@@ -170,7 +170,7 @@ estimator is only used in the precision study above.
 | E0 validate | ODE accurate with many rare classes | **Passes** after Adam's warm-up transient. At `b = 1` the gap is 0.2-0.5% of the risk (also at `C = 128`). For larger `b` there is an `O(1/D)` bias. Rare classes are no less accurate. |
 | E1a rates | H1, initial drift | **Holds**: slopes 1/2 and 1. All ten kinks fall within 2% of `kappa_beta (1-beta2)/(b F^2)`. The eps-regime rate has no `sqrt(b)`, contrary to the plan's table. |
 | E1b timescales | H1 along the trajectory | **Qualitatively.** Every method is 0.1-0.2 steeper than its frozen law, and Adam lags PSGD as `max(1, u^-1/2)` below the kink. |
-| E4 noise | H5, noise floor | **Refuted.** At `b = 1`, `eps <= 1e-6`, `beta2 = 0.99`, Adam stops at a *deterministic fixed point* with the rare classes unlearned (29/64), and direct simulation reproduces it. The cause is a normalization mismatch: the forcing is normalized by the class's own rare events, the curvature by the background. `B_cc` grows in a common mode the softmax ignores. `eps >= 1e-5`, `beta2 = 0.999` or `b >= 16` remove the stall; `b = 4` only moves it (43/64). |
+| E4 noise | H5, noise floor | **Refuted.** At `b = 1`, `eps <= 1e-6`, `beta2 = 0.99`, Adam stops at a *deterministic fixed point* with the rare classes unlearned (29/64), and direct simulation reproduces it. The cause is a normalization mismatch: the forcing is normalized by the class's own rare events, the curvature by the background. `B_cc` grows in a common mode the softmax ignores. `eps >= 1e-5` and `beta2 = 0.999` remove the fixed point. A larger `b` raises its margins: 43/64 learned at `b = 4`, and 64/64 at `b = 16`, still at a fixed point. |
 | E2 exponents | H2, H3 | **Direction holds.** Inside the window Adam's risk exponent is 1.66-1.70x SGD's at `C = 64`, not 2x, because its frontier moves with `s ~ 0.6` against SGD's 1.05. H3's break appears at the window edge, at `t ~ 3/(eta r^2 sqrt(1-beta2))`. |
 | E3 batch | H4 | **Supported for per-class targets.** The best `b` brackets `b* = 10` at `eps = 1e-4`. The best `b` grows as the target moves into the tail. The ODE is exactly batch-invariant for SGD with `eta ~ b` and PSGD with `eta ~ sqrt(b)`. |
 | E5 bigram | transfer to the one-hot bigram model | **The `beta2`/batch kink transfers**: slope -1 below `kappa (1-beta2)/b`, shallower above, moving with `b`. **The stall does not**: one-hot inputs never mix classes in a coordinate's normalization. With the square loss Adam has a constant-step noise floor. |
@@ -620,10 +620,16 @@ of the logit gaps over the last half-decade, relative to the largest gap. "Above
   learned, no class above its initial loss). The floor matters once the background second moment of a rare output falls
   below about `eps`, which matches the verification estimate that the reference fixed point sits about 7x above the
   `eps = 1e-8` floor in background scale.
-* **`b = 4` moves the fixed point without removing it.** The `t = 750` (E3) and `t = 3000` runs end at the same state:
-  43 learned, `R = 0.0380`, gaps stationary to 6e-5. Its rare margins are larger (`gap_64` 1.54 vs 0.58) and flatter in
-  `pi` (`s` = 0.73). Whether `b = 16`, which learns all 64 classes, also sits at a fixed point is being checked with a
-  `t = 3000` run.
+* **A larger batch raises the fixed point rather than removing it.**
+  * `b = 4`: the `t = 750` (E3) and `t = 3000` runs end at the same state, with 43 learned, `R = 0.0380` and gaps
+    stationary to 6e-5. Its rare margins are larger (`gap_64` 1.54 vs 0.58) and flatter in `pi` (`s` = 0.73).
+  * `b = 16` (`exponents --exponent-alphas 2 --exponent-batches 16 --exponent-modes adam --exponent-horizon 3000`,
+    17 min) also converges: stationarity is 4.7e-3 at `t = 3000` and still falling, and `phi_64` plateaus at 0.039. Its
+    margins are large enough that all 64 classes are learned (`gap_64 = 9.5`, `ell_64 = 0.69`, `R = 0.0116`).
+  * The rare-event forcing grows like `b pi_c` while `phi_cc` stays near 0.04-0.09, so `gap_64 ~ b/phi_64`. Measured
+    against `b = 1`, `gap_64` is 2.7x at `b = 4` (predicted 2.8x) and 16.4x at `b = 16` (predicted 25x; `b = 16` is
+    deeper in the window, where the forcing is no longer sign-like).
+  * The stall is this fixed point with margins too small to learn the tail.
 * **`beta2 = 0.999` removes it.** All 64 classes are learned, although its kink (`kappa (1-beta2) = 1.6e-3`) still puts
   classes 21-64 in the rare-event regime. A 1000-step memory keeps a rare class's own events in its denominator much of
   the time, so the curvature is no longer normalized by the background alone. The fixed point needs a memory that is
