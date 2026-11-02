@@ -613,3 +613,64 @@ residual loss of learned classes explain the difference. H3's break appears wher
 the `beta2` window, and the time scale includes `r^2`. At `b = 1` and `alpha >= 1.5` the late regime is not the SGD
 exponent but the stall. A clean asymptotic exponent would need `C >> 64`: no local exponent here is flat over more
 than about one decade.
+
+### E3 `batch`: batch size at a fixed sample budget (H4)
+
+```
+real/bin/python experiments/zipf_scaling.py batch --safety 1     # 41 min (the b = 1 runs are shared with E4)
+```
+
+**Setup.** `C = 64`, `alpha = 2`, `beta2 = 0.99`, `eps` in {1e-8, 1e-4}, `b` in {1, 4, 16, 64}. Every run goes to
+the same number of samples, `b t = 3000` (in units of `D`). Learning-rate rules:
+
+* Adam and PSGD: fixed `eta = 0.3`, and `eta sqrt(b)`.
+* SGD: fixed `eta = 3`, and `eta b`.
+
+Analysis: `experiments/zipf/analysis/e3_batch/e3_analysis.py`, which writes `e3_numbers.json`. Figure:
+`figs/experiments/zipf/batch.pdf`.
+
+**Exact scaling symmetries of the ODE.**
+
+* SGD with `eta ~ b` needs exactly the same samples at every `b`: 441.5 to learn all 64 classes for `b` = 1-64, and the
+  same risk curve. This is because `(eta, b, t) -> (eta b, b, t/b)` leaves both the drift `eta phi` and the diffusion
+  `eta^2 sigma/b` invariant per sample.
+* PSGD with `eta ~ sqrt(b)` and `eps = 0` is invariant in the same way (159.7-160.5), since its preconditioner scales
+  as `sqrt(b)`.
+
+So in the high-dimensional limit these two rules have no critical batch size. Adam breaks the symmetry only through
+its finite memory `beta2` and through `eps`, and so does PSGD with `eps > 0`.
+
+**Samples to learn `k` classes** (`b t`; `-` = not within `b t = 3000`). Bold marks the best `b`:
+
+| optimizer, rule | `k` | b = 1 | b = 4 | b = 16 | b = 64 |
+|---|---|---|---|---|---|
+| Adam `eps` 1e-8, fixed | 8 / 32 / 64 | **5.0** / - / - | 7.6 / 171 / - | 13.6 / **133** / 1039 | 25.7 / 174 / **727** |
+| Adam `eps` 1e-8, `sqrt(b)` | 8 / 32 / 64 | 5.0 / - / - | 3.9 / 103 / - | 3.5 / 44 / 496 | **3.4** / **30** / **232** |
+| Adam `eps` 1e-4, fixed | 8 / 32 / 64 | **5.2** / 139 / 862 | 8.0 / **119** / **660** | 15.0 / 179 / 919 | 34.6 / 505 / 2585 |
+| Adam `eps` 1e-4, `sqrt(b)` | 8 / 32 / 64 | 5.2 / 139 / 862 | 4.1 / 66 / 396 | **3.9** / **52** / **291** | 4.4 / 70 / 379 |
+| PSGD `eps` 1e-8, `sqrt(b)` | 64 | 160 | 160 | 160 | 160 |
+| SGD, `eta b` | 64 | 441 | 441 | 441 | 441 |
+| SGD, fixed | 8 / 64 | **3.7** / **441** | 14 / 1576 | 56 / - | 224 / - |
+
+**H4.**
+
+* **Window optimum.** With `eps = 1e-4` (`b* = sqrt((1-beta2)/eps) = 10`), Adam's sample cost for the deep targets is
+  smallest at `b = 4` with fixed `eta` and at `b = 16` with `eta sqrt(b)`. Both bracket `b*`, and both rules get worse
+  at `b = 64`, where the eps edge `pi = b eps` cuts into the window. With `eps = 1e-8` (`b* = 1000`) Adam keeps
+  improving up to `b = 64`.
+* **The critical batch grows with the target.** For Adam (`eps = 1e-8`, fixed `eta`) the samples-minimizing `b` is 1
+  for the first 8-16 classes, 16 for 32 classes and 64 for 48-64 classes. For `eps = 1e-4` it moves from 1 to 4 and
+  then stays there, capped by the window optimum. The grid of four batch sizes is too coarse to test
+  `b_crit ~ 1/pi_{c*}` quantitatively.
+* **Larger batches escape the stall.** At `b t = 3000` with fixed `eta = 0.3`, Adam (`eps = 1e-8`) learns 29 classes at
+  `b = 1`, 43 at `b = 4` and 64 at `b` = 16 and 64. The final risk is 0.074, 0.038, 0.013 and 0.0099. A larger batch
+  moves classes into the `beta2` window (`b pi_c > kappa (1-beta2)`) and out of the regime where the fixed point
+  forms. At the head, fixed `eta` makes larger batches cost more samples: window classes gain only `sqrt(b)` per step.
+* **SGD at fixed `eta`** wastes samples in proportion to `b` (it only takes fewer steps). With `eta b` it is exactly
+  invariant, as above.
+
+**Verdict (H4).** Supported. The best batch size for the tail lies between 4 and 16 when `b* = 10`, and no optimum
+appears below `b = 64` when `b* = 1000`. The critical batch size grows as the target moves into the tail. In this
+model a larger batch is also the cure for the small-batch stall of E4. The ODE has no critical batch size for SGD
+with `eta ~ b` or for PSGD with `eta ~ sqrt(b)` (`eps = 0`), so every batch-size effect here comes from Adam's finite
+`beta2` memory and from `eps`.
