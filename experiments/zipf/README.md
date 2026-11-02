@@ -163,6 +163,18 @@ ended. Since commit 7df1486 the default estimator is the psi-route
 (`discounts.softmax_psi_coefficients`), and every ODE run below uses it. The forced-event
 estimator is only used in the precision study above.
 
+**Operations (one H100, 2 CPU cores).**
+
+* Run one GPU process at a time. Simulators and the ODE drive `lax.scan`/`while_loop` from the host, so each takes a
+  full core. Two such processes on one GPU are time-sliced: a simulation that takes 2 min alone took 30 min next to
+  another job.
+* E2-E4 use ODE step factor `--safety 1`. On the `C = 64`, `alpha = 2` problem it is 1.8x faster than 0.5, and up to
+  `t = 300` it changes the risk by at most 4.7e-4 (0.6%), any `ell_c` by at most 0.25%, `B_cc` by at most 0.09%, and
+  no `t_c`.
+* E2-E4 trajectories are cached by configuration in `figs/experiments/zipf/ode/`, with the full `B` and `O`, and start
+  from the `D -> infinity` initial state. That start agrees with the finite-`D` `Theta_0` used by E1b to 0.1% in the
+  risk at `t = 300`.
+
 ### Learning rates (`tune`, ODE only; `C = 32`, `alpha = 1.5`, `b = 1`, criterion `R(t = 100)`)
 
 `real/bin/python experiments/zipf_scaling.py tune` (8 ODE runs, 6 min)
@@ -422,7 +434,7 @@ mechanism (below).
 Quantitatively, every method is steeper than its frozen law (by 0.1-0.2 in the exponent), and the break moves less than
 predicted. For `b = 1`, `eps = 1e-8` the rare-class law is overtaken by a stall that frozen rates do not predict.
 
-### Checkpoint B (written 2026-11-02, 13:10)
+### Checkpoint B (written 2026-11-02, 13:05)
 
 * **E0 passes** past the warm-up transient: <= 0.5% of the risk at `b = 1`, and an `O(1/D)` bias for larger `b`. The
   `C = 128` validation is still running (queue step 7).
