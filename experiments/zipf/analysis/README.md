@@ -9,6 +9,10 @@ experiment, and the numbers quoted in `experiments/zipf/README.md` come from the
 |---|---|---|
 | `e1_rates` (E1a, `rates.npz`) | `decompose.py init`, `decompose.py mid`, `analysis.py`, `analysis2.py`, `checks.py`, `fig.py` | `decomp_{init,mid}.npz`, `results.json`, `results2.json`, `e1a_rates_summary.png` |
 | `e1_timescales` (E1b, `timescales.npz`, `rates.npz`) | `e1b_analysis.py`, `e1b_figure.py`, `frozen_rate_checks.py` | `e1b_numbers.json`, `e1b_summary.png` |
+| `e0_validate` (E0, `validate_*.npz`) | `e0_analysis.py` | printed tables |
+| `e2_exponents` (E2, `ode/*_T1000_s1.npz`) | `e2_analysis.py` | printed tables |
+| `e3_batch` (E3, `ode/*`) | `e3_analysis.py` | `e3_numbers.json` |
+| `e4_noise` (E4, `ode/*`, `simcheck_*.npz`) | `e4_analysis.py` | `e4_numbers.json`, `e4_mechanism.png` |
 
 `decompose.py` splits each frozen rate into the forcing `r^2 pi_c E[psi_c(1 - p_c)]`, computed from the stored
 psi tables, and the restoring part `-(phi^T O)_cc`. The Gaussian draws are seeded, so reruns reproduce the

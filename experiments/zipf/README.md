@@ -444,3 +444,61 @@ predicted. For `b = 1`, `eps = 1e-8` the rare-class law is overtaken by a stall 
   says to diagnose before E2. The diagnosis (E4 below) is a *deterministic fixed point* of the drift, not a noise floor.
   By the plan's rule E2 would wait. The user asked to continue, so E2-E4 run with the stall in view and are interpreted
   through this mechanism.
+
+### E2 `exponents`: risk exponents (H2, H3)
+
+```
+real/bin/python experiments/zipf_scaling.py exponents --safety 1     # 37 min
+```
+
+**Setup.** `C = 64`, `alpha` in {1.25, 1.5, 2, 3}, `b` in {1, 16}, Adam and PSGD at `eta = 0.3` and SGD at `eta = 3`.
+`beta2 = 0.99`, `eps = 1e-8`, `t <= 1000` with 16 records per decade. Analysis:
+`experiments/zipf/analysis/e2_exponents/e2_analysis.py`. Figure: `figs/experiments/zipf/exponents.pdf`, where the
+middle panels draw the plan's asymptotic exponents.
+
+**Frontier model at finite `C`.** If `t_c ~ pi_c^-s`, the frontier (the number of learned classes) grows as
+`c*(t) ~ t^(1/(alpha s))`. The risk is mostly the unlearned tail, `R ~ sum_{c > c*} pi_c ell_c(0)`. At `C = 64` that
+tail is truncated, so the local exponent `-dlog R/dlog t` is `(-dlog tail/dlog c*)/(alpha s)` rather than the plan's
+`2(alpha-1)/alpha` (`s = 1/2`) or `(alpha-1)/alpha` (`s = 1`). Averaged over `c*` in [2, 16]:
+
+| alpha | 1.25 | 1.5 | 2 | 3 |
+|---|---|---|---|---|
+| plan, `s = 1/2` / `s = 1` (`C -> infinity`) | 0.40 / 0.20 | 0.67 / 0.33 | 1.00 / 0.50 | 1.33 / 0.67 |
+| finite `C = 64`, `s = 1/2` / `s = 1` | 0.87 / 0.44 | 0.92 / 0.46 | 1.03 / 0.52 | 1.23 / 0.62 |
+
+**Measured** (least squares over the times where `2 <= c* <= 16`). `gamma = dlog c*/dlog t` gives the effective `s`:
+
+| alpha | exponent SGD (`b` 1 / 16) | Adam `b` 16 | PSGD `b` 16 | Adam/SGD | `s`: SGD / Adam `b` 16 / PSGD `b` 16 |
+|---|---|---|---|---|---|
+| 1.25 | 0.40 / 0.41 | 0.69 | 0.71 | 1.7 | 0.97-0.98 / 0.54 / 0.53 |
+| 1.5 | 0.43 / 0.44 | 0.74 | 0.77 | 1.7 | 0.95-0.97 / 0.54 / 0.53 |
+| 2 | 0.49 / 0.50 | 0.83 | 0.89 | 1.66 | 0.97-0.98 / 0.58 / 0.55 |
+| 3 | 0.59 / 0.60 | 0.84 | 1.01 | 1.4 | 0.97-0.98 / 0.72 / 0.58 |
+
+* **SGD** follows the finite-`C` frontier model within 0.02-0.04 at every `alpha`, with `s = 0.95-0.98`.
+* **Adam and PSGD inside the window** (`b = 16`, whose `beta2` window holds the first 64, 60, 26 and 9 classes): the
+  frontier moves with `s = 0.53-0.58` for `alpha <= 2`, close to the window's 1/2. The risk exponent is 1.6-1.75x
+  SGD's, against the plan's "doubling". It is about 80% of the frontier model's `s = 1/2` value, because learned
+  classes keep some loss. At `alpha = 3` only 9 classes are in the window, so Adam's `s` is 0.72 and the ratio drops
+  to 1.4.
+* **Broken power law (H3).** Fitting Adam's exponent separately for `c*` in [2, 6] and [6, 16]:
+  * At `b = 1`, where the window holds 6 classes at `alpha = 2` and 3 at `alpha = 3`, it drops from 0.71 to 0.52
+    (`alpha = 2`) and from 0.82 to 0.35 (`alpha = 3`): back to the SGD value once the frontier leaves the window.
+  * At `b = 16` it stays at 0.84-0.82 for `alpha = 2`, where all 16 frontier classes are inside the window, and breaks
+    from 1.03 to 0.67 at `alpha = 3`.
+  * For `alpha <= 1.5` at `b = 1` the window holds 9-11 classes and no clear break shows (0.53-0.60 throughout).
+* **Break time.** The frontier leaves the `b = 1` window (`c* = 6`, `alpha = 2`) at `t = 3.2`. The plan's
+  `1/(eta sqrt(1-beta2)) = 33` omits the factor `r^2 = 25` of the drift, and once that is restored the order of
+  magnitude matches.
+* **The stall caps the `b = 1` frontier.** By `t = 1000` Adam learns 47, 29 and 16 of 64 classes for
+  `alpha` = 1.5, 2 and 3. PSGD learns 64, 64 and 21, and SGD 64, 64 and 24. At `alpha = 1.25` Adam learns all 64:
+  the rarest class there has `pi = 1.7e-3` and its fixed-point margin (E4) is large enough.
+* **Final risk** at `t = 1000`, `b = 16`: Adam is within 2-12% of SGD at `alpha <= 2` (`alpha = 2`: 0.0116 vs 0.0115)
+  and lower at `alpha = 3` (0.0047 vs 0.0056). PSGD's risk turns up late in several runs.
+
+**Verdict (H2, H3).** The direction of H2 holds. Inside the window Adam's frontier moves like `t^(2/alpha)`
+(`s ~ 0.55` against SGD's 0.97), and its risk exponent is 1.6-1.75x SGD's at `C = 64`, not 2x. Finite `C` and the
+residual loss of learned classes explain the difference. H3's break appears where predicted, when the frontier leaves
+the `beta2` window, and the time scale includes `r^2`. At `b = 1` and `alpha >= 1.5` the late regime is not the SGD
+exponent but the stall. A clean asymptotic exponent would need `C >> 64`: no local exponent here is flat over more
+than about one decade.
