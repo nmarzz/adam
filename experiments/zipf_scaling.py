@@ -10,7 +10,7 @@ explicit-frequency psi-route, default) or ``discounts.softmax_coefficients``
 (forced-class events), so that rare classes are resolved.
 
 Subcommands: ``selftest | timings | precision | tune | validate | rates | timescales |
-exponents | batch | noise | simcheck | plot``. Results go to ``figs/experiments/zipf/``
+exponents | batch | noise | simcheck | bigram | plot``. Results go to ``figs/experiments/zipf/``
 (``.npz`` and ``.pdf``; E2-E4 trajectories in ``ode/``); the log is
 ``experiments/zipf/README.md``.
 """
@@ -697,6 +697,95 @@ def run_simcheck(args):
 
 
 # --------------------------------------------------------------------------- #
+# E5 (bigram): direct Adam / SGD on a one-hot linear bigram model (no ODE)
+# --------------------------------------------------------------------------- #
+@functools.partial(jax.jit, static_argnames=["vocab", "batch", "loss", "optimizer"])
+def bigram_paths(keys, priors, target, record_steps, *, vocab, batch, loss, optimizer, lr,
+                 beta1, beta2, eps):
+    """Per-token losses ``(seeds, len(record_steps), V)`` of ``logits = W e_i`` for a
+    token ``i ~ priors`` whose next token is ``target[i]``, from ``W = 0`` (float32).
+    ``loss``: ``"ce"`` (softmax) or ``"sq"`` (``|W e_i - e_target|^2 / 2``)."""
+    cols = jnp.arange(vocab)
+    logits = jnp.log(priors)
+
+    def per_token(W):
+        own = W[target, cols]
+        if loss == "ce":
+            return jax.nn.logsumexp(W, axis=0) - own
+        return 0.5 * (jnp.sum(W ** 2, axis=0) - 2 * own + 1)
+
+    def advance(k, carry):
+        W, m, v, key = carry
+        key, sub = jax.random.split(key)
+        tokens = jax.random.categorical(sub, logits, shape=(batch,))
+        out = W[:, tokens]
+        f = jax.nn.softmax(out, axis=0) if loss == "ce" else out
+        f = f.at[target[tokens], jnp.arange(batch)].add(-1.0)
+        g = jnp.zeros_like(W).at[:, tokens].add(f / batch)
+        if optimizer == "sgd":
+            return W - lr * g, m, v, key
+        m = beta1 * m + (1 - beta1) * g
+        v = beta2 * v + (1 - beta2) * g ** 2
+        return W - lr * m / jnp.sqrt(v + eps), m, v, key
+
+    def one(key):
+        zero = jnp.zeros((vocab, vocab), jnp.float32)
+
+        def segment(carry, bounds):
+            carry = jax.lax.fori_loop(bounds[0], bounds[1], advance, carry)
+            return carry, per_token(carry[0])
+
+        carry = (zero, zero, zero, key)
+        _, path = jax.lax.scan(segment, carry,
+                               jnp.stack([record_steps[:-1], record_steps[1:]], 1))
+        return jnp.concatenate([per_token(zero)[None], path])
+
+    return jax.vmap(one)(keys)
+
+
+def bigram_configs(args):
+    """``(loss, alpha, optimizer, beta2, b)`` for E5; SGD has no ``beta2``."""
+    configs = []
+    for loss in args.bigram_losses:
+        for alpha in args.bigram_alphas:
+            for b in args.bigram_batches:
+                configs += [(loss, alpha, "adam", b2, b) for b2 in args.bigram_beta2]
+                configs.append((loss, alpha, "sgd", 0.0, b))
+    return configs
+
+
+def bigram_name(loss, alpha, optimizer, beta2, b, vocab):
+    opt = f"adam_b2{beta2:g}" if optimizer == "adam" else "sgd"
+    return f"bigram_{loss}_V{vocab}_a{alpha:g}_{opt}_b{b}"
+
+
+def run_bigram(args):
+    """E5: per-token learning times on the linear bigram model, Adam vs SGD."""
+    V = args.bigram_vocab
+    target = jax.random.permutation(jax.random.PRNGKey(5), V)
+    keys = jax.random.split(jax.random.PRNGKey(55), args.bigram_seeds)
+    for loss, alpha, optimizer, beta2, b in bigram_configs(args):
+        name = bigram_name(loss, alpha, optimizer, beta2, b, V)
+        if (OUT / f"{name}.npz").exists() and not args.overwrite:
+            continue
+        steps = int(args.bigram_samples // b)
+        record = np.unique(np.round(np.geomspace(1, steps, 64)).astype(int))
+        record = np.concatenate([[0], record])
+        priors = jnp.asarray(zipf_priors(V, alpha), jnp.float32)
+        lr = args.bigram_lr_adam if optimizer == "adam" else args.bigram_lr_sgd
+        t0 = time.time()
+        losses = np.asarray(bigram_paths(keys, priors, target, jnp.asarray(record), vocab=V,
+                                         batch=b, loss=loss, optimizer=optimizer, lr=lr,
+                                         beta1=args.beta1, beta2=beta2, eps=args.eps))
+        np.savez_compressed(OUT / f"{name}.npz", steps=record, priors=np.asarray(priors),
+                            loss=losses, lr=lr, seconds=time.time() - t0)
+        risk = losses[:, -1] @ np.asarray(priors)
+        learned = (losses[:, -1] <= losses[:, 0] / 2).sum(1)
+        print(f"{name}: R(end) = {risk.mean():.4f}, tokens learned {np.median(learned):.0f}/{V}"
+              f"  [{time.time() - t0:.0f}s]", flush=True)
+
+
+# --------------------------------------------------------------------------- #
 # Plots
 # --------------------------------------------------------------------------- #
 def save(fig, name):
@@ -1099,10 +1188,65 @@ def plot_batch(args):
     save(fig, "batch")
 
 
+def plot_bigram(args):
+    V = args.bigram_vocab
+    runs = {}
+    for cfg in bigram_configs(args):
+        path = OUT / f"{bigram_name(*cfg, V)}.npz"
+        if path.exists():
+            runs[cfg] = dict(np.load(path))
+    if not runs:
+        return
+    alphas, losses = args.bigram_alphas, args.bigram_losses
+    style = {}
+    for b, ls in zip(sorted(args.bigram_batches), ("-", "--", ":")):
+        for b2, col in zip(sorted(args.bigram_beta2), ("#1f77b4", "#d62728", "#2ca02c")):
+            style[("adam", b2, b)] = (col, ls)
+        style[("sgd", 0.0, b)] = ("k", ls)
+    fig, axes = plt.subplots(len(losses), len(alphas) + 1,
+                             figsize=(7.5 * (len(alphas) + 1), 6.2 * len(losses)),
+                             constrained_layout=True, squeeze=False)
+    for row, loss in zip(axes, losses):
+        for ax, alpha in zip(row, alphas):
+            for (l, a, opt, b2, b), r in runs.items():
+                if l != loss or a != alpha:
+                    continue
+                pi, steps, paths = r["priors"], r["steps"], r["loss"]
+                t_i = np.array([learning_times(steps, p, p)[0] for p in paths])
+                col, ls = style[(opt, b2, b)]
+                ax.plot(pi, np.nanmedian(t_i, 0), ls, color=col, lw=1.6,
+                        label=(fr"Adam $\beta_2={b2:g}$" if opt == "adam" else "SGD") + f", $b={b}$")
+                if opt == "adam":
+                    kink = kappa_beta(args.beta1, b2) * (1 - b2) / b
+                    if pi.min() < kink < pi.max():
+                        ax.axvline(kink, color=col, ls=ls, lw=0.9, alpha=0.6)
+                risk = paths @ pi
+                row[-1].plot(b * steps[1:], risk.mean(0)[1:], ls, color=col, lw=1.4,
+                             alpha=1.0 if alpha == alphas[0] else 0.55)
+            x = np.array([pi.min(), pi.max()])
+            for slope, lsr in ((-0.5, "--"), (-1.0, ":")):
+                ax.plot(x, 30 * (x / x[1]) ** slope, lsr, color="0.5", lw=1)
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_xlabel(r"$\pi_i$")
+            ax.set_ylabel(r"steps to $\ell_i \leq \ell_i(0)/2$")
+            ax.set_title(fr"{loss.upper()}, $V={V}$, $\alpha={alpha:g}$ (grey: slopes $-1/2$, $-1$)")
+            ax.legend(frameon=False, fontsize=10)
+        row[-1].set_xscale("log")
+        row[-1].set_yscale("log")
+        row[-1].set_xlabel("samples ($b\\times$steps)")
+        row[-1].set_ylabel(r"$\mathcal{R}$")
+        row[-1].set_title(r"Risk (opaque: $\alpha=%g$)" % alphas[0])
+        for ax in row:
+            polish_axis(ax)
+    save(fig, "bigram")
+
+
 def run_plot(args):
     plot_validate(args)
     plot_rates(args)
     plot_timescales(args)
+    plot_bigram(args)
     plot_noise(args)
     plot_exponents(args)
     plot_batch(args)
@@ -1114,7 +1258,7 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=["selftest", "timings", "precision", "tune", "validate", "rates",
                                        "timescales", "exponents", "batch", "noise", "simcheck",
-                                       "plot"])
+                                       "bigram", "plot"])
     p.add_argument("--timing-classes", type=int, nargs="+", default=[8, 32, 128, 256])
     p.add_argument("--timing-beta2", type=float, nargs="+", default=[0.95, 0.99, 0.999])
     p.add_argument("--timing-batches", type=int, nargs="+", default=[1, 16, 64])
@@ -1182,6 +1326,16 @@ def parse_args():
     p.add_argument("--simcheck-horizon", type=float, default=3000.0)
     p.add_argument("--simcheck-eps", type=float, nargs="+", default=[1e-8])
     p.add_argument("--simcheck-runs", type=int, default=8)
+    # E5
+    p.add_argument("--bigram-vocab", type=int, default=1000)
+    p.add_argument("--bigram-alphas", type=float, nargs="+", default=[1.0, 1.5])
+    p.add_argument("--bigram-losses", nargs="+", default=["ce", "sq"])
+    p.add_argument("--bigram-beta2", type=float, nargs="+", default=[0.95, 0.999])
+    p.add_argument("--bigram-batches", type=int, nargs="+", default=[1, 16])
+    p.add_argument("--bigram-samples", type=float, default=2.0 ** 22)
+    p.add_argument("--bigram-lr-adam", type=float, default=1e-2)
+    p.add_argument("--bigram-lr-sgd", type=float, default=1.0)
+    p.add_argument("--bigram-seeds", type=int, default=4)
     p.add_argument("--output-dir", type=Path, default=OUT)
     return p.parse_args()
 
@@ -1194,7 +1348,8 @@ def main():
     {"selftest": run_selftest, "timings": run_timings, "precision": run_precision,
      "tune": run_tune, "validate": run_validate, "rates": run_rates,
      "timescales": run_timescales, "exponents": run_exponents, "batch": run_batch,
-     "noise": run_noise, "simcheck": run_simcheck, "plot": run_plot}[args.command](args)
+     "noise": run_noise, "simcheck": run_simcheck, "bigram": run_bigram,
+     "plot": run_plot}[args.command](args)
 
 
 if __name__ == "__main__":
