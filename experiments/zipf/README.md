@@ -163,6 +163,18 @@ ended. Since commit 7df1486 the default estimator is the psi-route
 (`discounts.softmax_psi_coefficients`), and every ODE run below uses it. The forced-event
 estimator is only used in the precision study above.
 
+### Summary of findings (Nov 2)
+
+| experiment | hypothesis | outcome |
+|---|---|---|
+| E0 validate | ODE accurate with many rare classes | **Passes** after Adam's warm-up transient. At `b = 1` the gap is 0.2-0.5% of the risk (also at `C = 128`). For larger `b` there is an `O(1/D)` bias. Rare classes are no less accurate. |
+| E1a rates | H1, initial drift | **Holds**: slopes 1/2 and 1. All ten kinks fall within 2% of `kappa_beta (1-beta2)/(b F^2)`. The eps-regime rate has no `sqrt(b)`, contrary to the plan's table. |
+| E1b timescales | H1 along the trajectory | **Qualitatively.** Every method is 0.1-0.2 steeper than its frozen law, and Adam lags PSGD as `max(1, u^-1/2)` below the kink. |
+| E4 noise | H5, noise floor | **Refuted.** At `b = 1`, `eps <= 1e-6`, `beta2 = 0.99`, Adam stops at a *deterministic fixed point* with the rare classes unlearned (29/64), and direct simulation reproduces it. The cause is a normalization mismatch: the forcing is normalized by the class's own rare events, the curvature by the background. `B_cc` grows in a common mode the softmax ignores. `eps >= 1e-5`, `beta2 = 0.999` or `b >= 16` remove the stall; `b = 4` only moves it (43/64). |
+| E2 exponents | H2, H3 | **Direction holds.** Inside the window Adam's risk exponent is 1.66-1.70x SGD's at `C = 64`, not 2x, because its frontier moves with `s ~ 0.6` against SGD's 1.05. H3's break appears at the window edge, at `t ~ 3/(eta r^2 sqrt(1-beta2))`. |
+| E3 batch | H4 | **Supported for per-class targets.** The best `b` brackets `b* = 10` at `eps = 1e-4`. The best `b` grows as the target moves into the tail. The ODE is exactly batch-invariant for SGD with `eta ~ b` and PSGD with `eta ~ sqrt(b)`. |
+| E5 bigram | transfer to the one-hot bigram model | **The `beta2`/batch kink transfers**: slope -1 below `kappa (1-beta2)/b`, shallower above, moving with `b`. **The stall does not**: one-hot inputs never mix classes in a coordinate's normalization. With the square loss Adam has a constant-step noise floor. |
+
 **Operations (one H100, 2 CPU cores).**
 
 * Run one GPU process at a time. Simulators and the ODE drive `lax.scan`/`while_loop` from the host, so each takes a
@@ -797,3 +809,54 @@ memory and from `eps`; for PSGD it comes from `eps`.
 * At fixed `eta` the best `b` grows as the target moves into the tail.
 * `b >= 16` removes the small-batch stall at this sample budget, by a mechanism not identified here.
 * The ODE has no critical batch size for SGD with `eta ~ b` or for PSGD with `eta ~ sqrt(b)` (`eps = 0`).
+
+### E5 `bigram`: transfer to a one-hot linear bigram model (direct simulation)
+
+```
+real/bin/python experiments/zipf_scaling.py bigram     # 47 min alone (24 configurations, 4 seeds each)
+```
+
+**Setup.** This is a plan-style transfer test, and the model is our own simplification of the Kunstner-Bach setting.
+Tokens `i ~ pi_i ~ i^-alpha` with `V = 1000` and `alpha` in {1, 1.5}. Each token's next token is a fixed random
+permutation `target[i]`, and the logits are `W e_i` with `W = 0` at start (float32). Loss: CE or square
+(`|W e_i - e_target|^2/2`). Optimizers:
+
+* Adam with `beta2` in {0.95, 0.999}, `beta1 = 0.9`, `eps = 1e-8`, `lr = 1e-2`;
+* SGD with `lr = 1`.
+
+`b` in {1, 16}, `2^22` samples per run. The learning rates are untuned, so absolute times are not comparable across
+optimizers. `t_i` is the first step with `ell_i <= ell_i(0)/2`, as a geometric mean over the 4 seeds. Analysis:
+`experiments/zipf/analysis/e5_bigram/e5_analysis.py`. Figure: `figs/experiments/zipf/bigram.pdf`, with the predicted
+kinks `kappa_beta (1-beta2)/b` as vertical lines.
+
+**Band slopes** of `log t_i` against `log pi_i`, by token rank (the window predicts -1/2, rare events and SGD -1):
+
+| run (CE) | ranks 1-5 | 6-39 | 40-249 | 250-1000 | ranks inside the window |
+|---|---|---|---|---|---|
+| SGD, `b` 1 / 16, `alpha = 1` | -1.10 / -1.04 | -1.07 / -1.02 | -0.99 / -1.00 | -0.98 / -1.01 | - |
+| Adam 0.95, `b = 1`, `alpha = 1` | -0.73 | -0.93 | -1.00 | -1.00 | 1-3 |
+| Adam 0.95, `b = 16`, `alpha = 1` | -0.44 | -0.64 | -0.83 | -0.96 | 1-46 |
+| Adam 0.999, `b = 1`, `alpha = 1` | -1.04 | -0.89 | -0.87 | -0.93 | 1-85 |
+| Adam 0.999, `b = 16`, `alpha = 1` | -0.54 | -0.79 | -0.81 | -0.73 | all |
+| Adam 0.95, `b` 1 / 16, `alpha = 1.5` | -0.61 / -0.31 | -0.91 / -0.66 | -1.01 / -0.94 | -1.00 / -0.96 | 1-4 / 1-12 |
+
+The square loss gives the same pattern (Adam 0.95: -0.76, -0.97, -1.01, -1.00 at `b = 1` and -0.27, -0.52, -0.81, -0.96
+at `b = 16`, `alpha = 1`).
+
+* **The `beta2` kink transfers.** SGD has slope -1 for every token. Adam with `beta2 = 0.95` has slope -1 below
+  `kappa_beta (1-beta2)/b` and is shallower above it (down to about -0.3 to -0.6 at the head). The shallow range grows
+  with `b` (from ranks 1-5 at `b = 1` to about 1-40 at `b = 16`), as the kink moves down by `1/b`. In the one-hot model
+  each occurrence of a rare token gives one sign-like kick, so its learning time counts occurrences (`~ 1/pi`).
+* **The window slope is not cleanly -1/2.** The shallowest bands are -0.3 to -0.6. With `beta2 = 0.999` the head is
+  learned during Adam's 1000-step warm-up (no bias correction), and the slopes are -0.7 to -0.9 throughout.
+* **No stall.** Every Adam configuration learns all 1000 tokens, except where the `b = 16`, `alpha = 1.5` step budget
+  runs out (SGD falls short there too). This fits the E4 mechanism. With one-hot inputs, coordinate `(r, i)` receives
+  gradient only when token `i` occurs, so its denominator is never dominated by other classes' background: there is no
+  normalization mismatch.
+* **A different floor appears with the square loss.** With a constant learning rate, Adam's risk plateaus at about
+  1e-4 to 3e-3, where SGD converges to 0, because normalized steps do not shrink near the optimum. With CE the optimum
+  is at infinity and no plateau shows within the budget.
+
+**Verdict.** In the bigram model the `beta2`/batch kink in per-token learning times appears qualitatively, as
+predicted. The Gaussian model's rare-class stall does not, because it needs dense inputs that couple every class into
+every coordinate's normalization.
