@@ -445,6 +445,117 @@ predicted. For `b = 1`, `eps = 1e-8` the rare-class law is overtaken by a stall 
   By the plan's rule E2 would wait. The user asked to continue, so E2-E4 run with the stall in view and are interpreted
   through this mechanism.
 
+### E4 `noise`: eta sweep and the rare-class stall (H5)
+
+```
+real/bin/python experiments/zipf_scaling.py noise --safety 1 --noise-eps 1e-8                          # 40 min
+real/bin/python experiments/zipf_scaling.py simcheck                                                    # 32 min
+real/bin/python experiments/zipf_scaling.py noise --safety 1 --noise-eps 1e-4 --noise-modes psgd adam   # 15 min
+```
+
+**Setup.** `C = 64`, `alpha = 2`, `b = 1`, `beta2 = 0.99`. Adam and PSGD: `eta` in {0.03, 0.1, 0.3, 1} to
+`eta T = 900`, `eps` in {1e-8, 1e-4}. SGD: `eta` in {0.3, 1, 3, 10} to `eta T = 9000`. `simcheck`: 8 direct Adam runs
+(`D = 2000`, `eta = 0.3`, `eps = 1e-8`, one shared finite-`D` `Theta_0`) to `t = 3000`. Analysis:
+`experiments/zipf/analysis/e4_noise/e4_analysis.py`, rerun after the `eps = 1e-4` runs. The equal-`t` and simulation
+tables and the coefficient checks come from separate verification scripts (numpy, plus one 80 s GPU job). Figures:
+`figs/experiments/zipf/noise.pdf`, `figs/experiments/zipf/analysis/e4_noise/e4_mechanism.png`.
+
+**Runs** at `T`; cells are `eta` = 0.03 / 0.1 / 0.3 / 1 (SGD 0.3 / 1 / 3 / 10). Learned: `ell_c <= ell_c(0)/2` at some
+record time. `gap_c = O_cc - max_{k != c} O_kc`. `N = B - O O^T/r^2` is the part of `B` outside the span of the means.
+Stationarity: largest change of the gaps `O_cc - O_kc` over `[T/sqrt(10), T]`, relative to the largest gap. `s`: slope
+of `log gap_c` against `log pi_c` (classes 16-64). `R(T)`, learned and `max B_cc` match `run_session2.log`.
+
+| run | R(T) | learned | max B_cc | N_cc/B_cc (%) | gap_64 | stationarity | s |
+|---|---|---|---|---|---|---|---|
+| Adam, `eps` 1e-8 | 0.0664 / 0.0683 / 0.0741 / 0.0775 | 28 / 28 / 29 / 35 | 1158 / 1039 / 726 / 176 | 0.25 / 0.85 / 2.7 / 17 | 0.454 / 0.475 / 0.579 / 5.10 | 7.5e-5 / 7.9e-5 / 2.9e-4 / 0.14 | 1.14 / 1.14 / 1.12 / 0.50 |
+| Adam, `eps` 1e-4 | 0.0079 / 0.0087 / 0.0116 / 0.0308 | 64 | 27.9 / 30.0 / 37.5 / 92.8 | 1.1 / 3.6 / 10 / 29 | 10.4 / 10.6 / 11.3 / 15.9 | 0.18 / 0.18 / 0.20 / 0.26 | 0.13-0.16 |
+| PSGD, `eps` 1e-8 | 0.0100 / 0.0183 / 0.0418 / 0.1328 | 64 / 64 / 64 / 29 | 83 / 156 / 340 / 936 | 10 / 21 / 32 / 45 | 24.8 / 32.6 / 44.6 / 66.4 | 0.36 / 0.40 / 0.41 / 0.42 | 0.08-0.14 |
+| PSGD, `eps` 1e-4 | 0.0079 / 0.0128 / 0.0323 / 0.1138 | 64 / 64 / 64 / 33 | 49 / 82 / 229 / 764 | 5.4 / 15 / 29 / 43 | 19.1 / 23.8 / 36.2 / 60.7 | 0.28 / 0.33 / 0.39 / 0.41 | 0.08-0.12 |
+| SGD | 0.0079 / 0.0083 / 0.0100 / 0.0215 | 64 | 21.4 / 22.7 / 27.0 / 58.7 | 1.0 / 3.1 / 9.0 / 26 | 10.3 / 10.5 / 11.1 / 14.3 | 0.21 / 0.22 / 0.23 / 0.26 | 0.12-0.13 |
+
+* **Adam with `eps = 1e-8` and `eta <= 0.3` stops at a fixed point.** It learns 28-29 classes at every `eta` and never
+  loses one; the gaps are stationary to 3e-4; 21-26 rare classes (39-64 at `eta = 0.3`) end above their initial loss,
+  by up to 1.34x. The margins grow mildly with `eta` (`gap_32` = 2.44 / 2.61 / 3.33 at `eta` = 0.03 / 0.1 / 0.3) and
+  scale as `pi_c^1.12-1.14` (local exponent 0.9-1.0 over classes 16-39, 1.14-1.17 over 40-64).
+* **`eps = 1e-4` removes the stall** at every `eta`: all 64 classes are learned and the margins are still growing. The
+  floor sets the denominator (`psi_c'(0)` = 91-99 against `1/sqrt(eps)` = 100), so `phi_cc` follows the background
+  scale (0.0005-0.0023 at `T`, decaying like `t^-0.67`). PSGD and SGD have no fixed point either.
+
+**Equal `t`** (Adam, `eps = 1e-8`, `eta` = 0.03 / 0.1 / 0.3 / 1; head = classes 1-16, tail = 17-64, prior-weighted):
+
+| t | R(t) | head loss | tail loss | learned |
+|---|---|---|---|---|
+| 30 | 0.445 / 0.217 / **0.139** / 0.147 | 0.340 / 0.109 / **0.038** / 0.039 | 4.13 / 4.01 / **3.68** / 3.94 | 6 / 11 / 17 / **20** |
+| 100 | 0.213 / 0.122 / **0.094** / 0.122 | 0.106 / 0.028 / **0.017** / 0.032 | 3.98 / 3.42 / **2.79** / 3.28 | 11 / 18 / 23 / **25** |
+| 300 | 0.124 / 0.083 / **0.077** / 0.099 | 0.030 / **0.013** / 0.014 / 0.028 | 3.44 / 2.55 / **2.31** / 2.59 | 17 / 24 / 27 / **30** |
+| 900 | 0.083 / **0.070** / 0.074 / 0.078 | 0.013 / **0.011** / 0.013 / 0.026 | 2.54 / 2.14 / 2.22 / **1.89** | 24 / 28 / 29 / **35** |
+
+`eta = 0.3` is best for the risk and the tail loss up to `t = 300`. At `t = 900` `eta = 0.1` wins the head and the
+risk, and `eta = 1` the tail loss. `eta = 1` learns the most classes at every `t` but raises `ell_64` the most (to
+1.6-2.1x its initial value). Best risks at `t = 900`: PSGD 0.0134-0.0149, SGD 0.0146, Adam 0.0186 (`eps = 1e-4`).
+
+**Simulation** (mean +- s.e. over the 8 runs, against the `eta = 0.3` ODE interpolated in `log t`):
+
+| t | R sim / ODE | learned, running | learned at `t` | gap_64 sim / ODE | mean-competitor gap_64 |
+|---|---|---|---|---|---|
+| 303 | 0.07714 +- 0.00020 / 0.07725 | 27.4 / 27 | 27.1 / 27 | 0.32 +- 0.06 / 0.54 | 0.62 +- 0.06 / 0.61 |
+| 953 | 0.07417 +- 0.00024 / 0.07414 | 29.1 / 29 | 28.4 / 29 | 0.43 +- 0.05 / 0.58 | 0.75 +- 0.05 / 0.66 |
+| 3000 | 0.07438 +- 0.00017 / 0.07410 | 29.75 +- 0.16 / 29 | 28.4 +- 0.3 / 29 | 0.34 +- 0.08 / 0.58 | 0.65 +- 0.06 / 0.66 |
+
+Real Adam stalls the same way. The risk agrees within 0.4% (`|z| <= 1.6`) for `t = 10-3000` and is flat late
+(`R(3000) - R(953)` = +0.00021 +- 0.00037). `ell_64(3000)` = 5.565 +- 0.059 vs 5.563, rare margins do not move after
+`t = 953`, and `B` grows as in the ODE (common-mode share 0.9959 vs 0.9957). The min-gap is 0.2-0.3 low in every
+class: the max over about 63 nearly tied competitors, each with a steady run-to-run s.d. of 0.21-0.235, is biased up.
+
+**Mechanism: a fixed point of the shift-invariant drift.** The softmax ignores a common logit shift, so `1^T phi = 0`
+and `(P O, P B P)`, `P = I - 11^T/C`, is closed. At the `eta <= 0.3` end states, psi-route coefficients recomputed
+with the ODE's own plan give `|P dO/dt|` = 0.9-1.9e-6 and `|P dB/dt P|` about 3e-6 of the forcing
+`eta |P r^2 chi^T|`. Other plans or an independent numpy `phi` leave a mixed-sign 3% rms (MC level). Stationarity
+reads `phi^T o_c + r^2 chi_{c.}^T = lambda_c 1` (`o_c` = column `c` of `O`). The columns of `phi` sum to 0 and
+`phi_sc <= 0` for `s != c`, so row `c` fixes a weighted margin,
+`mbar_c = sum_{s != c} (|phi_sc|/phi_cc)(O_cc - O_sc) = (r^2 |chi_cc| + lambda_c)/phi_cc`. At `eta = 0.3`, for `c` =
+32 / 48 / 64, `gap_c` = 3.33 / 1.175 / 0.579, `mbar_c` = 3.42 / 1.225 / 0.608 and the right-hand side 3.64 / 1.211 /
+0.612. `lambda_c` (0.0066-0.024) is the common-mode drift of column `c`, predicted to 3e-5; without it the rare
+margins come out 10-21% low.
+
+**Why `phi_cc` stays finite.** Adam normalizes the forcing by the own event and the restoring term by the background.
+For classes >= 32, `r^2 chi_cc/pi_c` is 98-99% of `-r^2 c_beta sqrt(2/pi)/(1 - beta1/sqrt(beta2)) = -208.9`, the
+sign-like plateau. The curvature is `phi_cc = kappa E_bg[p_c(1-p_c)]/RMS_bg(p_c)`, `kappa = 0.44-0.94`, with `E_bg`
+over other classes' inputs: own events carry 200-400x the background in `E f_c^2`, yet `psi_c'(0)` = 1.7-1.9 /
+`RMS_bg`. So `phi_cc` ignores the scale of the background, not its shape. It fell 11-20x as the background shrank and
+grew a heavy tail, then stopped with `P B P` at 0.034-0.081; `eps = 1e-4` would cut it 5-8x. Shrinking `E_bg[p_64]`
+55x at the `eta = 0.3` state (logit 64 lowered by 4 on other means, `eps -> 0`) moves Adam's balance margin
+0.493 -> 0.532, but SGD's and PSGD's (equal on the diagonal) 47.7 -> 1399: they normalize forcing and restoring alike.
+
+**Noise.** Exactly, `dN/dt = -eta Sym(N phi) + eta^2 sigma` (the `O chi` terms of `dB/dt` and `d(O O^T)/dt` cancel),
+and `dO/dt` has no `sigma` term: noise reaches the margins only through the coefficients. At the fixed point the
+differential noise is in Lyapunov balance (residual 6e-6). 99.6-99.9% of `tr B/C` is the common mode driven by
+`lambda_c`, which Adam's per-output normalization does not conserve (SGD conserves it), so `B_cc` grows like
+`t^1.8-1.95`. At `eta = 1` the differential variance keeps growing (`Var(q_64 - q_1)` 16.6 -> 75.3 over
+`eta t` = 9-900, against plateaus of 11.9-17.4 at `eta <= 0.3`), so `phi_cc` keeps falling and the margins follow.
+
+**Verdict (H5).** Refuted as stated. H5 predicted a noise floor: rare-class `B_cc` plateauing near `eta/sqrt(b pi_c)`
+and an `eta` limited by the tail. `B_cc` never plateaus (it grows like `t^2` in a common mode the softmax ignores), and
+at `eta <= 0.3` its diffusion-driven part is 0.25-2.7%. The tail does stall at `b = 1`, `eps -> 0`, but at a
+deterministic fixed point of the drift (28-29 classes at every `eta <= 0.3`), set by the mismatch between own-event and
+background normalization; `eps = 1e-4` removes it, and PSGD (`eta <= 0.3`) and SGD learn all classes. At fixed `t` the
+head sets the optimal `eta` and the tail would take a larger one. At `t = 900` Adam (`eps = 1e-8`) has 5x SGD's risk.
+
+**Dropped claims** (refuted, superseded above, or not decidable from the stored data):
+
+* Margins `~ pi_c^1.07-1.14` (1.07 not reproduced); `B_cc` "grows to 700-1160" (no plateau); `N` "1-3% of `B_cc`"
+  (0.25-2.7%); `phi_cc` "stays O(1)" (it falls 11-20x first); stationarity `phi^T o_c = -r^2 chi_{c.}^T` (only up to
+  the common mode `lambda_c 1`); "more noise (`eta = 1`) moves the fixed point" (none is reached by `eta T = 900`).
+* PSGD's `phi_cc` "decays like `1/t` because own events dominate `E f_c^2`": it decays like `t^-1/2`, and own events
+  are 41-69% of `E f_c^2` at its end state; what separates it from Adam is the shared normalization.
+* The rare-event condition `b pi_c << 1 - beta2` needs a log factor (own events dominate `S_c` for 850-980 steps).
+* "The fixed point holds with every estimator": the forced-event estimator is biased here (`phi_cc` 10-16% and
+  `sigma_cc` 27% low against 8.4M plain-path samples; spurious +10-12% margin growth). Do not use it at late times.
+* Simulation "29.8 vs 29 learned" (a running count, inflated by threshold crossings; 28.4 +- 0.3 vs 29 at fixed `t`)
+  and "`c = 64` margin 0.32-0.43 vs 0.58" (a finite-`D` bias of the min-gap; the mean-competitor margin agrees).
+* Not decidable: whether a larger `b` keeps a fixed point (the E2 `b = 16` run learns all 64 classes by `t = 1000`,
+  `gap_64` = 9.5, and its gaps still move), and whether the stall exists at other `C`.
+
 ### E2 `exponents`: risk exponents (H2, H3)
 
 ```
