@@ -243,7 +243,13 @@ finite-`D` bias that scales as `D^-1` and grows with `b` (about 2x from `b = 8` 
 `b = 32`). It is below 1% of the risk at `D = 8000` (`C = 32`) and 1.3% at `D = 16000`
 (`C = 8`, `b = 32`). The pass criterion holds at the largest `D` for `b <= 8`; at
 `b = 32` it holds at `C = 32` and is narrowly missed at `C = 8`. Rare classes show no
-extra error. Results at `C = 128` are pending (queue step 7).
+extra error.
+
+**`C = 128`** (`alpha = 2`, `b = 1`, `D = 4000`, `t <= 300`; `validate --val-classes 128 --val-alphas 2
+--val-batches 1 8 --horizon-large 300`): the ODE took 2177 s (1049 steps) and the 16 runs 294 s. After warm-up the
+risk gap is 0.0023 (0.21% of `R`, z = -0.9). The per-class worst relative gap has median 0.7%, and for the rarest
+class it is 0.4% (z = 2.2), although that class gets `D pi_128 = 0.1` samples per unit time. I stopped the `b = 8`
+case and its D-sweep because at 2.1 s per ODE step they did not fit the GPU budget.
 
 ### E1a `rates`: frozen per-class rates at C = 128 (H1a)
 
@@ -436,8 +442,8 @@ predicted. For `b = 1`, `eps = 1e-8` the rare-class law is overtaken by a stall 
 
 ### Checkpoint B (written 2026-11-02, 13:05)
 
-* **E0 passes** past the warm-up transient: <= 0.5% of the risk at `b = 1`, and an `O(1/D)` bias for larger `b`. The
-  `C = 128` validation is still running (queue step 7).
+* **E0 passes** past the warm-up transient: <= 0.5% of the risk at `b = 1`, and an `O(1/D)` bias for larger `b`. At
+  `C = 128` (`b = 1`) the gap is 0.21% of the risk.
 * **H1 holds for the initial drift.** The kinks are within 2% after the background/eps correction, the eps-regime rate
   carries no `sqrt(b)`, and PSGD misses the `beta2` kink.
 * **Along the trajectory H1 holds only qualitatively.** The stall at `b = 1`, `eps = 1e-8` is the failure that the plan
