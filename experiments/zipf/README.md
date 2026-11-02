@@ -153,3 +153,282 @@ Predicted kinks at `Theta_0` (see the note draft): `b pi = kappa_beta (1 - beta2
 `pi_c (1-p_c)^2 ≈ sum_{k≠c} pi_k p_c^2` (`pi ≈ C^{-2}` at `Theta_0`), which the plan's
 table does not include and which matters for the rarest classes when `alpha ≥ 2` or
 `b ≳ (1 - beta2) C^2`.
+
+---------------------------------------------------------------------------------
+## Session 2 (2026-11-02): runs after Checkpoint A
+
+Logs: `figs/experiments/zipf/run_to_B.log` (Oct 30) and `run_session2.log` (Nov 2). The
+Oct 30 log stops at 19:07 during E0 at `C = 128` because the 10-hour slurm allocation
+ended. Since commit 7df1486 the default estimator is the psi-route
+(`discounts.softmax_psi_coefficients`), and every ODE run below uses it. The forced-event
+estimator is only used in the precision study above.
+
+### Learning rates (`tune`, ODE only; `C = 32`, `alpha = 1.5`, `b = 1`, criterion `R(t = 100)`)
+
+`real/bin/python experiments/zipf_scaling.py tune` (8 ODE runs, 6 min)
+
+| | eta | R(t = 100) | R(t = 1000) |
+|---|---|---|---|
+| Adam | 0.03 / 0.1 / **0.3** / 1 | 0.218 / 0.068 / **0.034** / 0.056 | 0.023 / **0.016** / 0.017 / 0.040 |
+| SGD | 0.3 / 1 / **3** / 10 | 0.183 / 0.065 / **0.032** / 0.033 | 0.028 / 0.016 / **0.013** / 0.026 |
+
+Chosen and fixed (`eta.json`): Adam 0.3, SGD 3. At `t = 1000` Adam would prefer
+`eta = 0.1`, which is the first sign of the late-time cost of a large Adam step studied in E4.
+
+### E0 `validate`: ODE vs simulation
+
+```
+real/bin/python experiments/zipf_scaling.py validate          # Oct 30: C in {8, 32}, all alpha and b, D = 4000
+real/bin/python experiments/zipf_scaling.py validate --val-classes 8 32 \
+    --dsweep '[[8,2,8],[8,2,32],[32,2,1],[32,2,32]]' --val-dimensions 2000 8000 16000
+```
+
+Setup: one ODE per `(C, alpha, b)`, started from the `D -> infinity` initial state, and 16
+Adam runs per `D` (`eta = 0.3`, `beta2 = 0.99`, `eps = 1e-8`). Horizons are `t = 30` for
+`C = 8` and `t = 300` for `C = 32`. The ODEs took 2-514 s. The simulations took 7-170 s at
+`D = 4000` and up to 1340 s at `D = 16000`. I stopped the `C = 32`, `b = 32`, `D = 16000`
+case to free the GPU. Analysis script: `e0_analysis.py`; its numbers are quoted below.
+
+There are two distinct effects:
+
+1. **Warm-up transient (not an ODE error).** The simulator's Adam starts from `m = v = 0`
+   with no bias correction. For the first ~`1/(1-beta2) = 100` steps it therefore takes
+   sign-like steps, up to ~4x the stationary update size that the ODE assumes. The
+   simulation runs ahead: its risk is below the ODE by 0.04-0.43 at `t = 0.01-0.1`, i.e.
+   after 40-400 steps. The transient is larger for larger `b` and shrinks with `D` (log-log
+   slopes -0.4 to -0.9), because a fixed number of steps occupies ODE time `~100/D`. The
+   "sup mean gap" printed by `validate` (and in `run_to_B.log`) is this transient.
+2. **After warm-up (`t >= 1`).** The simulation is slightly *behind* the ODE, and the gap
+   decays like `1/D`:
+
+| case | D = 2000 | D = 4000 | D = 8000 | D = 16000 | slope |
+|---|---|---|---|---|---|
+| C 8, alpha 2, b 8 | 0.0037 (5.4% of R, z 17) | 0.0018 (2.6%) | 0.0007 (1.0%) | 0.0004 (0.6%, z 5) | -1.09 |
+| C 8, alpha 2, b 32 | 0.0024 (9.8%, z 48) | 0.0012 (4.8%) | 0.0006 (2.5%) | 0.0003 (1.3%, z 11) | -0.98 |
+| C 32, alpha 2, b 1 | 0.0050 (0.9%, z 2.5) | 0.0022 (0.4%) | 0.0015 (0.2%) | 0.0017 (0.3%, z 2.7) | at the noise floor |
+| C 32, alpha 2, b 32 | 0.0038 (3.0%, z 24) | 0.0019 (1.5%) | 0.0012 (0.9%, z 17) | stopped | -0.83 |
+
+At `D = 4000`, the full grid (`C` in {8, 32}, `alpha` in {1.2, 1.5, 2}) gives 0.3-0.5% of
+`R` with `|z| <= 2.4` at `b = 1`. It gives 0.3-3.2% at `b = 8` and 1.5-5.7% at `b = 32`.
+The 0-1 error gap is at most 0.0018 in absolute terms. Final risks agree to four decimals.
+
+**Per class** (worst relative gap of `ell_c` over `t >= 1`): the median over classes is
+2-6% and is not larger for rare classes. Grouped by the expected number of class-`c`
+events per unit time, `D pi_c`:
+
+| D pi_c | 0-10 | 10-100 | 100-1000 | > 1000 |
+|---|---|---|---|---|
+| median relative gap | 4.5% | 3.8% | 3.5% | 3.3% |
+| 90th percentile | 7.3% | 6.4% | 5.7% | 6.8% |
+
+With only a handful of class-`c` events per unit ODE time, the rarest classes are as
+accurate as the frequent ones. Their simulation spread is larger, so their z-scores are
+smaller.
+
+**Verdict (C <= 32).** Past the warm-up transient, the ODE is accurate to within MC error
+at `b = 1`: 0.2-0.5% of the risk for `D >= 4000`. For larger batches the residual is a
+finite-`D` bias that scales as `D^-1` and grows with `b` (about 2x from `b = 8` to
+`b = 32`). It is below 1% of the risk at `D = 8000` (`C = 32`) and 1.3% at `D = 16000`
+(`C = 8`, `b = 32`). The pass criterion holds at the largest `D` for `b <= 8`; at
+`b = 32` it holds at `C = 32` and is narrowly missed at `C = 8`. Rare classes show no
+extra error. Results at `C = 128` are pending (queue step 7).
+
+### E1a `rates`: frozen per-class rates at C = 128 (H1a)
+
+```
+real/bin/python experiments/zipf_scaling.py rates --rates-check     # Oct 30, 52 min
+```
+
+**Setup.** `alpha = 2`. The rate of class `c` is the frozen drift `|dO_cc/dt|/eta = |(phi^T O + r^2 chi^T)_cc|`, from
+psi-route coefficients averaged over 4 plan seeds. It is evaluated at `Theta_0` and at the Adam ODE state at `t = 10`
+(`beta2 = 0.99`, `b = 1`, `eps = 1e-8`). There are ten Adam configs, with PSGD and SGD at the same states. The analysis
+(`experiments/zipf/analysis/e1_rates/`, figure `figs/experiments/zipf/analysis/e1_rates/e1a_rates_summary.png`) splits
+each rate into the forcing `r^2 pi_c E[psi_c(1 - p_c)]`, computed from the stored psi tables, and the restoring part
+`-(phi^T O)_cc`. Slopes and kinks are fitted on the forcing, and every claim was recomputed independently by a second
+script.
+
+**Slopes and kinks at `Theta_0`.** Free fits give slope 0.99-1.00 on the rare side and 0.48-0.50 on the frequent side
+in all ten configs, joined by a crossover about 2 decades wide. So a slope taken over a single decade near the kink
+falls anywhere between 1/2 and 1. The kink `pi_b` is the intersection of the two asymptotes:
+
+| config | kink `pi_b` | / `(1-beta2)/b` (plan) | / `kappa_beta (1-beta2)/b` | / `kappa_beta (1-beta2)/(b F^2)` |
+|---|---|---|---|---|
+| `beta2` 0.95 / 0.99 / 0.999, `b = 1` | 4.8e-2 / 1.5e-2 / 1.8e-3 | 0.95 / 1.48 / 1.75 | 1.03 / 1.03 / 1.12 | 1.02 / 1.01 / 1.01 |
+| `b` = 4 / 16 / 64 (`beta2 = 0.99`) | 3.8e-3 / 1.1e-3 / 3.4e-4 | 1.52 / 1.69 / 2.18 | 1.06 / 1.18 / 1.52 | 1.00 / 1.00 / 1.00 |
+| `b = 1`, `eps` 1e-4 / 1e-2 | 1.5e-2 / 3.0e-2 | 1.51 / 3.04 | 1.05 / 2.13 | 1.01 / 1.02 |
+| `b = 16`, `eps` 1e-4 / 1e-2 | 3.1e-3 / 0.16 | 1.93 / 1.01 (vs `b eps`) | 1.93 / 1.01 | 1.01 / 0.99 |
+
+`F` is a rare-side prefactor below 1. The rare-event law assumes that one class-`c` event dominates its own denominator.
+The softmax background (`b/C^2` per step at `Theta_0`) and the eps floor compete with that event:
+
+```
+F(a) = sum_l rho^l g(a / (f^2 beta2^l)) / (sqrt(2/pi) sum_l rho^l),   rho = beta1/sqrt(beta2),
+g(a) = E[xi^2/sqrt(xi^2 + a)],   f = 1 - 1/C,   a = (b^2 eps + b/C^2)/(1 - beta2).
+```
+
+* `F` = 0.995, 0.991, 0.947, 0.972, 0.922 and 0.810 for the `eps = 1e-8` configs in table order.
+* It matches the measured rare-side prefactor at class 128 within 1% in nine configs (4% at `b = 64`, where class 128
+  is not yet asymptotic).
+* The window law is unchanged, so the kink moves to `kappa_beta (1-beta2)/(b F^2)`. That puts all ten measured kinks,
+  including the eps kinks, within 2%.
+* Divided by the window law `r^2 sqrt(b pi)`, the six `eps = 1e-8` curves collapse onto one function of
+  `pi/kink_corrected`. They cross 0.5 at 0.33-0.36. Without `F` the crossings spread over 0.34-0.53.
+
+**PSGD** has no `beta2` kink by construction, since `beta2 -> 1`:
+
+* Its slope is 0.50-0.51 above `pi = 1e-3`, and it bends towards its own softmax-background kink, at local slope 3/4 at
+  `pi = 6.1e-5` (predicted `1/((C-1)^2 - 1) = 6.2e-5`).
+* At class 128 it overstates Adam's forcing by 22x, 12x and 4.2x for `beta2` = 0.95, 0.99 and 0.999, and by 6.2x, 3.3x
+  and 1.9x for `b` = 4, 16 and 64.
+* Adam itself has no background kink in this range. One would need `b >~ C^2 (1-beta2) = 164`.
+
+**eps.** Only the larger edge of `pi_min = max(kappa (1-beta2)/b, b eps)` shows up, so an eps kink needs
+`b > b* = sqrt((1-beta2)/eps)`:
+
+* At `b = 1`, `eps = 1e-4` (`b* = 10`) the forcing is within 1% of the `eps = 1e-8` value at every class.
+* At `b = b*` (`b = 1`, `eps = 1e-2`) the two edges merge.
+* **The eps-regime rate does not depend on `b`.** At `b = 16`, `eps = 1e-2` the tail forcing is 0.997 of
+  `r^2 pi (1 - 1/C)/sqrt(eps)`, and Adam/PSGD is 0.997-1.002 at every class. The plan's table (`sqrt(b) pi/sqrt(eps)`)
+  is wrong by `sqrt(b)`. This follows from `eq:batch_chi`, because the batch sum and the `1/b` in `y` cancel once the
+  denominator is the eps floor. Only this one config is fully eps-dominated.
+
+**Where the own-class error sits on `psi_c`** (`|f| = 1 - 1/C`, at `Theta_0`, `beta2 = 0.99`, `b = 1`):
+
+* Class 1 is on the linear part: `psi(|f|)/psi'(0) = 0.98`.
+* Class 10 is in the crossover (0.21).
+* Classes 50 and 128 are saturated (0.07, 98-99% of the plateau). For these `psi'(0) = 120-128 ~ C`, set by the
+  background RMS `1/C`.
+* At `b = 16`, `eps = 1e-2`, `psi'(0) = 1/sqrt(eps)` and `|f|` sits on the eps-linear segment.
+
+This is exactly the plan's mechanism: the linear part gives the window, saturation gives the rare-event regime, and the
+floor gives the eps regime.
+
+**Direct simulation** (frozen Adam, 256 chains x 50 000 steps, `beta2 = 0.99`, `b = 1`):
+
+| class (`pi`) | coefficients | simulation | difference (z) |
+|---|---|---|---|
+| 3 (0.068) | 5.896 +- 0.019 | 5.827 +- 0.004 | -1.2% (-3.7) |
+| 8 (9.5e-3) | 1.516 +- 0.006 | 1.513 +- 0.003 | -0.2% (-0.5) |
+| 25 (9.8e-4) | 0.1876 +- 0.0002 | 0.1887 +- 0.0022 | +0.6% (+0.5) |
+
+The simulation also resolves the restoring term at class 25: the forcing alone would be 3 s.e. off. Classes rarer than
+`1e-3` would need ~10^9 steps.
+
+**Precision and finite-`D` scatter.** The 4-seed s.e. is at most 0.4% of the forcing (`b = 1`, `beta2 <= 0.99`) and 2%
+at most anywhere. The class-3 gap shows that the total error can reach ~1%. The ragged rare tail of `rates_init.pdf` is
+not MC noise. It is Adam's restoring term acting on the random initial overlaps `O_cc(Theta_0)` (s.d. 0.007 at
+`D = 4000`):
+
+* Over classes >= 64, rate minus forcing correlates with `O_cc` at r = -0.99.
+* Adam's rare-class `phi_cc` is large (0.8-0.95 at `b = 1`), so relative to its forcing the restoring term is 14x that of
+  SGD or PSGD.
+* The log's "max rel s.e. 0.617" at `beta2 = 0.95` is class 125, whose net rate is nearly cancelled.
+
+**Mid state (`t = 10`).**
+
+* Classes 1-10 are learned, and the slope-1/2 window has disappeared.
+* The tail forcing is unchanged (within 1% at `b = 1`), but the restoring term now removes much of the tail drift. The
+  median over classes 25-128 is 68% at `beta2 = 0.95` and 50% at 0.99 (`b = 1`, `eps = 1e-8`), against 17%
+  (`beta2 = 0.999`), 27% (`b = 4`), 11% (`b = 16`), 3% (`b = 64`), 12% (`eps = 1e-4`) and 1% for SGD and PSGD.
+* This ordering is the order in which configs stall (E1b, E4).
+
+**Verdict (H1a).** At `Theta_0` the frozen drift has H1's shape in every config: slopes 1/2 and 1, joined by a
+~2-decade crossover. Checkpoint A's `kappa_beta (1-beta2)/b` places the `beta2` kink within 1.03-1.18x for `b <= 16`.
+With the background/eps prefactor `F`, all ten kinks fall within 2%. PSGD misses the `beta2` kink. The eps edge appears
+only when it is the larger edge, and the eps-regime rate is `r^2 pi/sqrt(eps)`, without the plan's `sqrt(b)`. All of
+this is a statement about the initial drift: by `t = 10` the restoring term removes half of the tail drift at `b = 1`,
+`eps = 1e-8`.
+
+### E1b `timescales`: per-class learning times at C = 64 (H1b)
+
+```
+real/bin/python experiments/zipf_scaling.py timescales --timescale-check     # Oct 30, 79 min
+```
+
+**Setup.** `alpha = 2`, `t <= 3000`, starting from the finite-`D` `Theta_0`. Adam and PSGD (`eta = 0.3`) are run at
+`(beta2, b, eps)` = (0.99, 1, 1e-8), (0.95, 1, 1e-8), (0.99, 16, 1e-8) and (0.99, 1, 1e-4). SGD (`eta = 3`) is run at
+`b` = 1 and 16. `t_c` is the first time `ell_c <= ell_c(0)/2`. Adam's ODE took 400-2013 s, and PSGD and SGD took
+14-37 s. Analysis: `experiments/zipf/analysis/e1_timescales/`, figure
+`figs/experiments/zipf/analysis/e1_timescales/e1b_summary.png`.
+
+**Exponents** (OLS slope of `log t_c` against `log pi_c`, by band):
+
+| method | c1-3 | c4-6 | c7-14 | c15-26 | c27-64 | H1 |
+|---|---|---|---|---|---|---|
+| SGD `b` 1 | -1.02 | -1.04 | -1.08 | -1.14 | -1.21 | -1 |
+| PSGD `b` 1 / 16 | -0.60 / -0.60 | -0.59 / -0.57 | -0.64 / -0.59 | -0.76 / -0.65 | -1.21 / -0.75 | -1/2 |
+| Adam 0.99, `b` 1 | -0.66 | -0.78 | -1.08 | -1.88 | 3/38 learned | -1/2, then -1 below 1.4e-2 |
+| Adam 0.95, `b` 1 | -0.72 | -0.93 | -1.28 | -2.68 (9/12) | none learned | -1/2, then -1 below 4.6e-2 |
+| Adam 0.99, `b` 16 | -0.61 | -0.61 | -0.67 | -0.89 | -1.46 | -1/2, then -1 below 9e-4 |
+| Adam 0.99, `b` 1, `eps` 1e-4 | -0.66 | -0.78 | -1.03 | -1.27 | -1.32 | as `b = 1` |
+
+**Every method is steeper than its frozen-rate law.**
+
+* SGD steepens from -1.02 to -1.21 although its frozen slope is 1.000.
+* The PSGD window is -0.58 to -0.60 against a frozen slope of 0.50.
+* Adam is a further 0.08-0.23 steeper than its frozen crossover.
+* Part of the steepening of PSGD's tail at `C = 64` is static: the background kink sits at `1/C^2 = 2.4e-4`.
+
+**Break vs kink.** This is a continuous broken-line fit with the break free, over the classes with `t_c <= 20`:
+
+| config | slopes above / below | break / `kappa_beta (1-beta2)/b` |
+|---|---|---|
+| `beta2` 0.99, `b` 1 | -0.69 / -1.08 | 1.04 |
+| `beta2` 0.99, `b` 1, `eps` 1e-4 | -0.69 / -1.05 | 1.06 |
+| `beta2` 0.95, `b` 1 | -0.74 / -1.12 | 0.63 |
+| `beta2` 0.99, `b` 16 | -0.63 / -1.13 | 1.99 |
+
+* The break lies within a factor 2 of the predicted kink, but the factor drifts with the kink. It moves 2.0x between
+  `beta2` = 0.95 and 0.99, where 3.2x is predicted, and 8.3x between `b` = 1 and 16, where 16x is predicted.
+* Fixing the slopes at -1/2 and -1 moves the break to 2.5-5.5x and triples the rms.
+* **Adam lags PSGD exactly where the kink says.** The ratio `t_c(Adam)/t_c(PSGD)` against `u = pi/kink` follows
+  `max(1, u^-1/2)` (panel (e) of the figure). The lag reaches 1.5 at `u = 0.47-1.03`. At the head Adam is slightly
+  faster than PSGD (0.84-0.95 at class 1).
+
+**Matched-class laws hold.**
+
+* Head, `sqrt(b)`: `t_c(b = 1)/(4 t_c(b = 16))` is 0.92-1.02 for classes 1-3.
+* Rare end, linear in `b`: over classes 27-44, `t_c(b = 1, eps = 1e-4)/t_c(b = 16)` is 15.3-17.7, against 16.
+* `beta2` dependence: for classes 11-14, `t_c(0.95)/t_c(0.99)` is 1.66-1.86. The rare-event law, which carries the
+  factor `1 - beta1/sqrt(beta2)`, predicts 1.79.
+* Collapse: the sub-kink classes with `t_c <= 20` collapse under `t pi` (s.d. of `log10(t_c pi_c)` 0.014-0.037). The
+  window classes collapse better under `t sqrt(b pi)` than under `t pi` (0.11 vs 0.18 at `b = 1`), but not well. Within
+  one run these collapses restate the band slopes.
+
+**ODE vs simulation** (8 runs, `D = 4000`, `t <= 300`, first config):
+
+* The classes learned are the same (1-27).
+* For classes 5-27 the pooled `log(t_c sim / t_c ODE)` is -0.009 +- 0.006 (sum z^2 = 32 over 23 classes).
+* Classes 1-4 are learned 4.3% earlier in simulation, a head start of 64-126 steps. This is E0's warm-up.
+* For `t >= 1` the risk gap is at most 0.39% (|z| <= 1.9).
+
+**Late-time stall at `b = 1`, `eps = 1e-8`.**
+
+* Only 29/64 classes are learned by `t = 3000` at `beta2 = 0.99`, and 23/64 at 0.95. Every other run learns all 64.
+* Classes 39-64 (34-64 at 0.95) end above their initial loss, by up to 1.33x.
+* The tail leaves its `eps = 1e-4` control from `t ~ 14-25`, and the local `t_c` slope reaches -2 by `t ~ 59`.
+* `B_cc(3000)` is about 700 in every column (1950 at `beta2 = 0.95`), against 5-27 for SGD and 12-37 for `eps = 1e-4`.
+
+`B` alone does not single out the cause: PSGD carries as much rare-column `B` and learns every class. E4 resolves the
+mechanism (below).
+
+**Verdict (H1b).** H1 holds qualitatively and fails quantitatively. Its qualitative content is confirmed:
+
+* `t_c` is shallow at the head and steep in the tail.
+* The break lies within 0.6-2x of `kappa_beta (1-beta2)/b`.
+* Adam lags PSGD below the kink as `u^-1/2`, while PSGD has no kink.
+* The `sqrt(b)` head law and the linear-in-`b` rare law hold at matched classes.
+
+Quantitatively, every method is steeper than its frozen law (by 0.1-0.2 in the exponent), and the break moves less than
+predicted. For `b = 1`, `eps = 1e-8` the rare-class law is overtaken by a stall that frozen rates do not predict.
+
+### Checkpoint B (written 2026-11-02, 13:10)
+
+* **E0 passes** past the warm-up transient: <= 0.5% of the risk at `b = 1`, and an `O(1/D)` bias for larger `b`. The
+  `C = 128` validation is still running (queue step 7).
+* **H1 holds for the initial drift.** The kinks are within 2% after the background/eps correction, the eps-regime rate
+  carries no `sqrt(b)`, and PSGD misses the `beta2` kink.
+* **Along the trajectory H1 holds only qualitatively.** The stall at `b = 1`, `eps = 1e-8` is the failure that the plan
+  says to diagnose before E2. The diagnosis (E4 below) is a *deterministic fixed point* of the drift, not a noise floor.
+  By the plan's rule E2 would wait. The user asked to continue, so E2-E4 run with the stall in view and are interpreted
+  through this mechanism.
