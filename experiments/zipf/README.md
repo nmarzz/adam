@@ -870,3 +870,29 @@ at `b = 16`, `alpha = 1`).
 **Verdict.** In the bigram model the `beta2`/batch kink in per-token learning times appears qualitatively, as
 predicted. The Gaussian model's rare-class stall does not, because it needs dense inputs that couple every class into
 every coordinate's normalization.
+
+---------------------------------------------------------------------------------
+## Status at the end of session 2 (2026-11-02)
+
+**Done.** E0-E5 have run, each with an analysis script in `experiments/zipf/analysis/`, and each claim was recomputed
+by an independent check. The results are in the summary table at the top of Session 2. The self-tests pass (15/15,
+332 s): `real/bin/python experiments/zipf_scaling.py selftest`.
+
+**Note.** `paper/zipf_adam.tex` covers the model, the exact identities, the rate regimes, the fixed-point mechanism,
+E0-E5, the relation to Kunstner & Bach, and limitations. It is on branch `zipf-note` of the paper repository, and local
+`master` has been fast-forwarded to it. Four commits are not yet on Overleaf, because this session has no Overleaf
+credentials: run `git push origin master` from `paper/`. The note has not been compiled here, since LaTeX is not
+installed; its environments, references and citations were checked by script.
+
+**Open questions and not done:**
+
+* The margin law of the fixed point at larger `b`: `gap_64 ~ b/phi_64` holds at `b = 4`, but at `b = 16` the gain is
+  16x against the predicted 25x. An analytic prediction of the number of learned classes is missing.
+* Whether the `C = 128` stall signature (27/128 learned at `t = 300`) is a fixed point, and how the cut-off class
+  depends on `C` and `alpha`.
+* PSGD at `eta = 1` loses its tail without a fixed point. It is the one candidate for a genuine noise-driven limit
+  (H5), and it is not analysed.
+* E2 at `C > 64`. An Adam ODE step costs 2.1 s at `C = 128`; a cheaper psi-route (float32 lag scan, fewer psi times)
+  would be needed. The 0-1-error exponent was not measured.
+* E3 with `eta` tuned per `b`, and costs to reach target losses at tuned `eta`.
+* PSGD baselines use Adam's `eta = 0.3`, which E4 shows is too large for PSGD.
