@@ -5,12 +5,14 @@ Model (experiments/zipf_adam_plan.md): ``C`` classes with priors
 ``pi_c ~ c^{-alpha}``, means ``r q_c`` with ``q_c`` orthonormal, ``K = Id``,
 softmax cross-entropy with ``M = C`` logits and no bias, ``Theta_0 = 0.1 N(0, 1/D)``.
 For ``K = Id`` the mode ODEs aggregate exactly (``dynamics.isotropic_modes``),
-and the coefficients come from ``discounts.softmax_coefficients``, which pools
-ordinary and forced-class events so that rare classes are resolved.
+and the coefficients come from ``discounts.softmax_psi_coefficients`` (the
+explicit-frequency psi-route, default) or ``discounts.softmax_coefficients``
+(forced-class events), so that rare classes are resolved.
 
-Subcommands: ``selftest | timings | validate | rates | timescales | exponents |
-batch | noise | plot``. Results go to ``figs/experiments/zipf/`` (``.npz`` and
-``.pdf``); the log is ``experiments/zipf/README.md``.
+Subcommands: ``selftest | timings | precision | tune | validate | rates | timescales |
+exponents | batch | noise | simcheck | plot``. Results go to ``figs/experiments/zipf/``
+(``.npz`` and ``.pdf``; E2-E4 trajectories in ``ode/``); the log is
+``experiments/zipf/README.md``.
 """
 from __future__ import annotations
 
@@ -367,11 +369,11 @@ def deterministic_start(classes, means, scale=0.1, seed=0):
     return scale * jnp.linalg.qr(Z)[0]
 
 
-def ode_on_grid(path, priors, means, times, *, cache, **kw):
-    """Collapsed ODE from the deterministic start, per-class metrics, cached in ``path``."""
-    if path.exists() and not kw.pop("overwrite", False):
+def ode_on_grid(path, priors, means, times, *, cache, overwrite=False, full=False, **kw):
+    """Collapsed ODE from the deterministic start, per-class metrics, cached in ``path``
+    (``full``: also the order parameters ``B`` and ``O`` at every record time)."""
+    if path.exists() and not overwrite:
         return dict(np.load(path))
-    kw.pop("overwrite", None)
     t0 = time.time()
     out = solve(priors, deterministic_start(len(priors), means), means, times, **kw)
     loss, err = class_metrics(out["B"], out["O"])
@@ -380,6 +382,8 @@ def ode_on_grid(path, priors, means, times, *, cache, **kw):
            "Odiag": np.asarray(jnp.diagonal(out["O"], axis1=-2, axis2=-1)),
            "coef": np.asarray(out["coef_diag"]), "steps": np.asarray(out["steps"]),
            "seconds": np.array(time.time() - t0)}
+    if full:
+        res["B"], res["O"] = np.asarray(out["B"]), np.asarray(out["O"])
     if cache:
         np.savez_compressed(path, **res)
     return res
@@ -588,72 +592,108 @@ def frontier(times, t_c):
     return np.array([(t_c <= t).sum() for t in times])
 
 
-def exponent_configs(args):
-    base = dict(beta2=args.beta2, batch=1, eps=args.eps)
-    configs = [base, dict(base, beta2=0.95), dict(base, beta2=0.999), dict(base, batch=16),
-               dict(base, eps=1e-4)]
-    return configs
+def run_name(mode, classes, alpha, *, eta, beta2, batch, eps, horizon, safety):
+    """Canonical stem of one ODE trajectory; E2-E4 share runs through it. PSGD has
+    no ``beta2`` and SGD neither ``beta2`` nor ``eps``."""
+    opt = {"adam": f"b2{beta2:g}_b{batch}_e{eps:g}", "psgd": f"b{batch}_e{eps:g}",
+           "sgd": f"b{batch}"}[mode]
+    return f"{mode}_C{classes}_a{alpha:g}_{opt}_eta{eta:g}_T{horizon:g}_s{safety:g}"
+
+
+def ode_run(mode, classes, alpha, *, eta, beta2, batch, eps, horizon, args, per_decade=16):
+    """Collapsed ODE (deterministic start, log grid to ``horizon``) cached in
+    ``OUT/ode/<run_name>.npz`` with the full ``B`` and ``O``."""
+    horizon = float(np.round(horizon, 6))
+    name = run_name(mode, classes, alpha, eta=eta, beta2=beta2, batch=batch, eps=eps,
+                    horizon=horizon, safety=args.safety)
+    path = OUT / "ode" / f"{name}.npz"
+    path.parent.mkdir(exist_ok=True)
+    fresh = args.overwrite or not path.exists()
+    priors, data, _ = zipf_model(classes, alpha, 4000)
+    res = ode_on_grid(path, priors, data.means, log_grid(0.01, horizon, per_decade),
+                      cache=True, overwrite=args.overwrite, full=True, lr=eta,
+                      beta1=args.beta1, beta2=beta2, eps=eps, batch=batch, mode=mode,
+                      safety=args.safety)
+    if fresh:
+        t_c, _ = learning_times(res["time"], res["loss"], res["err"])
+        print(f"{name}: R(T) = {total(res['loss'][-1], priors):.4f}, {np.isfinite(t_c).sum()}"
+              f"/{classes} classes learned, max B_cc(T) = {res['Bdiag'][-1].max():.3g}"
+              f"  [{float(res['seconds']):.0f}s, {int(res['steps'].sum())} steps]", flush=True)
+    return res
 
 
 def run_exponents(args):
+    """E2: risk curves of Adam, PSGD and SGD for every alpha and batch size."""
     eta_adam, eta_sgd = chosen_eta(args)
-    times = log_grid(0.01, args.exponent_horizon, per_decade=16)
-    for classes in args.exponent_classes:
-        for alpha in args.exponent_alphas:
-            priors, data, _ = zipf_model(classes, alpha, 4000)
-            for cfg in exponent_configs(args):
-                if alpha != 2.0 and cfg != exponent_configs(args)[0]:
+    for alpha in args.exponent_alphas:
+        for batch in args.exponent_batches:
+            for mode in args.exponent_modes:
+                ode_run(mode, args.exponent_classes, alpha,
+                        eta=eta_sgd if mode == "sgd" else eta_adam, beta2=args.beta2,
+                        batch=batch, eps=args.eps, horizon=args.exponent_horizon, args=args)
+
+
+def batch_runs(args):
+    """E3 runs ``(mode, eps, b, rule, eta)``: Adam and PSGD at fixed eta and at
+    ``eta sqrt(b)``, SGD at fixed eta and at ``eta b``; all to the same number of
+    samples ``b t = batch_samples`` (in units of ``D``)."""
+    eta_adam, eta_sgd = chosen_eta(args)
+    runs = []
+    for eps in args.batch_eps:
+        for b in args.batch_sizes:
+            for mode in args.batch_modes:
+                if mode == "sgd" and eps != args.batch_eps[0]:
                     continue
-                tag = (f"C{classes}_a{alpha:g}_b2{cfg['beta2']:g}_b{cfg['batch']}"
-                       f"_e{cfg['eps']:g}")
-                for mode, eta in (("adam", eta_adam), ("psgd", eta_adam), ("sgd", eta_sgd)):
-                    if mode == "sgd" and cfg != exponent_configs(args)[0]:
-                        continue
-                    path = OUT / f"exponents_{mode}_{tag}.npz"
-                    plan = None
-                    if mode == "adam":
-                        plan = make_plan(priors, args.beta1, cfg["beta2"], cfg["batch"])
-                    res = ode_on_grid(path, priors, data.means, times, cache=True,
-                                      overwrite=args.overwrite, lr=eta, beta1=args.beta1,
-                                      beta2=cfg["beta2"], eps=cfg["eps"], batch=cfg["batch"],
-                                      mode=mode, plan=plan)
-                    print(f"exponents {mode} {tag}: R(T)={total(res['loss'][-1], priors):.4f}"
-                          f"  [{float(res['seconds']):.0f}s, {int(res['steps'].sum())} steps]",
-                          flush=True)
+                base = eta_sgd if mode == "sgd" else eta_adam
+                scaled = ("linear", base * b) if mode == "sgd" else ("sqrt", base * np.sqrt(b))
+                for rule, eta in (("fixed", base),) + ((scaled,) if b > 1 else ()):
+                    runs.append((mode, eps, b, rule, float(np.round(eta, 6))))
+    return runs
 
 
 def run_batch(args):
-    """Samples to reach target losses against b: fixed eta, sqrt(b) scaling, tuned eta."""
-    eta_adam, _ = chosen_eta(args)
-    classes, alpha = args.batch_classes, 2.0
-    priors, data, _ = zipf_model(classes, alpha, 4000)
-    times = log_grid(0.01, args.batch_horizon, per_decade=16)
-    for eps in args.batch_eps:
-        for b in args.batch_sizes:
-            for rule, eta in (("fixed", eta_adam), ("sqrt", eta_adam * np.sqrt(b))):
-                path = OUT / f"batch_C{classes}_e{eps:g}_b{b}_{rule}.npz"
-                res = ode_on_grid(path, priors, data.means, times, cache=True,
-                                  overwrite=args.overwrite, lr=eta, beta1=args.beta1,
-                                  beta2=args.beta2, eps=eps, batch=b)
-                print(f"batch eps={eps:g} b={b} {rule} eta={eta:g}:"
-                      f" R(T)={total(res['loss'][-1], priors):.4f} [{float(res['seconds']):.0f}s]",
-                      flush=True)
+    """E3: samples to reach target losses against ``b`` (ODE only)."""
+    for mode, eps, b, rule, eta in batch_runs(args):
+        ode_run(mode, args.batch_classes, 2.0, eta=eta, beta2=args.beta2, batch=b, eps=eps,
+                horizon=args.batch_samples / b, args=args)
 
 
 def run_noise(args):
-    """Rare-class plateaus of B_cc and ell_c against eta (Adam and SGD)."""
-    classes, alpha = args.noise_classes, 2.0
-    priors, data, _ = zipf_model(classes, alpha, 4000)
-    times = log_grid(0.01, args.noise_horizon, per_decade=12)
-    for mode, grid in (("adam", args.noise_adam_etas), ("sgd", args.noise_sgd_etas)):
-        for eta in grid:
-            path = OUT / f"noise_{mode}_C{classes}_eta{eta:g}.npz"
-            res = ode_on_grid(path, priors, data.means, times, cache=True,
-                              overwrite=args.overwrite, lr=eta, beta1=args.beta1,
-                              beta2=args.beta2, eps=args.eps, batch=1, mode=mode)
-            print(f"noise {mode} eta={eta:g}: R(T)={total(res['loss'][-1], priors):.4f},"
-                  f" max B_cc(T)={res['Bdiag'][-1].max():.3g} [{float(res['seconds']):.0f}s]",
-                  flush=True)
+    """E4: ``B_cc`` and ``ell_c`` against eta at a fixed amount of drift ``eta T``
+    (Adam and PSGD for every eps, SGD at its own ``eta T``)."""
+    for eps in args.noise_eps:
+        for eta in args.noise_adam_etas:
+            for mode in args.noise_modes:
+                if mode != "sgd":
+                    ode_run(mode, args.noise_classes, 2.0, eta=eta, beta2=args.beta2, batch=1,
+                            eps=eps, horizon=args.noise_progress / eta, args=args)
+    if "sgd" in args.noise_modes:
+        for eta in args.noise_sgd_etas:
+            ode_run("sgd", args.noise_classes, 2.0, eta=eta, beta2=args.beta2, batch=1,
+                    eps=args.eps, horizon=args.noise_progress_sgd / eta, args=args)
+
+
+def run_simcheck(args):
+    """Direct Adam runs (``b = 1``) to long times, against the E4 trajectories:
+    growth of ``B_cc`` and the rare-class losses. Stores ``B`` and ``O``."""
+    eta_adam, _ = chosen_eta(args)
+    C, D = args.noise_classes, args.simcheck_dimension
+    priors, data, theta0 = zipf_model(C, 2.0, D)
+    for eps in args.simcheck_eps:
+        name = f"simcheck_C{C}_e{eps:g}_D{D}_T{args.simcheck_horizon:g}"
+        if (OUT / f"{name}.npz").exists() and not args.overwrite:
+            continue
+        steps, times = record_grid(0.01, args.simcheck_horizon, D, per_decade=8)
+        t0 = time.time()
+        B, O = simulate_runs(priors, data, theta0, steps, lr=eta_adam, beta1=args.beta1,
+                             beta2=args.beta2, eps=eps, batch=1, runs=args.simcheck_runs,
+                             seed=C + D)
+        loss, err = class_metrics(B, O)
+        np.savez_compressed(OUT / f"{name}.npz", time=times, priors=np.asarray(priors),
+                            eta=eta_adam, B=np.asarray(B), O=np.asarray(O), loss=loss, err=err,
+                            seconds=time.time() - t0)
+        print(f"{name}: {args.simcheck_runs} runs, max B_cc(T) = {np.asarray(B)[:, -1].max():.3g}"
+              f"  [{time.time() - t0:.0f}s]", flush=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -850,10 +890,222 @@ def plot_timescales(args):
     save(fig, "timescales")
 
 
+def load_run(mode, classes, alpha, *, eta, beta2, batch, eps, horizon, args):
+    """A cached :func:`ode_run` result, or ``None``."""
+    name = run_name(mode, classes, alpha, eta=eta, beta2=beta2, batch=batch, eps=eps,
+                    horizon=float(np.round(horizon, 6)), safety=args.safety)
+    path = OUT / "ode" / f"{name}.npz"
+    return dict(np.load(path)) if path.exists() else None
+
+
+def noise_energy(r):
+    """``N_cc = B_cc - |O_c.|^2 / r^2``: squared norm of ``theta_c`` outside the span
+    of the means (the part of the logit variance that carries no signal)."""
+    B, O = r["B"], r["O"]
+    return np.diagonal(B, axis1=-2, axis2=-1) - (O ** 2).sum(-1) / MEAN_NORM ** 2
+
+
+def plot_noise(args):
+    C, eta_sgd = args.noise_classes, chosen_eta(args)[1]
+    get = lambda mode, eta, eps=args.eps: load_run(
+        mode, C, 2.0, eta=eta, beta2=args.beta2, batch=1, eps=eps,
+        horizon=(args.noise_progress_sgd if mode == "sgd" else args.noise_progress) / eta,
+        args=args)
+    etas = sorted(args.noise_adam_etas)
+    if not any(get("adam", e) is not None for e in etas):
+        return
+    cols = dict(zip(etas, plt.cm.viridis(np.linspace(0.0, 0.85, len(etas)))))
+    show = tuple(sorted({min(c, C - 1) for c in (0, 7, 31, C - 1)}))
+    styles = dict(zip(show, ("-", "--", "-.", ":")))
+    fig, axes = plt.subplots(1, 4, figsize=(28, 6.2), constrained_layout=True)
+    sgd = get("sgd", eta_sgd)
+    for eta in etas:
+        r = get("adam", eta)
+        if r is None:
+            continue
+        x = eta * r["time"][1:]
+        for c in show:
+            axes[0].plot(x, r["Bdiag"][1:, c], styles[c], color=cols[eta], lw=1.8)
+            axes[1].plot(x, np.maximum(noise_energy(r)[1:, c], 1e-6), styles[c], color=cols[eta],
+                         lw=1.8)
+        axes[0].plot([], [], "-", color=cols[eta], label=fr"Adam $\eta={eta:g}$")
+    if sgd is not None:
+        for c in show:
+            axes[0].plot(eta_sgd * sgd["time"][1:], sgd["Bdiag"][1:, c], styles[c], color="k",
+                         lw=1.2, alpha=0.6)
+            axes[1].plot(eta_sgd * sgd["time"][1:], np.maximum(noise_energy(sgd)[1:, c], 1e-6),
+                         styles[c], color="k", lw=1.2, alpha=0.6)
+        axes[0].plot([], [], "-", color="k", alpha=0.6, label=fr"SGD $\eta={eta_sgd:g}$")
+    for c in show:
+        axes[1].plot([], [], styles[c], color="0.4", label=f"$c={c + 1}$")
+    for ax, lab in ((axes[0], r"$B_{cc}=|\theta_c|^2$"),
+                    (axes[1], r"$N_{cc}=B_{cc}-|O_{c\cdot}|^2/r^2$")):
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel(r"$\eta t$")
+        ax.set_ylabel(lab)
+        ax.legend(frameon=False, fontsize=11)
+    axes[0].set_title(r"Weight norms ($b=1$, $\epsilon=%g$)" % args.eps)
+    axes[1].set_title("Norm outside the span of the means")
+    ax = axes[2]
+    for eta in etas:
+        for eps, marker in zip(args.noise_eps, ("o", "s")):
+            r = get("adam", eta, eps)
+            if r is not None:
+                pi = zipf_priors(C, 2.0)
+                ax.plot(pi, r["loss"][-1] / r["loss"][0], marker, color=cols[eta], ms=4,
+                        alpha=0.85 if eps == args.eps else 0.5)
+    r = get("psgd", 0.3)
+    if r is not None:
+        ax.plot(zipf_priors(C, 2.0), r["loss"][-1] / r["loss"][0], "^", color="C3", ms=4,
+                label=r"PSGD $\eta=0.3$")
+    if sgd is not None:
+        ax.plot(zipf_priors(C, 2.0), sgd["loss"][-1] / sgd["loss"][0], "k-", lw=1.5, alpha=0.6,
+                label="SGD")
+    for eps, marker in zip(args.noise_eps, ("o", "s")):
+        ax.plot([], [], marker, color="0.4", label=fr"Adam $\epsilon={eps:g}$")
+    ax.axhline(1, color="0.5", lw=1)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"$\pi_c$")
+    ax.set_ylabel(r"$\ell_c(T)/\ell_c(0)$")
+    ax.set_title(r"End of run ($\eta T=%g$)" % args.noise_progress)
+    ax.legend(frameon=False, fontsize=11)
+    ax = axes[3]
+    pri = zipf_priors(C, 2.0)
+    for eta in etas:
+        for eps, ls in zip(args.noise_eps, ("-", "--")):
+            r = get("adam", eta, eps)
+            if r is not None:
+                ax.plot(r["time"][1:], total(r["loss"], pri)[1:], ls, color=cols[eta], lw=1.8)
+    if sgd is not None:
+        ax.plot(sgd["time"][1:], total(sgd["loss"], pri)[1:], "k-", lw=1.5, alpha=0.6)
+    for eps, ls in zip(args.noise_eps, ("-", "--")):
+        ax.plot([], [], ls, color="0.4", label=fr"Adam $\epsilon={eps:g}$")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("$t$")
+    ax.set_ylabel(r"$\mathcal{R}(t)$")
+    ax.set_title(r"Risk ($C=%d$, $\alpha=2$)" % C)
+    ax.legend(frameon=False, fontsize=11)
+    for ax in axes:
+        polish_axis(ax)
+    save(fig, "noise")
+
+
+def plot_exponents(args):
+    C, (eta_adam, eta_sgd) = args.exponent_classes, chosen_eta(args)
+    alphas = sorted(args.exponent_alphas)
+    batches = sorted(args.exponent_batches, reverse=True)
+    runs = {(m, a, b): load_run(m, C, a, eta=eta_sgd if m == "sgd" else eta_adam,
+                                beta2=args.beta2, batch=b, eps=args.eps,
+                                horizon=args.exponent_horizon, args=args)
+            for m in ("adam", "psgd", "sgd") for a in alphas for b in batches}
+    if not any(v is not None for v in runs.values()):
+        return
+    cols = dict(zip(alphas, plt.cm.plasma(np.linspace(0.05, 0.8, len(alphas)))))
+    ls = {"adam": "-", "psgd": "--", "sgd": ":"}
+    fig, axes = plt.subplots(len(batches), 3, figsize=(22, 6.2 * len(batches)),
+                             constrained_layout=True, squeeze=False)
+    for row, b in zip(axes, batches):
+        for (m, a, bb), r in runs.items():
+            if bb != b or r is None:
+                continue
+            pri = zipf_priors(C, a)
+            risk = total(r["loss"], pri)
+            t = r["time"]
+            row[0].plot(t[1:], risk[1:], ls[m], color=cols[a], lw=1.8)
+            if m != "psgd":
+                row[1].plot(t[1:], local_exponent(t, risk)[1:], ls[m], color=cols[a], lw=1.8)
+            t_c, _ = learning_times(t, r["loss"], r["err"])
+            row[2].plot(t[1:], frontier(t, t_c)[1:], ls[m], color=cols[a], lw=1.8)
+        for a in alphas:
+            row[1].axhline(2 * (a - 1) / a, color=cols[a], lw=1, ls="-", alpha=0.5)
+            row[1].axhline((a - 1) / a, color=cols[a], lw=1, ls=":", alpha=0.5)
+            row[0].plot([], [], "-", color=cols[a], label=fr"$\alpha={a:g}$")
+        for m in ls:
+            row[0].plot([], [], ls[m], color="0.4", label=m.upper() if m != "adam" else "Adam")
+        row[0].set_yscale("log")
+        row[0].set_ylabel(r"$\mathcal{R}(t)$")
+        row[0].legend(frameon=False, fontsize=11, ncol=2)
+        row[0].set_title(f"Risk, $b={b}$")
+        row[1].set_ylabel(r"$-d\log\mathcal{R}/d\log t$")
+        row[1].set_ylim(-0.5, 2.5)
+        row[1].set_title(r"Local exponent (lines: $2(\alpha-1)/\alpha$, dotted $(\alpha-1)/\alpha$)")
+        row[2].set_ylabel(r"classes learned $c^*(t)$")
+        row[2].set_yscale("log")
+        row[2].set_title("Frontier")
+        for ax in row:
+            ax.set_xscale("log")
+            ax.set_xlabel("$t$")
+            polish_axis(ax)
+    save(fig, "exponents")
+
+
+def plot_batch(args):
+    C = args.batch_classes
+    runs = {}
+    for mode, eps, b, rule, eta in batch_runs(args):
+        r = load_run(mode, C, 2.0, eta=eta, beta2=args.beta2, batch=b, eps=eps,
+                     horizon=args.batch_samples / b, args=args)
+        if r is not None:
+            runs[(mode, eps, b, rule)] = r
+    if not runs:
+        return
+    pri = zipf_priors(C, 2.0)
+    sizes = sorted(args.batch_sizes)
+    cols = dict(zip(sizes, plt.cm.viridis(np.linspace(0.0, 0.85, len(sizes)))))
+    show = tuple(sorted({min(c, C - 1) for c in (3, 15, 31, C - 1)}))
+    fig, axes = plt.subplots(len(args.batch_eps), 3, figsize=(22, 6.2 * len(args.batch_eps)),
+                             constrained_layout=True, squeeze=False)
+    for row, eps in zip(axes, args.batch_eps):
+        for (mode, e, b, rule), r in runs.items():
+            if mode != "adam" or e != eps:
+                continue
+            row[0].plot(b * r["time"][1:], total(r["loss"], pri)[1:],
+                        "-" if rule == "fixed" else "--", color=cols[b], lw=1.8)
+        for b in sizes:
+            row[0].plot([], [], "-", color=cols[b], label=f"$b={b}$")
+        row[0].plot([], [], "--", color="0.4", label=r"$\eta\sqrt{b}$")
+        for ax, (mode, rules) in zip(row[1:], (("adam", ("fixed", "sqrt")),
+                                               ("psgd", ("fixed", "sqrt")))):
+            for c, col in zip(show, plt.cm.plasma(np.linspace(0.05, 0.8, len(show)))):
+                for rule, marker in zip(rules, ("o-", "s--")):
+                    xs, ys = [], []
+                    for b in sizes:
+                        r = runs.get((mode, eps, b, rule if b > 1 else "fixed"))
+                        if r is None:
+                            continue
+                        t_c, _ = learning_times(r["time"], r["loss"], r["err"])
+                        xs.append(b)
+                        ys.append(b * t_c[c])
+                    ax.plot(xs, ys, marker, color=col, ms=5, lw=1.4,
+                            label=fr"$c={c + 1}$" if rule == "fixed" else None)
+            ax.set_title(f"{'Adam' if mode == 'adam' else 'PSGD'}: samples to learn class $c$"
+                         r" ($\epsilon=%g$)" % eps)
+            ax.set_xlabel("$b$")
+            ax.set_ylabel(r"$b\,t_c$ (samples / $D$)")
+            ax.set_yscale("log")
+            ax.set_xscale("log", base=2)
+            ax.legend(frameon=False, fontsize=11)
+        row[0].set_xscale("log")
+        row[0].set_yscale("log")
+        row[0].set_xlabel(r"samples / $D$ ($b t$)")
+        row[0].set_ylabel(r"$\mathcal{R}$")
+        row[0].set_title(r"Adam risk vs samples ($\epsilon=%g$)" % eps)
+        row[0].legend(frameon=False, fontsize=11)
+        for ax in row:
+            polish_axis(ax)
+    save(fig, "batch")
+
+
 def run_plot(args):
     plot_validate(args)
     plot_rates(args)
     plot_timescales(args)
+    plot_noise(args)
+    plot_exponents(args)
+    plot_batch(args)
 
 
 # --------------------------------------------------------------------------- #
@@ -861,7 +1113,8 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=["selftest", "timings", "precision", "tune", "validate", "rates",
-                                       "timescales", "exponents", "batch", "noise", "plot"])
+                                       "timescales", "exponents", "batch", "noise", "simcheck",
+                                       "plot"])
     p.add_argument("--timing-classes", type=int, nargs="+", default=[8, 32, 128, 256])
     p.add_argument("--timing-beta2", type=float, nargs="+", default=[0.95, 0.99, 0.999])
     p.add_argument("--timing-batches", type=int, nargs="+", default=[1, 16, 64])
@@ -905,19 +1158,30 @@ def parse_args():
     p.add_argument("--timescale-horizon", type=float, default=3000.0)
     p.add_argument("--timescale-check", action="store_true")
     p.add_argument("--timescale-check-horizon", type=float, default=300.0)
-    # E2-E4
-    p.add_argument("--exponent-classes", type=int, nargs="+", default=[128])
-    p.add_argument("--exponent-alphas", type=float, nargs="+", default=[1.25, 1.5, 2.0, 3.0])
-    p.add_argument("--exponent-horizon", type=float, default=1e4)
+    # E2-E4 (ODE runs cached in OUT/ode/, see ode_run)
+    p.add_argument("--safety", type=float, default=SAFETY)
+    p.add_argument("--exponent-classes", type=int, default=64)
+    p.add_argument("--exponent-alphas", type=float, nargs="+", default=[2.0, 1.5, 3.0, 1.25])
+    p.add_argument("--exponent-batches", type=int, nargs="+", default=[16, 1])
+    p.add_argument("--exponent-modes", nargs="+", default=["sgd", "psgd", "adam"])
+    p.add_argument("--exponent-horizon", type=float, default=1000.0)
     p.add_argument("--rates-seeds", type=int, default=4)
     p.add_argument("--batch-classes", type=int, default=64)
     p.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 16, 64])
     p.add_argument("--batch-eps", type=float, nargs="+", default=[1e-8, 1e-4])
-    p.add_argument("--batch-horizon", type=float, default=3000.0)
+    p.add_argument("--batch-modes", nargs="+", default=["sgd", "psgd", "adam"])
+    p.add_argument("--batch-samples", type=float, default=3000.0)
     p.add_argument("--noise-classes", type=int, default=64)
-    p.add_argument("--noise-adam-etas", type=float, nargs="+", default=[0.03, 0.1, 0.3, 1.0])
+    p.add_argument("--noise-adam-etas", type=float, nargs="+", default=[0.3, 0.1, 1.0, 0.03])
     p.add_argument("--noise-sgd-etas", type=float, nargs="+", default=[0.3, 1.0, 3.0, 10.0])
-    p.add_argument("--noise-horizon", type=float, default=3000.0)
+    p.add_argument("--noise-eps", type=float, nargs="+", default=[1e-8, 1e-4])
+    p.add_argument("--noise-modes", nargs="+", default=["sgd", "psgd", "adam"])
+    p.add_argument("--noise-progress", type=float, default=900.0)
+    p.add_argument("--noise-progress-sgd", type=float, default=9000.0)
+    p.add_argument("--simcheck-dimension", type=int, default=2000)
+    p.add_argument("--simcheck-horizon", type=float, default=3000.0)
+    p.add_argument("--simcheck-eps", type=float, nargs="+", default=[1e-8])
+    p.add_argument("--simcheck-runs", type=int, default=8)
     p.add_argument("--output-dir", type=Path, default=OUT)
     return p.parse_args()
 
@@ -930,7 +1194,7 @@ def main():
     {"selftest": run_selftest, "timings": run_timings, "precision": run_precision,
      "tune": run_tune, "validate": run_validate, "rates": run_rates,
      "timescales": run_timescales, "exponents": run_exponents, "batch": run_batch,
-     "noise": run_noise, "plot": run_plot}[args.command](args)
+     "noise": run_noise, "simcheck": run_simcheck, "plot": run_plot}[args.command](args)
 
 
 if __name__ == "__main__":
