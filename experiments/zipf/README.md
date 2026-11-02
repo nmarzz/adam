@@ -581,8 +581,8 @@ head sets the optimal `eta` and the tail would take a larger one. At `t = 900` A
   `sigma_cc` 27% low against 8.4M plain-path samples; spurious +10-12% margin growth). Do not use it at late times.
 * Simulation "29.8 vs 29 learned" (a running count, inflated by threshold crossings; 28.4 +- 0.3 vs 29 at fixed `t`)
   and "`c = 64` margin 0.32-0.43 vs 0.58" (a finite-`D` bias of the min-gap; the mean-competitor margin agrees).
-* Not decidable: whether a larger `b` keeps a fixed point. The E2 `b = 16` run learns all 64 classes by `t = 1000`,
-  `gap_64` is 9.5, and its gaps still move.
+* Decided later by the diagnostics: a larger `b` keeps a fixed point and raises its margins (`b = 16`: all 64 classes
+  learned, stationary by `t = 3000`).
 * Partly decidable: whether the stall exists at other `C`. At `C = 128` (E0, `alpha = 2`, `b = 1`, `t <= 300`) the same
   signature appears in the ODE and the simulation alike: 27/128 classes learned, and classes 41-128 above their initial
   loss by up to 1.28x. Whether it is a fixed point there needs `t >> 300`.
@@ -800,8 +800,9 @@ memory and from `eps`; for PSGD it comes from `eps`.
   `b` = 1, 4, 16 and 64 (`R` = 0.074, 0.038, 0.013, 0.0099).
   * The escape is not explained by entering the `beta2` window. `b pi_c > kappa (1-beta2)` holds for classes up to
     6 / 13 / 26 / 52 at `b` = 1 / 4 / 16 / 64, yet at `b = 16` classes 27-64 are learned below the edge.
-  * At `b = 4`, 8 classes are still above their initial loss and the gaps are still moving (0.017). Whether a larger
-    `b` removes the fixed point or only moves it is open. See the `b = 4` run to `t = 3000` in the diagnostics.
+  * At `b = 4`, 8 classes are still above their initial loss and the gaps are still moving (0.017). The
+    diagnostics settle the question: `b = 4` and `b = 16` both converge to fixed points, and a larger `b` raises their
+    margins (`gap_64 ~ b/phi_64`) until every class is learned.
 * **SGD at fixed `eta`** wastes samples in proportion to `b`.
 * **Not done:** `eta` tuned per `b`, and costs to reach target losses at tuned `eta`. PSGD (`eta = 0.3 sqrt(b)`) learns
   all 64 classes in 160 samples at every `b`, fewer than any Adam run (231).
@@ -813,7 +814,8 @@ memory and from `eps`; for PSGD it comes from `eps`.
   risk.
 * With `eps = 1e-8` (`b* = 1000`), learning all 48-64 classes is cheapest at `b = 64`.
 * At fixed `eta` the best `b` grows as the target moves into the tail.
-* `b >= 16` removes the small-batch stall at this sample budget, by a mechanism not identified here.
+* `b >= 16` escapes the small-batch stall at this sample budget. It does so by raising the margins of the fixed point
+  (E4 diagnostics), not by putting every class inside the window.
 * The ODE has no critical batch size for SGD with `eta ~ b` or for PSGD with `eta ~ sqrt(b)` (`eps = 0`).
 
 ### E5 `bigram`: transfer to a one-hot linear bigram model (direct simulation)
