@@ -167,7 +167,7 @@ estimator is only used in the precision study above.
 
 | experiment | hypothesis | outcome |
 |---|---|---|
-| E0 validate | ODE accurate with many rare classes | **Passes** after Adam's warm-up transient. At `b = 1` the gap is 0.2-0.5% of the risk (also at `C = 128`). For larger `b` there is an `O(1/D)` bias. Rare classes are no less accurate. |
+| E0 validate | ODE accurate with many rare classes | **Passes** after Adam's warm-up transient. At `b = 1` the gap is 0.2-0.5% of the risk (also at `C = 128`, and 0.44% there at `b = 8`). For larger `b` there is an `O(1/D)` bias. Rare classes are no less accurate. |
 | E1a rates | H1, initial drift | **Holds**: slopes 1/2 and 1. All ten kinks fall within 2% of `kappa_beta (1-beta2)/(b F^2)`. The eps-regime rate has no `sqrt(b)`, contrary to the plan's table. |
 | E1b timescales | H1 along the trajectory | **Qualitatively.** Every method is 0.1-0.2 steeper than its frozen law, and Adam lags PSGD as `max(1, u^-1/2)` below the kink. |
 | E4 noise | H5, noise floor | **Refuted.** At `b = 1`, `eps <= 1e-6`, `beta2 = 0.99`, Adam stops at a *deterministic fixed point* with the rare classes unlearned (29/64), and direct simulation reproduces it. The cause is a normalization mismatch: the forcing is normalized by the class's own rare events, the curvature by the background. `B_cc` grows in a common mode the softmax ignores. `eps >= 1e-5` and `beta2 = 0.999` remove the fixed point. A larger `b` raises its margins: 43/64 learned at `b = 4`, and 64/64 at `b = 16`, still at a fixed point. |
@@ -265,8 +265,10 @@ extra error.
 **`C = 128`** (`alpha = 2`, `b = 1`, `D = 4000`, `t <= 300`; `validate --val-classes 128 --val-alphas 2
 --val-batches 1 8 --horizon-large 300`): the ODE took 2177 s (1049 steps) and the 16 runs 294 s. After warm-up the
 risk gap is 0.0023 (0.21% of `R`, z = -0.9). The per-class worst relative gap has median 0.7%, and for the rarest
-class it is 0.4% (z = 2.2), although that class gets `D pi_128 = 0.1` samples per unit time. I stopped the `b = 8`
-case and its D-sweep because at 2.1 s per ODE step they did not fit the GPU budget.
+class it is 0.4% (z = 2.2), although that class gets `D pi_128 = 0.1` samples per unit time. `b = 8` was run
+later (`validate --val-classes 128 --val-alphas 2 --val-batches 8 --horizon-large 300`; ODE 2574 s, 2215 steps; runs
+314 s). After warm-up its gap is 0.0021 (0.44% of `R`, z = 3.6). The per-class median is 3.1%, and the rarest class is
+off by 0.6% (z = 2.9). The `C = 128` D-sweep was dropped as not worth its cost.
 
 ### E1a `rates`: frozen per-class rates at C = 128 (H1a)
 
@@ -464,7 +466,7 @@ predict. The `t = 10` frozen rates (E1a) already show the restoring term cancell
 
 * **E0 passes** past the warm-up transient for `b <= 8`: <= 0.5% of the risk at `b = 1` and `D >= 4000`. At `b = 32`
   an `O(1/D)` bias remains, which narrowly misses the criterion at `C = 8` (1.3% at `D = 16000`). At
-  `C = 128` (`b = 1`) the gap is 0.21% of the risk.
+  `C = 128` the gap is 0.21% (`b = 1`) and 0.44% (`b = 8`) of the risk.
 * **H1 holds for the initial drift.** The kinks are within 2% after the background/eps correction, the eps-regime rate
   carries no `sqrt(b)`, and PSGD misses the `beta2` kink.
 * **Along the trajectory H1 holds only qualitatively.** The stall at `b = 1`, `eps = 1e-8` is the failure that the plan
