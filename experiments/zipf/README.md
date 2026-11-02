@@ -493,7 +493,7 @@ tail is truncated, so the local exponent `-dlog R/dlog t` is `(-dlog tail/dlog c
 * **The stall caps the `b = 1` frontier.** By `t = 1000` Adam learns 47, 29 and 16 of 64 classes for
   `alpha` = 1.5, 2 and 3. PSGD learns 64, 64 and 21, and SGD 64, 64 and 24. At `alpha = 1.25` Adam learns all 64:
   the rarest class there has `pi = 1.7e-3` and its fixed-point margin (E4) is large enough.
-* **Final risk** at `t = 1000`, `b = 16`: Adam is within 2-12% of SGD at `alpha <= 2` (`alpha = 2`: 0.0116 vs 0.0115)
+* **Final risk** at `t = 1000`, `b = 16`: Adam is within 1-6% of SGD at `alpha <= 2` (`alpha = 2`: 0.0116 vs 0.0115)
   and lower at `alpha = 3` (0.0047 vs 0.0056). PSGD's risk turns up late in several runs.
 
 **Verdict (H2, H3).** The direction of H2 holds. Inside the window Adam's frontier moves like `t^(2/alpha)`
