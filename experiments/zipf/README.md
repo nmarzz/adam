@@ -166,10 +166,13 @@ estimator is only used in the precision study above.
 **Operations (one H100, 2 CPU cores).**
 
 * Run one GPU process at a time. Simulators and the ODE drive `lax.scan`/`while_loop` from the host, so each takes a
-  full core. Two such processes on one GPU are time-sliced: a simulation that takes 2 min alone took 30 min next to
-  another job.
+  full core. Two such processes on one GPU are time-sliced. The first E5 bigram configuration took 1780 s next to
+  `simcheck`, against about 2 min estimated from a 28 s probe of `2^20` steps run alone, and `simcheck` itself slowed to
+  32 min.
+* The plan's 30-min limit per run was exceeded twice: the E1b Adam `b = 16` ODE took 2013 s, and the `C = 128` validation
+  ODE 2177 s.
 * E2-E4 use ODE step factor `--safety 1`. On the `C = 64`, `alpha = 2` problem it is 1.8x faster than 0.5, and up to
-  `t = 300` it changes the risk by at most 4.7e-4 (0.6%), any `ell_c` by at most 0.25%, `B_cc` by at most 0.09%, and
+  `t = 300` it changes the risk by at most 4.7e-4 (0.03% of `R`), any `ell_c` by at most 0.25%, `B_cc` by at most 0.09%, and
   no `t_c`.
 * E2-E4 trajectories are cached by configuration in `figs/experiments/zipf/ode/`, with the full `B` and `O`, and start
   from the `D -> infinity` initial state. That start agrees with the finite-`D` `Theta_0` used by E1b to 0.1% in the
@@ -177,7 +180,7 @@ estimator is only used in the precision study above.
 
 ### Learning rates (`tune`, ODE only; `C = 32`, `alpha = 1.5`, `b = 1`, criterion `R(t = 100)`)
 
-`real/bin/python experiments/zipf_scaling.py tune` (8 ODE runs, 6 min)
+`real/bin/python experiments/zipf_scaling.py tune` (8 ODE runs, 5 min)
 
 | | eta | R(t = 100) | R(t = 1000) |
 |---|---|---|---|
@@ -199,7 +202,9 @@ Setup: one ODE per `(C, alpha, b)`, started from the `D -> infinity` initial sta
 Adam runs per `D` (`eta = 0.3`, `beta2 = 0.99`, `eps = 1e-8`). Horizons are `t = 30` for
 `C = 8` and `t = 300` for `C = 32`. The ODEs took 2-514 s. The simulations took 7-170 s at
 `D = 4000` and up to 1340 s at `D = 16000`. I stopped the `C = 32`, `b = 32`, `D = 16000`
-case to free the GPU. Analysis script: `e0_analysis.py`; its numbers are quoted below.
+case to free the GPU. Wall-clock: 46 min on Oct 30 for `C` in {8, 32} (the `C = 128` part was cut when the allocation
+ended), and 53 min for the Nov 2 D-sweep. Analysis: `experiments/zipf/analysis/e0_validate/e0_analysis.py`, whose
+numbers are quoted below. Figure: `figs/experiments/zipf/validate.pdf`.
 
 There are two distinct effects:
 
@@ -222,11 +227,11 @@ There are two distinct effects:
 
 At `D = 4000`, the full grid (`C` in {8, 32}, `alpha` in {1.2, 1.5, 2}) gives 0.3-0.5% of
 `R` with `|z| <= 2.4` at `b = 1`. It gives 0.3-3.2% at `b = 8` and 1.5-5.7% at `b = 32`.
-The 0-1 error gap is at most 0.0018 in absolute terms. Final risks agree to four decimals.
+The 0-1 error gap is at most 0.0018 in absolute terms. Final risks agree within 2e-4.
 
 **Per class** (worst relative gap of `ell_c` over `t >= 1`): the median over classes is
 2-6% and is not larger for rare classes. Grouped by the expected number of class-`c`
-events per unit time, `D pi_c`:
+events per unit time, `D pi_c` (`C <= 32`; computed before the `C = 128` file existed):
 
 | D pi_c | 0-10 | 10-100 | 100-1000 | > 1000 |
 |---|---|---|---|---|
@@ -348,7 +353,8 @@ not MC noise. It is Adam's restoring term acting on the random initial overlaps 
 * The tail forcing is unchanged (within 1% at `b = 1`), but the restoring term now removes much of the tail drift. The
   median over classes 25-128 is 68% at `beta2 = 0.95` and 50% at 0.99 (`b = 1`, `eps = 1e-8`), against 17%
   (`beta2 = 0.999`), 27% (`b = 4`), 11% (`b = 16`), 3% (`b = 64`), 12% (`eps = 1e-4`) and 1% for SGD and PSGD.
-* This ordering is the order in which configs stall (E1b, E4).
+* Among the configs later run on trajectories (E1b, E3), this ordering matches the stall: `beta2 = 0.95` (23
+  learned) < 0.99 (29) < `b = 4` (43 at `b t = 3000`) < `b = 16`, `b = 64`, `eps = 1e-4` (all 64).
 
 **Verdict (H1a).** At `Theta_0` the frozen drift has H1's shape in every config: slopes 1/2 and 1, joined by a
 ~2-decade crossover. Checkpoint A's `kappa_beta (1-beta2)/b` places the `beta2` kink within 1.03-1.18x for `b <= 16`.
@@ -415,7 +421,7 @@ real/bin/python experiments/zipf_scaling.py timescales --timescale-check     # O
 
 **ODE vs simulation** (8 runs, `D = 4000`, `t <= 300`, first config):
 
-* The classes learned are the same (1-27).
+* Every run learns classes 1-27 by `t = 300`, as the ODE does; at least one run also learns class 28.
 * For classes 5-27 the pooled `log(t_c sim / t_c ODE)` is -0.009 +- 0.006 (sum z^2 = 32 over 23 classes).
 * Classes 1-4 are learned 4.3% earlier in simulation, a head start of 64-126 steps. This is E0's warm-up.
 * For `t >= 1` the risk gap is at most 0.39% (|z| <= 1.9).
@@ -427,7 +433,8 @@ real/bin/python experiments/zipf_scaling.py timescales --timescale-check     # O
 * The tail leaves its `eps = 1e-4` control from `t ~ 14-25`, and the local `t_c` slope reaches -2 by `t ~ 59`.
 * `B_cc(3000)` is about 700 in every column (1950 at `beta2 = 0.95`), against 5-27 for SGD and 12-37 for `eps = 1e-4`.
 
-`B` alone does not single out the cause: PSGD carries as much rare-column `B` and learns every class. E4 resolves the
+`B` alone does not single out the cause. PSGD's rare-column `B_cc` is about 1/5 of Adam's (median 156 vs 723 over
+classes 39-64), but its part outside the mean span is 3x larger (`N_cc` 64 vs 19), and it learns every class. E4 resolves the
 mechanism (below).
 
 **Verdict (H1b).** H1 holds qualitatively and fails quantitatively. Its qualitative content is confirmed:
@@ -438,11 +445,13 @@ mechanism (below).
 * The `sqrt(b)` head law and the linear-in-`b` rare law hold at matched classes.
 
 Quantitatively, every method is steeper than its frozen law (by 0.1-0.2 in the exponent), and the break moves less than
-predicted. For `b = 1`, `eps = 1e-8` the rare-class law is overtaken by a stall that frozen rates do not predict.
+predicted. For `b = 1`, `eps = 1e-8` the rare-class law is overtaken by a stall that the frozen rates at `Theta_0` do not
+predict. The `t = 10` frozen rates (E1a) already show the restoring term cancelling 50-68% of the tail drift.
 
-### Checkpoint B (written 2026-11-02, 13:05)
+### Checkpoint B (written 2026-11-02, 13:05; the E4 diagnosis and the `C = 128` result were added later)
 
-* **E0 passes** past the warm-up transient: <= 0.5% of the risk at `b = 1`, and an `O(1/D)` bias for larger `b`. At
+* **E0 passes** past the warm-up transient for `b <= 8`: <= 0.5% of the risk at `b = 1` and `D >= 4000`. At `b = 32`
+  an `O(1/D)` bias remains, which narrowly misses the criterion at `C = 8` (1.3% at `D = 16000`). At
   `C = 128` (`b = 1`) the gap is 0.21% of the risk.
 * **H1 holds for the initial drift.** The kinks are within 2% after the background/eps correction, the eps-regime rate
   carries no `sqrt(b)`, and PSGD misses the `beta2` kink.
@@ -463,7 +472,8 @@ real/bin/python experiments/zipf_scaling.py noise --safety 1 --noise-eps 1e-4 --
 `eta T = 900`, `eps` in {1e-8, 1e-4}. SGD: `eta` in {0.3, 1, 3, 10} to `eta T = 9000`. `simcheck`: 8 direct Adam runs
 (`D = 2000`, `eta = 0.3`, `eps = 1e-8`, one shared finite-`D` `Theta_0`) to `t = 3000`. Analysis:
 `experiments/zipf/analysis/e4_noise/e4_analysis.py`, rerun after the `eps = 1e-4` runs. The equal-`t` and simulation
-tables and the coefficient checks come from separate verification scripts (numpy, plus one 80 s GPU job). Figures:
+tables and the coefficient checks come from the verification agents' scripts. These used numpy plus one 80 s GPU
+job recomputing psi-route and plain-path coefficients at the end state, and they are kept outside the repository. Figures:
 `figs/experiments/zipf/noise.pdf`, `figs/experiments/zipf/analysis/e4_noise/e4_mechanism.png`.
 
 **Runs** at `T`; cells are `eta` = 0.03 / 0.1 / 0.3 / 1 (SGD 0.3 / 1 / 3 / 10). Learned: `ell_c <= ell_c(0)/2` at some
@@ -508,7 +518,7 @@ risk, and `eta = 1` the tail loss. `eta = 1` learns the most classes at every `t
 | 953 | 0.07417 +- 0.00024 / 0.07414 | 29.1 / 29 | 28.4 / 29 | 0.43 +- 0.05 / 0.58 | 0.75 +- 0.05 / 0.66 |
 | 3000 | 0.07438 +- 0.00017 / 0.07410 | 29.75 +- 0.16 / 29 | 28.4 +- 0.3 / 29 | 0.34 +- 0.08 / 0.58 | 0.65 +- 0.06 / 0.66 |
 
-Real Adam stalls the same way. The risk agrees within 0.4% (`|z| <= 1.6`) for `t = 10-3000` and is flat late
+Real Adam stalls the same way. The risk agrees within 0.6% (`|z| <= 1.9`) for `t = 10-3000`, except at `t = 403` (+0.68%, z 3.3), and is flat late
 (`R(3000) - R(953)` = +0.00021 +- 0.00037). `ell_64(3000)` = 5.565 +- 0.059 vs 5.563, rare margins do not move after
 `t = 953`, and `B` grows as in the ODE (common-mode share 0.9959 vs 0.9957). The min-gap is 0.2-0.3 low in every
 class: the max over about 63 nearly tied competitors, each with a steady run-to-run s.d. of 0.21-0.235, is biased up.
@@ -525,7 +535,7 @@ reads `phi^T o_c + r^2 chi_{c.}^T = lambda_c 1` (`o_c` = column `c` of `O`). The
 margins come out 10-21% low.
 
 **Why `phi_cc` stays finite.** Adam normalizes the forcing by the own event and the restoring term by the background.
-For classes >= 32, `r^2 chi_cc/pi_c` is 98-99% of `-r^2 c_beta sqrt(2/pi)/(1 - beta1/sqrt(beta2)) = -208.9`, the
+For classes >= 32, `r^2 chi_cc/pi_c` is 97-99% of `-r^2 c_beta sqrt(2/pi)/(1 - beta1/sqrt(beta2)) = -208.9`, the
 sign-like plateau. The curvature is `phi_cc = kappa E_bg[p_c(1-p_c)]/RMS_bg(p_c)`, `kappa = 0.44-0.94`, with `E_bg`
 over other classes' inputs: own events carry 200-400x the background in `E f_c^2`, yet `psi_c'(0)` = 1.7-1.9 /
 `RMS_bg`. So `phi_cc` ignores the scale of the background, not its shape. It fell 11-20x as the background shrank and
@@ -541,7 +551,7 @@ differential noise is in Lyapunov balance (residual 6e-6). 99.6-99.9% of `tr B/C
 `eta t` = 9-900, against plateaus of 11.9-17.4 at `eta <= 0.3`), so `phi_cc` keeps falling and the margins follow.
 
 **Verdict (H5).** Refuted as stated. H5 predicted a noise floor: rare-class `B_cc` plateauing near `eta/sqrt(b pi_c)`
-and an `eta` limited by the tail. `B_cc` never plateaus (it grows like `t^2` in a common mode the softmax ignores), and
+and an `eta` limited by the tail. `B_cc` never plateaus (its local growth exponent at `T` is 1.85-1.96, in a common mode the softmax ignores), and
 at `eta <= 0.3` its diffusion-driven part is 0.25-2.7%. The tail does stall at `b = 1`, `eps -> 0`, but at a
 deterministic fixed point of the drift (28-29 classes at every `eta <= 0.3`), set by the mismatch between own-event and
 background normalization; `eps = 1e-4` removes it, and PSGD (`eta <= 0.3`) and SGD learn all classes. At fixed `t` the
@@ -559,8 +569,14 @@ head sets the optimal `eta` and the tail would take a larger one. At `t = 900` A
   `sigma_cc` 27% low against 8.4M plain-path samples; spurious +10-12% margin growth). Do not use it at late times.
 * Simulation "29.8 vs 29 learned" (a running count, inflated by threshold crossings; 28.4 +- 0.3 vs 29 at fixed `t`)
   and "`c = 64` margin 0.32-0.43 vs 0.58" (a finite-`D` bias of the min-gap; the mean-competitor margin agrees).
-* Not decidable: whether a larger `b` keeps a fixed point (the E2 `b = 16` run learns all 64 classes by `t = 1000`,
-  `gap_64` = 9.5, and its gaps still move), and whether the stall exists at other `C`.
+* Not decidable: whether a larger `b` keeps a fixed point. The E2 `b = 16` run learns all 64 classes by `t = 1000`,
+  `gap_64` is 9.5, and its gaps still move.
+* Partly decidable: whether the stall exists at other `C`. At `C = 128` (E0, `alpha = 2`, `b = 1`, `t <= 300`) the same
+  signature appears in the ODE and the simulation alike: 27/128 classes learned, and classes 41-128 above their initial
+  loss by up to 1.28x. Whether it is a fixed point there needs `t >> 300`.
+* PSGD at `eta = 1` also loses its tail, without a fixed point: 29/64 learned, 16 classes above their initial loss by up
+  to 1.5x, `R = 0.133`, and `N_cc/B_cc` up to 64% (33/64 learned at `eps = 1e-4`). This is the only E4 case where a
+  noise-driven tail limit (H5) is plausible. It was not analysed further.
 
 ### E2 `exponents`: risk exponents (H2, H3)
 
@@ -570,55 +586,94 @@ real/bin/python experiments/zipf_scaling.py exponents --safety 1     # 37 min
 
 **Setup.** `C = 64`, `alpha` in {1.25, 1.5, 2, 3}, `b` in {1, 16}, Adam and PSGD at `eta = 0.3` and SGD at `eta = 3`.
 `beta2 = 0.99`, `eps = 1e-8`, `t <= 1000` with 16 records per decade. Analysis:
-`experiments/zipf/analysis/e2_exponents/e2_analysis.py`. Figure: `figs/experiments/zipf/exponents.pdf`, where the
-middle panels draw the plan's asymptotic exponents.
+`experiments/zipf/analysis/e2_exponents/e2_analysis.py`. Figure: `figs/experiments/zipf/exponents.pdf`. Its middle
+panels draw the plan's asymptotic exponents and omit PSGD. The claims below were recomputed independently, and the
+corrections are included.
+
+Not done from the plan:
+
+* `C > 64`. An Adam ODE step costs 2.1 s at `C = 128`, so a `C = 128` exponent run would take hours.
+* The exponent of the 0-1 error.
+* Simulation spot-checks other than E4's.
 
 **Frontier model at finite `C`.** If `t_c ~ pi_c^-s`, the frontier (the number of learned classes) grows as
-`c*(t) ~ t^(1/(alpha s))`. The risk is mostly the unlearned tail, `R ~ sum_{c > c*} pi_c ell_c(0)`. At `C = 64` that
-tail is truncated, so the local exponent `-dlog R/dlog t` is `(-dlog tail/dlog c*)/(alpha s)` rather than the plan's
-`2(alpha-1)/alpha` (`s = 1/2`) or `(alpha-1)/alpha` (`s = 1`). Averaged over `c*` in [2, 16]:
+`c*(t) ~ t^(1/(alpha s))`. For `alpha <= 2` the risk is mostly the unlearned tail, `R ~ sum_{c > c*} pi_c ell_c(0)`
+(51-87% of `R` in the fit window); at `alpha = 3` learned classes carry up to 60% of it. At `C = 64` the tail is
+truncated and the first classes are discrete, so the local exponent is `(-dlog tail/dlog c*)/(alpha s)`, with tail
+`int_{c*+1/2}^{C+1/2} k^-alpha dk`, instead of the plan's `2(alpha-1)/alpha` (`s = 1/2`) or `(alpha-1)/alpha`
+(`s = 1`). Truncation dominates at `alpha <= 1.5`. At `alpha = 3` discreteness accounts for the change, since
+truncation alone would give 1.35. Averaged over `c*` in [2, 16]:
 
 | alpha | 1.25 | 1.5 | 2 | 3 |
 |---|---|---|---|---|
 | plan, `s = 1/2` / `s = 1` (`C -> infinity`) | 0.40 / 0.20 | 0.67 / 0.33 | 1.00 / 0.50 | 1.33 / 0.67 |
 | finite `C = 64`, `s = 1/2` / `s = 1` | 0.87 / 0.44 | 0.92 / 0.46 | 1.03 / 0.52 | 1.23 / 0.62 |
 
-**Measured** (least squares over the times where `2 <= c* <= 16`). `gamma = dlog c*/dlog t` gives the effective `s`:
+A staircase model fitted the same way as the measurement gives values 0.02-0.08 higher, so the comparison carries that
+much discretization ambiguity.
 
-| alpha | exponent SGD (`b` 1 / 16) | Adam `b` 16 | PSGD `b` 16 | Adam/SGD | `s`: SGD / Adam `b` 16 / PSGD `b` 16 |
+**Measured.** Exponents are least-squares fits over the times where `2 <= c* <= 16`. The effective `s` comes from
+per-class fits of `log t_c` against `log pi_c` over classes 2-16. The slope of the integer frontier biases `s` low by
+about 8%: 0.95-0.98 for SGD, 0.54-0.58 for Adam.
+
+| alpha | exponent SGD (`b` 1 / 16) | Adam `b` 16 | PSGD `b` 16 | Adam/SGD (PSGD/SGD) | `s`: SGD / Adam `b` 16 / PSGD `b` 16 |
 |---|---|---|---|---|---|
-| 1.25 | 0.40 / 0.41 | 0.69 | 0.71 | 1.7 | 0.97-0.98 / 0.54 / 0.53 |
-| 1.5 | 0.43 / 0.44 | 0.74 | 0.77 | 1.7 | 0.95-0.97 / 0.54 / 0.53 |
-| 2 | 0.49 / 0.50 | 0.83 | 0.89 | 1.66 | 0.97-0.98 / 0.58 / 0.55 |
-| 3 | 0.59 / 0.60 | 0.84 | 1.01 | 1.4 | 0.97-0.98 / 0.72 / 0.58 |
+| 1.25 | 0.40 / 0.41 | 0.69 | 0.71 | 1.70 (1.76) | 1.04-1.06 / 0.59 / 0.57 |
+| 1.5 | 0.43 / 0.44 | 0.74 | 0.77 | 1.70 (1.75) | 1.04-1.06 / 0.60 / 0.57 |
+| 2 | 0.49 / 0.50 | 0.83 | 0.89 | 1.66 (1.77) | 1.04-1.06 / 0.63 / 0.58 |
+| 3 | 0.59 / 0.60 | 0.84 | 1.01 | 1.41 (1.69) | 1.04-1.06 / 0.77 / 0.61 |
 
-* **SGD** follows the finite-`C` frontier model within 0.02-0.04 at every `alpha`, with `s = 0.95-0.98`.
-* **Adam and PSGD inside the window** (`b = 16`, whose `beta2` window holds the first 64, 60, 26 and 9 classes): the
-  frontier moves with `s = 0.53-0.58` for `alpha <= 2`, close to the window's 1/2. The risk exponent is 1.6-1.75x
-  SGD's, against the plan's "doubling". It is about 80% of the frontier model's `s = 1/2` value, because learned
-  classes keep some loss. At `alpha = 3` only 9 classes are in the window, so Adam's `s` is 0.72 and the ratio drops
-  to 1.4.
+* **SGD** lies 0.01-0.04 below the finite-`C` model with `s = 1` at every `alpha`, and its per-class `s` is 1.04-1.06.
+  Its local exponent is flat (within 5%) over about two decades at `alpha >= 2`: 0.47-0.51 at `alpha = 2`, the plan's
+  0.5.
+* **Adam and PSGD inside the window.** At `b = 16` the `beta2` window holds the first 64, 60, 26 and 9 classes.
+  * For `alpha <= 2` Adam's frontier moves with `s = 0.59-0.63`, rising from about 0.58 on classes 2-6 to 0.62-0.68
+    on classes 7-16.
+  * The risk exponent is 1.66-1.70x SGD's for Adam and 1.75-1.77x for PSGD, against the plan's doubling. Finite `C`
+    shifts both exponents but not their ratio. The ratio is the ratio of frontier speeds (Adam `s ~ 0.6`, SGD
+    `~ 1.05`), and the residual loss of learned classes changes it by at most 7%.
+  * The ratios move by about +-0.05 with the fit window or the learned threshold.
+  * At `alpha = 3` only 9 classes are in the window: Adam's `s` is 0.77 and the ratio is 1.4 (1.28-1.62 depending on
+    the window).
+  * No Adam local exponent is flat (within 5%) over more than about 1.2 decades.
 * **Broken power law (H3).** Fitting Adam's exponent separately for `c*` in [2, 6] and [6, 16]:
-  * At `b = 1`, where the window holds 6 classes at `alpha = 2` and 3 at `alpha = 3`, it drops from 0.71 to 0.52
-    (`alpha = 2`) and from 0.82 to 0.35 (`alpha = 3`): back to the SGD value once the frontier leaves the window.
-  * At `b = 16` it stays at 0.84-0.82 for `alpha = 2`, where all 16 frontier classes are inside the window, and breaks
+  * At `b = 1`, `alpha = 2` (window of 6 classes) it drops from 0.71 to 0.52, which is SGD's 0.50 on the same window.
+  * At `b = 1`, `alpha = 3` it drops from 0.82 to 0.35, well below SGD's 0.54. PSGD drops there too (1.01 -> 0.63),
+    with rare-class losses rising for all three optimizers, so this is a late slowdown and not the window edge.
+  * At `b = 16` it stays at 0.84-0.82 for `alpha = 2`, where every frontier class is inside the window, and breaks
     from 1.03 to 0.67 at `alpha = 3`.
-  * For `alpha <= 1.5` at `b = 1` the window holds 9-11 classes and no clear break shows (0.53-0.60 throughout).
-* **Break time.** The frontier leaves the `b = 1` window (`c* = 6`, `alpha = 2`) at `t = 3.2`. The plan's
-  `1/(eta sqrt(1-beta2)) = 33` omits the factor `r^2 = 25` of the drift, and once that is restored the order of
-  magnitude matches.
-* **The stall caps the `b = 1` frontier.** By `t = 1000` Adam learns 47, 29 and 16 of 64 classes for
-  `alpha` = 1.5, 2 and 3. PSGD learns 64, 64 and 21, and SGD 64, 64 and 24. At `alpha = 1.25` Adam learns all 64:
-  the rarest class there has `pi = 1.7e-3` and its fixed-point margin (E4) is large enough.
-* **Final risk** at `t = 1000`, `b = 16`: Adam is within 1-6% of SGD at `alpha <= 2` (`alpha = 2`: 0.0116 vs 0.0115)
-  and lower at `alpha = 3` (0.0047 vs 0.0056). PSGD's risk turns up late in several runs.
+  * For `alpha <= 1.5` at `b = 1` there is no clear break: Adam stays at 0.53-0.60 while SGD rises by 0.07-0.09 with
+    the finite-`C` tail. Inside the `b = 1` window Adam's `t_c` slope is already 0.71-0.74 (PSGD 0.58), because that
+    window lies in the crossover rather than on the slope-1/2 branch.
+* **Break time.** At `alpha = 2`, `b = 1` the frontier leaves the window between `t = 2.9` (`c* = 6`) and 3.9
+  (`c* = 7`), and the local exponent rolls off over more than a decade. At `b = 16` it leaves later: `t = 5.3-5.8` at
+  `alpha = 2` and 3.4-4.5 at `alpha = 3`, against 1.6-3.2 at `b = 1`. The plan's
+  `1/(eta max(sqrt(1-beta2), b sqrt(eps))) = 33` has no `b` dependence at `eps = 1e-8` and omits `r^2 = 25`. The
+  measured break is about `3/(eta r^2 sqrt(1-beta2))`. `beta2` and `eps` were not varied in E2.
+* **The `b = 1` frontier at `t = 1000`.** Adam learns 47, 29 and 16 of 64 classes for `alpha` = 1.5, 2 and 3. PSGD
+  learns 64, 64 and 21, and SGD 64, 64 and 24.
+  * Only `alpha = 2` is shown to be the E4 fixed point.
+  * At `alpha = 1.5` the state is nearly stationary (gaps change 2-3% per half decade), and no class has risen above its
+    initial loss.
+  * At `alpha = 3` the state is far from stationary, and rare-class losses rise for all three optimizers (Adam 45
+    classes, SGD 31, PSGD 37 above their initial loss).
+  * The prior of the last learned class is 1.3e-3, 7.3e-4 and 2.0e-4.
+  * At `alpha = 1.25` Adam learns all 64 classes (`pi_64 = 1.7e-3`), yet its `R(1000) = 0.102` is 3.9x SGD's.
+* **Final risk** at `t = 1000`.
+  * `b = 16`: Adam is within 1-6% of SGD at `alpha <= 2` (`alpha = 2`: 0.0116 vs 0.0115) and lower at `alpha = 3`
+    (0.0047 vs 0.0056).
+  * `b = 1` (`alpha` = 1.25 / 1.5 / 2 / 3): Adam 0.102 / 0.131 / 0.074 / 0.012, PSGD 0.072 / 0.060 / 0.038 / 0.017,
+    SGD 0.026 / 0.021 / 0.014 / 0.0067.
+  * PSGD's risk turns up late in every run. Its minimum is at `t = 130-320`, and `R(1000)` is 4-11% above it at `b = 1`
+    and 16-44% at `b = 16`. PSGD runs at Adam's untuned `eta = 0.3`, which E4 shows is too large for it.
 
-**Verdict (H2, H3).** The direction of H2 holds. Inside the window Adam's frontier moves like `t^(2/alpha)`
-(`s ~ 0.55` against SGD's 0.97), and its risk exponent is 1.6-1.75x SGD's at `C = 64`, not 2x. Finite `C` and the
-residual loss of learned classes explain the difference. H3's break appears where predicted, when the frontier leaves
-the `beta2` window, and the time scale includes `r^2`. At `b = 1` and `alpha >= 1.5` the late regime is not the SGD
-exponent but the stall. A clean asymptotic exponent would need `C >> 64`: no local exponent here is flat over more
-than about one decade.
+**Verdict (H2, H3).** The direction of H2 holds. Inside the window Adam's frontier moves with `s ~ 0.6` against SGD's
+1.05, so its risk exponent is 1.66-1.70x SGD's at `C = 64` (PSGD 1.75-1.77x), not 2x. Finite `C` shifts both
+exponents but not their ratio. H3's break shows near the window edge where it can be isolated (`alpha = 2`, `b = 1`;
+`alpha = 3`, `b = 16`) and is masked by the finite-`C` tail at `alpha <= 1.5`. Its time is about
+`3/(eta r^2 sqrt(1-beta2))`. At `b = 1` the late regime is the stall for `alpha` = 1.5-2, and a slower frontier that
+is still moving at `alpha = 3`. SGD's exponent is flat over two decades at `alpha >= 2`, but no Adam exponent is flat
+over more than ~1.2 decades, so a clean Adam exponent needs `C >> 64`.
 
 ### E3 `batch`: batch size at a fixed sample budget (H4)
 
@@ -633,25 +688,31 @@ the same number of samples, `b t = 3000` (in units of `D`). Learning-rate rules:
 * SGD: fixed `eta = 3`, and `eta b`.
 
 Analysis: `experiments/zipf/analysis/e3_batch/e3_analysis.py`, which writes `e3_numbers.json`. Figure:
-`figs/experiments/zipf/batch.pdf`.
+`figs/experiments/zipf/batch.pdf`. The claims were recomputed independently, and the corrections are included.
 
 **Exact scaling symmetries of the ODE.**
 
-* SGD with `eta ~ b` needs exactly the same samples at every `b`: 441.5 to learn all 64 classes for `b` = 1-64, and the
-  same risk curve. This is because `(eta, b, t) -> (eta b, b, t/b)` leaves both the drift `eta phi` and the diffusion
-  `eta^2 sigma/b` invariant per sample.
-* PSGD with `eta ~ sqrt(b)` and `eps = 0` is invariant in the same way (159.7-160.5), since its preconditioner scales
-  as `sqrt(b)`.
+* **SGD with `eta ~ b`** is exactly invariant: `(eta, b, t) -> (eta b, b, t/b)` leaves the drift `eta phi` and the
+  diffusion `eta^2 sigma/b` per sample unchanged.
+  * The runs learn all 64 classes after 441.2-441.5 samples for `b` = 1-64, and their risk curves agree to 3e-4 for
+    `b t >= 300`.
+  * Early on, `b` = 16 and 64 deviate: up to 16% at `b t = 0.16`, and up to 4.7% for `b t <= 10` at `b = 64`. This is
+    a numerical start-up error. The first record interval, `b t` up to `0.01 b`, is integrated in 1-3 Heun steps,
+    because the step controller is limited by `phi` and not by the `chi` forcing, which scales with `eta`. A first
+    record time of `0.01/b` would remove it.
+* **PSGD with `eta ~ sqrt(b)`** is exactly invariant at `eps = 0`, because its preconditioner
+  `(E f^2/b + eps)^-1/2` scales as `sqrt(b)`. The runs at `eps = 1e-8` need 159.7-160.5 samples for all 64 classes,
+  and their risks agree to 0.23%. The residual grows with `b`, as `b eps / E f_c^2` reaches 1.3% at `b = 64`.
 
-So in the high-dimensional limit these two rules have no critical batch size. Adam breaks the symmetry only through
-its finite memory `beta2` and through `eps`, and so does PSGD with `eps > 0`.
+So in this limit these two rules have no critical batch size. For Adam, every batch effect comes from the `beta2`
+memory and from `eps`; for PSGD it comes from `eps`.
 
 **Samples to learn `k` classes** (`b t`; `-` = not within `b t = 3000`). Bold marks the best `b`:
 
 | optimizer, rule | `k` | b = 1 | b = 4 | b = 16 | b = 64 |
 |---|---|---|---|---|---|
 | Adam `eps` 1e-8, fixed | 8 / 32 / 64 | **5.0** / - / - | 7.6 / 171 / - | 13.6 / **133** / 1039 | 25.7 / 174 / **727** |
-| Adam `eps` 1e-8, `sqrt(b)` | 8 / 32 / 64 | 5.0 / - / - | 3.9 / 103 / - | 3.5 / 44 / 496 | **3.4** / **30** / **232** |
+| Adam `eps` 1e-8, `sqrt(b)` | 8 / 32 / 64 | 5.0 / - / - | 3.9 / 103 / - | 3.5 / 44 / 496 | **3.4** / **30** / **231** |
 | Adam `eps` 1e-4, fixed | 8 / 32 / 64 | **5.2** / 139 / 862 | 8.0 / **119** / **660** | 15.0 / 179 / 919 | 34.6 / 505 / 2585 |
 | Adam `eps` 1e-4, `sqrt(b)` | 8 / 32 / 64 | 5.2 / 139 / 862 | 4.1 / 66 / 396 | **3.9** / **52** / **291** | 4.4 / 70 / 379 |
 | PSGD `eps` 1e-8, `sqrt(b)` | 64 | 160 | 160 | 160 | 160 |
@@ -660,23 +721,37 @@ its finite memory `beta2` and through `eps`, and so does PSGD with `eps > 0`.
 
 **H4.**
 
-* **Window optimum.** With `eps = 1e-4` (`b* = sqrt((1-beta2)/eps) = 10`), Adam's sample cost for the deep targets is
-  smallest at `b = 4` with fixed `eta` and at `b = 16` with `eta sqrt(b)`. Both bracket `b*`, and both rules get worse
-  at `b = 64`, where the eps edge `pi = b eps` cuts into the window. With `eps = 1e-8` (`b* = 1000`) Adam keeps
-  improving up to `b = 64`.
-* **The critical batch grows with the target.** For Adam (`eps = 1e-8`, fixed `eta`) the samples-minimizing `b` is 1
-  for the first 8-16 classes, 16 for 32 classes and 64 for 48-64 classes. For `eps = 1e-4` it moves from 1 to 4 and
-  then stays there, capped by the window optimum. The grid of four batch sizes is too coarse to test
-  `b_crit ~ 1/pi_{c*}` quantitatively.
-* **Larger batches escape the stall.** At `b t = 3000` with fixed `eta = 0.3`, Adam (`eps = 1e-8`) learns 29 classes at
-  `b = 1`, 43 at `b = 4` and 64 at `b` = 16 and 64. The final risk is 0.074, 0.038, 0.013 and 0.0099. A larger batch
-  moves classes into the `beta2` window (`b pi_c > kappa (1-beta2)`) and out of the regime where the fixed point
-  forms. At the head, fixed `eta` makes larger batches cost more samples: window classes gain only `sqrt(b)` per step.
-* **SGD at fixed `eta`** wastes samples in proportion to `b` (it only takes fewer steps). With `eta b` it is exactly
-  invariant, as above.
+* **Window optimum.** With `eps = 1e-4` (`b* = sqrt((1-beta2)/eps) = 10`), the samples to learn 24-64 classes are
+  smallest at `b = 4` with fixed `eta` and at `b = 16` with `eta sqrt(b)`, which bracket `b*`. Both rules lose at
+  `b = 64`, where `pi_c > b eps` holds only for classes 1-9. The risk does not follow under `eta sqrt(b)`: `b = 64`
+  ends lowest (`R(3000)` = 0.0101 vs 0.0118 at `b = 16`) and reaches `R <= 0.012` first.
+* **`eps = 1e-8`** (`b* = 1000`).
+  * Learning all 48-64 classes is cheapest at `b = 64` under both rules. For `k = 64` the cost falls from 1039 to 727
+    with fixed `eta`, and from 496 to 231 with `eta sqrt(b)`.
+  * But 32-40 classes are cheapest at `b = 16` with fixed `eta`.
+  * With `eta sqrt(b)` the final risk is lowest at `b = 16` (0.024 vs 0.031 at `b = 64`). This rule mixes batch size
+    with the late-time cost of a large Adam step (`eta` up to 2.4).
+* **The best batch grows with the target at fixed `eta`.** For `eps = 1e-8` it is 1 for the first 8-16 classes, 16 for
+  32 classes and 64 for 48-64 classes. For `eps = 1e-4` it moves from 1 to 4.
+  * This is not a critical batch in the usual sense, because `eta` is not tuned per `b`. The advantage of `b = 1` at the
+    head is the expected `sqrt(b)` per-step gain.
+  * `b_crit ~ 1/pi_{c*}` is untested with four batch sizes.
+* **The stall.** At `b t = 3000` with fixed `eta = 0.3`, Adam (`eps = 1e-8`) learns 29, 43, 64 and 64 classes for
+  `b` = 1, 4, 16 and 64 (`R` = 0.074, 0.038, 0.013, 0.0099).
+  * The escape is not explained by entering the `beta2` window. `b pi_c > kappa (1-beta2)` holds for classes up to
+    6 / 13 / 26 / 52 at `b` = 1 / 4 / 16 / 64, yet at `b = 16` classes 27-64 are learned below the edge.
+  * At `b = 4`, 8 classes are still above their initial loss and the gaps are still moving (0.017). Whether a larger
+    `b` removes the fixed point or only moves it is open. See the `b = 4` run to `t = 3000` in the diagnostics.
+* **SGD at fixed `eta`** wastes samples in proportion to `b`.
+* **Not done:** `eta` tuned per `b`, and costs to reach target losses at tuned `eta`. PSGD (`eta = 0.3 sqrt(b)`) learns
+  all 64 classes in 160 samples at every `b`, fewer than any Adam run (231).
 
-**Verdict (H4).** Supported. The best batch size for the tail lies between 4 and 16 when `b* = 10`, and no optimum
-appears below `b = 64` when `b* = 1000`. The critical batch size grows as the target moves into the tail. In this
-model a larger batch is also the cure for the small-batch stall of E4. The ODE has no critical batch size for SGD
-with `eta ~ b` or for PSGD with `eta ~ sqrt(b)` (`eps = 0`), so every batch-size effect here comes from Adam's finite
-`beta2` memory and from `eps`.
+**Verdict (H4).** Supported for per-class targets, with qualifications.
+
+* With `eps = 1e-4` (`b* = 10`) the samples to learn 24-64 classes are smallest at `b = 4` (fixed `eta`) and
+  `b = 16` (`eta sqrt(b)`), and both rules lose at `b = 64`. Under `eta sqrt(b)`, though, `b = 64` reaches the lowest
+  risk.
+* With `eps = 1e-8` (`b* = 1000`), learning all 48-64 classes is cheapest at `b = 64`.
+* At fixed `eta` the best `b` grows as the target moves into the tail.
+* `b >= 16` removes the small-batch stall at this sample budget, by a mechanism not identified here.
+* The ODE has no critical batch size for SGD with `eta ~ b` or for PSGD with `eta ~ sqrt(b)` (`eps = 0`).
