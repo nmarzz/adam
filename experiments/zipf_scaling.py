@@ -60,12 +60,13 @@ def zipf_priors(classes, alpha):
     return pi / pi.sum()
 
 
-def zipf_model(classes, alpha, dimension, *, r=MEAN_NORM, seed=0):
-    """Priors, isotropic mixture data and ``Theta_0`` (``D x C``)."""
+def zipf_model(classes, alpha, dimension, *, r=MEAN_NORM, seed=0, noise=1.0):
+    """Priors, isotropic mixture data and ``Theta_0`` (``D x C``); ``K = noise * Id``."""
     k_q, k_t = jax.random.split(jax.random.PRNGKey(seed + 7919 * classes + dimension))
     Q, _ = jnp.linalg.qr(jax.random.normal(k_q, (dimension, classes)))
     theta0 = 0.1 * jax.random.normal(k_t, (dimension, classes)) / jnp.sqrt(dimension)
-    data = simulate.MixtureData(jnp.ones(dimension), r * Q, jnp.zeros((dimension, 0)))
+    data = simulate.MixtureData(jnp.sqrt(noise) * jnp.ones(dimension), r * Q,
+                                jnp.zeros((dimension, 0)))
     return jnp.asarray(zipf_priors(classes, alpha)), data, theta0
 
 
@@ -141,24 +142,35 @@ def solve(priors, theta0, means, times, *, lr, beta1, beta2, eps, batch, mode="a
 
 
 def simulate_runs(priors, data, theta0, record_steps, *, lr, beta1, beta2, eps, batch,
-                  runs, sgd=False, seed=0):
-    """Adam (or SGD) runs recorded at ``record_steps``; ``lr`` in ODE units."""
+                  runs, sgd=False, seed=0, bias=False):
+    """Adam (or SGD) runs recorded at ``record_steps``; ``lr`` in ODE units.
+    ``bias=True``: a learned bias (zero at start) is trained alongside ``Theta``
+    with the same optimizer and ``lr``; returns ``(B, O, beta)``."""
     problem = problems.make_gmm_softmax(np.asarray(priors))
     d = theta0.shape[0]
+    if bias:
+        theta0 = jnp.concatenate([theta0, jnp.zeros((1, theta0.shape[1]), theta0.dtype)])
     if sgd:
-        sim = simulate.build_mixture_sgd(problem, data, lr / d, batch=batch)
+        sim = simulate.build_mixture_sgd(problem, data, lr / d, batch=batch, bias=bias)
     else:
         sim = simulate.build_mixture_adam(problem, data, lr / d, beta1=beta1,
-                                          beta2=beta2, eps=eps, batch=batch)
+                                          beta2=beta2, eps=eps, batch=batch, bias=bias)
     keys = jax.random.split(jax.random.PRNGKey(10_000 + seed), runs)
-    return simulate.run_mixture_at_many(sim, data, theta0, record_steps, keys=keys)
+    return simulate.run_mixture_at_many(sim, data, theta0, record_steps, keys=keys, bias=bias)
 
 
-def class_metrics(B, O, *, samples=2 ** 14):
-    """Per-class losses and errors for stacked ``(..., C, C)`` order parameters."""
+def class_metrics(B, O, *, samples=2 ** 14, bias=None):
+    """Per-class losses and errors for stacked ``(..., C, C)`` order parameters
+    (``bias``: optional stacked ``(..., C)`` learned biases)."""
     flat_B, flat_O = B.reshape((-1,) + B.shape[-2:]), O.reshape((-1,) + O.shape[-2:])
-    fn = jax.jit(lambda b, o: problems.softmax_class_metrics(b, o, samples=samples))
-    loss, err = jax.lax.map(lambda bo: fn(*bo), (flat_B, flat_O))
+    if bias is None:
+        fn = jax.jit(lambda b, o: problems.softmax_class_metrics(b, o, samples=samples))
+        loss, err = jax.lax.map(lambda bo: fn(*bo), (flat_B, flat_O))
+    else:
+        flat_beta = jnp.asarray(bias).reshape((-1, B.shape[-1]))
+        fn = jax.jit(lambda b, o, v: problems.softmax_class_metrics(b, o, samples=samples,
+                                                                    bias=v))
+        loss, err = jax.lax.map(lambda bov: fn(*bov), (flat_B, flat_O, flat_beta))
     shape = B.shape[:-2] + (B.shape[-1],)
     return np.asarray(loss).reshape(shape), np.asarray(err).reshape(shape)
 

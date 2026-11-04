@@ -323,17 +323,20 @@ def make_gmm_softmax(priors, *, risk_samples: int = 2 ** 15,
 
 
 def softmax_class_metrics(B, O, *, samples: int = 2 ** 15, seed: int = 0,
-                          batch_size: int = 8):
+                          batch_size: int = 8, bias=None):
     """Per-class cross-entropy ``ell_c = E[-log p_c(x) | c]`` and error
     ``err_c = P(argmax q != c | c)`` for softmax with ``M = C`` logits, from
     ``q | c ~ N(O[:, c], B)`` and fixed Gaussian draws (deterministic in ``(B, O)``).
 
     The shared noise ``g @ sym_sqrt(B)`` is formed once and classes are processed
     in ``lax.map`` batches, so memory is ``O(samples * C)`` rather than
-    ``O(samples * C^2)``.
+    ``O(samples * C^2)``. ``bias`` (``(C,)``, optional) is added to every logit
+    vector: ``q | c ~ N(O[:, c] + bias, B)``.
     """
     from utils import sym_sqrt
     classes = B.shape[0]
+    if bias is not None:
+        O = O + bias[:, None]
     noise = _gaussian_draws(classes, samples, seed) @ sym_sqrt(B)
 
     def one(c):

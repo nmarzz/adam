@@ -287,8 +287,12 @@ def mixture_covariance(data: MixtureData):
     return f ** 2 if f.ndim == 1 else f @ f.T
 
 
-def _mixture_grad(problem, data, params, key, batch):
-    """Batch-averaged gradient ``b^{-1} sum_beta x_beta (x) f(q_beta; c_beta, w_beta)``."""
+def _mixture_grad(problem, data, params, key, batch, bias=False):
+    """Batch-averaged gradient ``b^{-1} sum_beta x_beta (x) f(q_beta; c_beta, w_beta)``.
+
+    ``bias=True``: ``params`` is ``(D + 1, M)``, its last row a learned bias ``beta``
+    (logits ``x^T W + beta``, i.e. a constant input coordinate ``x_{D+1} = 1``); the
+    gradient's last row is then ``b^{-1} sum_beta f_beta``."""
     k_c, k_z, k_w = jax.random.split(key, 3)
     d = data.means.shape[0]
     classes = jax.random.categorical(k_c, jnp.log(problem.priors), shape=(batch,))
@@ -296,22 +300,32 @@ def _mixture_grad(problem, data, params, key, batch):
     noise = z * data.factor if data.factor.ndim == 1 else z @ data.factor.T
     x = data.means.T[classes] + noise
     w = jax.random.normal(k_w, (batch, problem.outputs))
-    q = x @ jnp.concatenate([params, data.teacher], axis=1)
-    return x.T @ jax.vmap(problem.f)(q, classes, w) / batch
+    if not bias:
+        q = x @ jnp.concatenate([params, data.teacher], axis=1)
+        return x.T @ jax.vmap(problem.f)(q, classes, w) / batch
+    W, beta = params[:-1], params[-1]
+    offset = jnp.concatenate([beta, jnp.zeros(data.teacher.shape[1], beta.dtype)])
+    q = x @ jnp.concatenate([W, data.teacher], axis=1) + offset
+    F = jax.vmap(problem.f)(q, classes, w)
+    return jnp.concatenate([x.T @ F / batch, F.mean(0)[None]])
 
 
 def build_mixture_adam(problem, data: MixtureData, lr, *, beta1, beta2, eps=0.0,
-                       batch=1) -> Sim:
-    """Adam with batch size ``batch`` and stability array ``eps * K_ii``."""
+                       batch=1, bias=False) -> Sim:
+    """Adam with batch size ``batch`` and stability array ``eps * K_ii`` (``eps`` on
+    the bias row when ``bias=True``, whose input coordinate is ``x_{D+1} = 1``)."""
     cov = mixture_covariance(data)
-    stability = eps * (cov if cov.ndim == 1 else jnp.diag(cov))[:, None]
+    diag = cov if cov.ndim == 1 else jnp.diag(cov)
+    if bias:
+        diag = jnp.concatenate([diag, jnp.ones(1, diag.dtype)])
+    stability = eps * diag[:, None]
 
     def init(params):
         return (jnp.zeros_like(params), jnp.zeros_like(params))
 
     def step(params, state, key, k):
         m, v = state
-        g = _mixture_grad(problem, data, params, key, batch)
+        g = _mixture_grad(problem, data, params, key, batch, bias)
         m = beta1 * m + (1 - beta1) * g
         v = beta2 * v + (1 - beta2) * g ** 2
         params = params - _lr_at(lr, k) * m / jnp.sqrt(v + stability)
@@ -320,12 +334,12 @@ def build_mixture_adam(problem, data: MixtureData, lr, *, beta1, beta2, eps=0.0,
     return Sim(init, step)
 
 
-def build_mixture_sgd(problem, data: MixtureData, lr, *, batch=1) -> Sim:
+def build_mixture_sgd(problem, data: MixtureData, lr, *, batch=1, bias=False) -> Sim:
     def init(params):
         return ()
 
     def step(params, state, key, k):
-        g = _mixture_grad(problem, data, params, key, batch)
+        g = _mixture_grad(problem, data, params, key, batch, bias)
         return params - _lr_at(lr, k) * g, ()
 
     return Sim(init, step)
@@ -370,17 +384,24 @@ def run_mixture_many(sim: Sim, data: MixtureData, params0, num_steps, *,
                                             basis=basis))(keys)
 
 
-def run_mixture_at(sim: Sim, data: MixtureData, params0, record_steps, *, key):
+def run_mixture_at(sim: Sim, data: MixtureData, params0, record_steps, *, key,
+                   bias=False):
     """Like :func:`run_mixture`, but record ``(B, O)`` at the given increasing step
     indices (``record_steps[0]`` is usually 0), e.g. a log-spaced grid. Segments
     between records have data-dependent lengths (``lax.fori_loop`` with traced
-    bounds), so one compilation serves any grid of the same size."""
+    bounds), so one compilation serves any grid of the same size.
+
+    ``bias=True`` (``params0`` is ``(D + 1, M)``, last row the bias): records
+    ``(B, O, beta)``, with ``B``, ``O`` from the weight rows only."""
     cov = mixture_covariance(data)
     record_steps = jnp.asarray(record_steps)
 
     def observe(params):
-        W = jnp.concatenate([params, data.teacher], axis=1)
+        weights = params[:-1] if bias else params
+        W = jnp.concatenate([weights, data.teacher], axis=1)
         KW = cov[:, None] * W if cov.ndim == 1 else cov @ W
+        if bias:
+            return W.T @ KW, W.T @ data.means, params[-1]
         return W.T @ KW, W.T @ data.means
 
     def advance(k, carry):
@@ -395,12 +416,13 @@ def run_mixture_at(sim: Sim, data: MixtureData, params0, record_steps, *, key):
 
     carry = lax.fori_loop(0, record_steps[0], advance, (params0, sim.init(params0), key))
     first = observe(carry[0])
-    _, (B, O) = lax.scan(segment, carry, jnp.stack([record_steps[:-1], record_steps[1:]], 1))
-    stack = lambda end, path: jnp.concatenate([end[None], path])
-    return stack(first[0], B), stack(first[1], O)
+    _, path = lax.scan(segment, carry, jnp.stack([record_steps[:-1], record_steps[1:]], 1))
+    stack = lambda end, rest: jnp.concatenate([end[None], rest])
+    return tuple(stack(e, r) for e, r in zip(first, path))
 
 
-def run_mixture_at_many(sim: Sim, data: MixtureData, params0, record_steps, *, keys):
+def run_mixture_at_many(sim: Sim, data: MixtureData, params0, record_steps, *, keys,
+                        bias=False):
     """``vmap`` :func:`run_mixture_at` over PRNG keys."""
     return jax.vmap(lambda key: run_mixture_at(sim, data, params0, record_steps,
-                                               key=key))(keys)
+                                               key=key, bias=bias))(keys)
