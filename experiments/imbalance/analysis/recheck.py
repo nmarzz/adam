@@ -20,6 +20,11 @@ NUM = json.loads((DATA / "analysis" / "numbers.json").read_text())
 FLAGS = []
 
 
+def arr(x):
+    """JSON list (None for NaN) -> float array."""
+    return np.array([np.nan if v is None else v for v in x], dtype=float)
+
+
 def tc_vec(t, L, level=0.5):
     """First crossing of L[:, c] <= level * L[0, c], log-linear interpolation."""
     target = level * L[0]
@@ -42,8 +47,13 @@ def tc_vec(t, L, level=0.5):
 
 def hinge_fit(x, y):
     """y = y0 + 0.5 * max(x - xb, 0): least squares over (y0, xb), many starts."""
+    # the objective is piecewise smooth in xb with local minima between classes:
+    # start the local solver from the best points of a dense scan
+    scan = np.linspace(x.min() - 2, x.max() + 2, 4001)
+    sse = [np.sum((y - np.mean(y - 0.5 * np.maximum(x - z, 0)) - 0.5 * np.maximum(x - z, 0)) ** 2)
+           for z in scan]
     best = None
-    for xb0 in np.linspace(x.min() - 1, x.max() + 1, 25):
+    for xb0 in scan[np.argsort(sse)[:5]]:
         fun = lambda p: p[0] + 0.5 * np.maximum(x - p[1], 0) - y
         sol = least_squares(fun, [np.median(y), xb0], method="trf",
                             bounds=([-50, x.min() - 2], [50, x.max() + 2]))
@@ -67,6 +77,7 @@ def main():
     worst = {"tc": 0.0, "RT": 0.0, "ratio_pi_b": 0.0}
     for k, rec in NUM["runs"].items():
         model, kappa, C, alpha, opt = k.split("_")
+        kappa, alpha = f"{float(kappa):g}", f"{float(alpha):g}"
         if rec["source"] == "ode":
             pattern = (f"m0_{'adam' if opt.startswith('adam') else 'sgd'}_k{kappa}_C{C}_a{alpha}_"
                        + (f"b10.9_b2{opt[4:]}_b1_e1e-08_eta0.3" if opt.startswith("adam")
@@ -83,7 +94,7 @@ def main():
                      if abs(float(np.load(f)["time"][-1]) - rec["T"]) < 1e-6]
             d = np.load(files[0])
             t, L, pi = d["time"], d["loss"].mean(0), d["priors"]
-        worst["tc"] = max(worst["tc"], compare(f"tc {k}", tc_vec(t, L), rec["tc"]["0.5"], 1e-9))
+        worst["tc"] = max(worst["tc"], compare(f"tc {k}", tc_vec(t, L), arr(rec["tc"]["0.5"]), 1e-9))
         worst["RT"] = max(worst["RT"], compare(f"R(T) {k}", L[-1] @ pi, rec["RT"], 1e-12))
     for k, rec in NUM["kink"].items():
         if "ratio" not in rec:
@@ -92,8 +103,8 @@ def main():
         a = NUM["runs"][f"{model}_{kappa}_{C}_{alpha}_adam{b2}"]
         s = NUM["runs"][f"{model}_{kappa}_{C}_{alpha}_sgd"]
         idx = np.asarray(rec["classes"]) - 1
-        pi = np.asarray(a["pi"])[idx]
-        r = np.asarray(a["tc"]["0.5"])[idx] / np.asarray(s["tc"]["0.5"])[idx]
+        pi = arr(a["pi"])[idx]
+        r = arr(a["tc"]["0.5"])[idx] / arr(s["tc"]["0.5"])[idx]
         pb = hinge_fit(np.log(pi), np.log(r))
         # profile-grid resolution of the analyze fit is (range + 4) / 800 in log pi
         tol = (np.log(pi).max() - np.log(pi).min() + 4) / 800 * 1.5
