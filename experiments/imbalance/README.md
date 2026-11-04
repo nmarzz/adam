@@ -112,3 +112,135 @@ the bias non-invariance described above, not a code error.
   SGD; includes compile). That is about 100 s per `10^6`-step config.
 - **ODE, C = 8, `T = 100`:** Adam 152 steps (`kappa = 1`) and 113 steps (`kappa = 0.1`); SGD 119 and 65 steps; a
   few seconds each after compile.
+
+## Stage 1: C = 8 (2026-11-04)
+
+```
+real/bin/python experiments/imbalance.py ode --classes 8            # 16 ODE runs, 20-30 s each
+real/bin/python experiments/imbalance.py frozen --classes 8         # 30 s
+real/bin/python experiments/imbalance.py frozen-bias --classes 8    # 3 min
+real/bin/python experiments/imbalance.py sim --classes 8            # 32 configs x 16 runs x 1e6 steps, ~31 s each
+real/bin/python experiments/imbalance.py sim --classes 8 --alphas 2 --models m0 --opts adam --beta2s 0.99 \
+    --dimension {2000,4000} --sim-horizon 100                       # finite-D check
+real/bin/python experiments/imbalance.py analyze; real/bin/python experiments/imbalance.py plot
+```
+
+Simulation at `D = 1000` takes about 31 µs per step for 16 runs, three times faster than the Stage 0 probe, which
+included compilation. Tables: `figs/experiments/imbalance/analysis/tables.md`. Figures: `A_*`–`E_*` in the same
+folder.
+
+### Risk (m0, ODE; `R(0) = 2.08`)
+
+| `kappa` | `alpha` | opt | `t(R/2)` | `t(R/10)` | `-dlogR/dlogt` at t = 1 / 10 / 100 / 1000 | `R(1000)` |
+|---|---|---|---|---|---|---|
+| 1 | 1 | Adam 0.9 / 0.95 / 0.99 | 0.44 / 0.44 / 0.43 | 2.0 / 2.1 / 1.9 | 1.07 / 1.23 / 0.08 / −0.11 (0.9) | 5.5e-3 / 5.3e-3 / 6.3e-3 |
+| 1 | 1 | SGD | 0.14 | 1.2 | 0.91 / 0.72 / 0.42 / 0.11 | 5.2e-3 |
+| 1 | 2 | Adam 0.9 / 0.95 / 0.99 | 0.22 / 0.23 / 0.23 | 1.6 / 1.6 / 1.5 | 0.87 / 1.36 / 0.20 / −0.08 (0.9) | 3.6e-3 / 3.5e-3 / 4.1e-3 |
+| 1 | 2 | SGD | 0.058 | 0.97 | 0.70 / 0.80 / 0.49 / 0.16 | 3.5e-3 |
+| 0.1 | 1 | Adam (all `beta2`) | 0.12–0.13 | 0.42–0.45 | ~5 / 1.2 / 1.0 / 0.98 | 4e-8 |
+| 0.1 | 1 | SGD | 0.12 | 0.78 | 1.20 / 1.05 / 0.99 / 0.98 | 1e-4 |
+| 0.1 | 2 | Adam (all `beta2`) | 0.066–0.069 | 0.34–0.37 | ~2 / 1.6–2.0 / 1.0 / 0.98 | 4e-8 |
+| 0.1 | 2 | SGD | 0.053 | 0.67 | 0.87 / 1.13 / 1.01 / 0.99 | 1e-4 |
+
+All 8 classes are learned in every run.
+- **`K = Id`:**
+  - SGD reaches `R/2` first: `eta_SGD = 3` against 0.3 for Adam.
+  - Adam overtakes in the middle, with a local exponent of 1.2–1.4 against SGD's 0.7–0.8.
+  - By `t ~ 100` Adam has flattened onto a floor. Its risk then **rises slightly** (exponent −0.07 to −0.11 at
+    `t = 1000`, `beta2 = 0.99` worst), and its last-decade class slopes are negative for the frequent classes.
+  - SGD is still descending at `t = 1000`.
+- **`K = 0.1 Id`** (separable): both reach an exponent of about 1 (`ell ~ 1/t`, as for logistic regression on
+  separable data), but Adam's prefactor is about 2500 times smaller (`R(1000)` 4e-8 against 1e-4).
+
+### Kink in the frozen drift at `Theta_0`
+
+Fits pool `alpha = 1` and `alpha = 2`, 16 classes per `beta2`.
+
+| `beta2` | free SBPL slopes (rare / frequent) | free `pi_b / kink_F` | fixed (1, ½) `pi_b / kink_F` | `alpha` overlap |
+|---|---|---|---|---|
+| 0.9 | 0.99 / 0.49 | 1.15 | 1.06 | 0.4% |
+| 0.95 | 0.99 / 0.50 | 1.08 | 1.05 | 0.6% |
+| 0.99 | 0.99 / 0.51 | 1.07 | 1.05 | 0.2% |
+
+- **The law of E1 holds at `C = 8`, but only with `F`.** `F = 0.65`, 0.74 and 0.59, so without it the predicted
+  kinks would be 2.3, 1.8 and 2.9 times too small.
+- **The background term `b/C^2` dominates `F`.** This is the first measurement of `F` at small `C`; E1 measured it
+  at `C = 128`.
+- **SGD** equals `r^2 pi (1 - 1/C)` to 4 digits.
+- **`kappa = 0.1`** gives identical numbers, as the rescaling predicts.
+
+### Kink along the trajectories (`t_c` at ½)
+
+| quantity | `K = Id` | `K = 0.1 Id` |
+|---|---|---|
+| Adam/SGD ratio break `pi_b / kink_F` (m0) | 1.11, 1.23, 1.65 (`alpha` = 1); 1.03, 1.13, 0.87 (`alpha` = 2) | 1.11, 1.24, 1.88; 0.60, 0.68, 0.78 |
+| ratio level / predicted rare plateau `10 (1-1/C) sqrt(kappa)/(coef_beta F)` | 0.73–1.14 | 0.63–1.25 |
+| free `t_c` broken line, slopes above / below the break (m0) | −0.71 to −0.78 / −0.82 to −1.16 | −0.65 to −0.71 / −0.67 to −0.79 |
+
+The `beta2`-pair ratio `t_c(0.9)/t_c(0.95)` on the rare side (π < kink_F/3; m0, `alpha = 2`, 4 classes) is
+1.003 (`K = Id`) and 0.982 (`K = 0.1 Id`). The predictions are 0.947 with the full `coef_beta`, and 1.41 for the
+plan's `1/sqrt(1-beta2)` rare law. The window ratio is 0.97.
+
+- **The Adam/SGD ratio** places the break within 0.6–1.9 of `kink_F` and its level within 0.6–1.25 of the
+  zero-parameter prediction.
+- **Eight classes give only 2–5 classes per side.** These are order-of-magnitude confirmations; `C = 32` is the
+  real test.
+- **`beta2 = 0.9` and 0.95 are indistinguishable**, as `kappa_beta` predicts (equal kinks, rare prefactors within
+  5%). The naive `(1 - beta2)` scaling is ruled out.
+- **At `K = 0.1 Id` the `t_c` slopes are shallower on both sides.** Learning is fast relative to the Adam memory, so
+  half-loss times fall in `t < 1`.
+
+### ODE vs simulation (m0): time lag `t_sim(R)/t_ode(R)` at fixed risk, `t >= 1`
+
+| | D = 1000 | D = 2000 | D = 4000 |
+|---|---|---|---|
+| `K = Id`, Adam (all `beta2`, `alpha`) | 1.018–1.038 (median) | 1.012 (`alpha = 2`, 0.99) | 1.002 |
+| `K = Id`, SGD | 0.995–1.006 | | |
+| `K = 0.1 Id`, Adam | 1.11–1.35 | 1.16 | 1.06 |
+| `K = 0.1 Id`, SGD | 0.999 | | |
+
+The sup relative risk gap first used here is misleading for `K = 0.1 Id`. It reaches 170–1460% only because the
+risk falls 4 decades between `t = 1` and 10, so a 30% time lag becomes a factor of 4.6 in `R`. The time lag at
+fixed risk is the metric used from now on.
+
+- **The gap is finite-D and closes as `1/D`.** The excess lag is 2.5%, 1.5% and 0.4% (`K = Id`) and 29%, 16% and
+  6% (`K = 0.1 Id`) at `D` = 1000, 2000 and 4000.
+- **Its 10 times larger coefficient at `K = 0.1 Id`** matches the mean energy per coordinate `r'^2/D` that Adam's
+  normalisation sees and the ODE drops (`r'^2 = 250` against 25).
+- **SGD has no such term.** It agrees at 0.1%.
+- **The ODE is correct in the limit.** Absolute times of `D = 1000` simulations at `K = 0.1 Id`, including all of
+  M1 there, are about 30% slow. Comparisons at equal `D` (m1 against m0) are unaffected.
+- **Before `t = 1`** the simulations run ahead: Adam's warm-up without bias correction, as in E0. This also closes
+  with `D`.
+
+### Bias model (m1, simulation)
+
+| | `K = Id` | `K = 0.1 Id` |
+|---|---|---|
+| median `t_c(m1)/t_c(m0)` | 0.96–1.07 | 0.98–1.05 |
+| `R(1000)`, `t(R/2)` | equal to m0 within 1–4% | equal |
+| learned bias at `T`: corr / slope of `beta - mean` against `log pi - mean` | Adam +0.84 to +1.00 / 0.11–0.31 (largest at `beta2 = 0.99`); SGD +0.91 to +0.96 / 0.06 | Adam −0.8 to −0.99 / −0.01; SGD +1.00 / 0.03 |
+
+**Frozen bias drift at the initial state** (chains, at least 1.4e6 own events per class; positive values push
+`beta_c` down):
+- **Adam is sign-like.**
+  - Class 1: −0.43 to −0.74 (SGD −0.24 to −0.53).
+  - Rarest class: +0.37 to +0.86 (SGD +0.08 to +0.11).
+  - The sign changes at `pi ≈ 0.11–0.15`, at the same place as SGD (`1/C = 0.125`).
+- **At the calibrated state `beta = log pi`:**
+  - SGD's drift vanishes, as it must (`E p = pi`).
+  - Adam keeps pushing the rare biases down: +0.54, +0.35 and +0.06 at the rarest class for `beta2` = 0.9, 0.95
+    and 0.99 (`alpha = 2`).
+  - This is the predicted over-suppression of rare biases. It is strongest at short memory, where own events stop
+    dominating `v`.
+
+At `C = 8` the bias barely changes per-class learning (within ±7%). The weights carry the class structure, and the
+learned biases move only 6–31% of the way towards the Bayes offsets `log pi` by `t = 1000`. At `K = 0.1 Id` the
+data are separable and the bias does nothing measurable.
+
+**Checkpoint 1.**
+- The frozen kink law, including `F`, holds at `C = 8`, and `kappa_beta` is confirmed by the 0.9/0.95 pair.
+- The trajectory kink is resolved only roughly with 8 classes.
+- The ODE is validated at `D = 1000` for `K = Id` (≤ 4% time lag, closing as `1/D`). At `K = 0.1 Id` the
+  simulations carry a 30% finite-D lag.
+- No stall at `C = 8`, but Adam's risk rises late at `K = Id`.

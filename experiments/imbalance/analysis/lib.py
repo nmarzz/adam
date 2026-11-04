@@ -172,6 +172,20 @@ def slope_at(time, loss, tc):
     return out
 
 
+def time_lag(t_sim, R_sim, t_ode, R_ode, t_from=1.0, n=12):
+    """``t_sim(R)/t_ode(R)`` at ``n`` risk levels log-spaced from ``R_ode(t_from)`` down
+    to ``1.5 R_ode(T_sim)`` (past the warm-up; meaningful also on steep curves).
+    Returns (levels, ratios)."""
+    hi = float(np.interp(np.log(t_from), np.log(t_ode[1:]), R_ode[1:]))
+    lo = 1.5 * float(np.interp(np.log(t_sim[-1]), np.log(t_ode[1:]), R_ode[1:]))
+    if not hi > lo:
+        return np.array([]), np.array([])
+    levels = np.geomspace(hi, lo, n)
+    ratio = np.array([first_crossing(t_sim, R_sim, l) / first_crossing(t_ode, R_ode, l)
+                      for l in levels])
+    return levels, ratio
+
+
 def stall_diagnostics(time, loss):
     learned = np.isfinite(level_times(time, loss, 0.5))
     above = loss[-1] > loss[0]

@@ -107,7 +107,8 @@ def kink_fits():
                             rb = lib.ratio_break(pi[ok], ta[ok] / ts[ok])
                             rec["ratio"] = rb
                             line += (f" {rb['n']} ({rb['n_above']}/{rb['n_below']}) |"
-                                     f" {rb['pi_b']:.3g}{'' if rb['interior'] else '*'} |"
+                                     f" {rb['pi_b']:.3g}{'' if rb['interior'] else '*'}"
+                                     f"{'' if min(rb['n_above'], rb['n_below']) >= 2 else '†'} |"
                                      f" {rb['pi_b'] / k0:.2f} | {rb['pi_b'] / kF:.2f} |"
                                      f" {rb['level'] / rare_pred:.2f} |")
                             br = lib.tc_breaks(pi[ok], ta[ok])
@@ -121,7 +122,8 @@ def kink_fits():
                             line += f" {int(ok.sum())} | unresolved | | | | | |"
                         NUM["kink"][key(model, kappa, C, alpha, b2)] = rec
                         print(line)
-    print("\n(* = break outside the fitted pi range; kink_F = kappa_beta(1-beta2)/(b F^2))")
+    print("\n(* = break outside the fitted pi range; † = fewer than 2 classes on one side;"
+          " kink_F = kappa_beta(1-beta2)/(b F^2))")
 
 
 def beta2_pairs():
@@ -231,9 +233,9 @@ def frozen_bias():
 # --------------------------------------------------------------------------- #
 def validation():
     print("\n## m0: ODE vs simulation\n")
-    print("| kappa | C | alpha | opt | D | sup_t>=1 |R_sim-R_ode|/R_ode (z) | mean log(t_c sim/ode)"
-          " +- se (n) | learned sim/ode |")
-    print("|---|---|---|---|---|---|---|---|")
+    print("| kappa | C | alpha | opt | D | T_sim | time lag t_sim/t_ode at fixed R (t>=1): median [min, max]"
+          " | sup_t>=1 |R_sim-R_ode|/R_ode (z) | mean log(t_c sim/ode) +- se (n) | learned sim/ode |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
     for kappa in I.KAPPAS:
         for C in I.CLASSES:
             for alpha in I.ALPHAS:
@@ -241,11 +243,8 @@ def validation():
                     ode = lib.load_ode("m0", opt, kappa, C, alpha, b2)
                     if ode is None:
                         continue
-                    for D in (1000, 4000):
-                        for T in (None, 300.0):
-                            sim = lib.load_sim("m0", opt, kappa, C, alpha, b2, D=D, T=T)
-                            if sim is not None:
-                                break
+                    for D, T in ((1000, None), (2000, 100.0), (4000, 100.0), (4000, 300.0)):
+                        sim = lib.load_sim("m0", opt, kappa, C, alpha, b2, D=D, T=T)
                         if sim is None:
                             continue
                         pi = sim["priors"]
@@ -268,12 +267,18 @@ def validation():
                         k_end = int(np.argmin(np.abs(ode["time"] - t[-1])))
                         learned_o = int(np.isfinite(lib.level_times(ode["time"][:k_end + 1],
                                                                     ode["loss"][:k_end + 1])).sum())
-                        NUM["validation"][key(kappa, C, alpha, label(opt, b2), D)] = {
+                        _, lag = lib.time_lag(t, Rs, ode["time"], ode["loss"] @ pi)
+                        lag_s = (f"{np.median(lag):.3f} [{lag.min():.3f}, {lag.max():.3f}]"
+                                 if len(lag) else "–")
+                        NUM["validation"][key(kappa, C, alpha, label(opt, b2), D, int(t[-1]))] = {
+                            "lag_median": float(np.median(lag)) if len(lag) else np.nan,
+                            "lag_min": float(lag.min()) if len(lag) else np.nan,
+                            "lag_max": float(lag.max()) if len(lag) else np.nan,
                             "sup_rel": float(rel[k]), "z": float(z), "t_sup": float(t[k]),
                             "log_tc": mean_lr, "log_tc_se": se_lr, "n": int(ok.sum()),
                             "learned_sim": learned_s, "learned_ode": learned_o}
                         print(f"| {kappa:g} | {C} | {alpha:g} | {label(opt, b2)} | {D} |"
-                              f" {rel[k]:.3f} ({z:+.1f}) at t={t[k]:.3g} |"
+                              f" {t[-1]:.0f} | {lag_s} | {rel[k]:.3f} ({z:+.1f}) at t={t[k]:.3g} |"
                               f" {mean_lr:+.3f} +- {se_lr:.3f} ({ok.sum()}) |"
                               f" {learned_s}/{learned_o} |")
 

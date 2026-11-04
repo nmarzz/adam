@@ -67,6 +67,7 @@ def sim_band(ax, sim, c, ls="-", lw=0.0, alpha=0.22, line=False):
     m, se = R.mean(0), R.std(0, ddof=1) / np.sqrt(len(R))
     k = t > 0
     ax.fill_between(t[k], (m - 2 * se)[k], (m + 2 * se)[k], color=c, alpha=alpha, lw=0)
+    ax.plot(t[k][::6], m[k][::6], "o", color=c, ms=3.5, mfc="none", mew=0.9)
     if line:
         ax.plot(t[k], m[k], color=c, ls=ls)
 
@@ -106,7 +107,7 @@ def fig_risk():
                 if not drawn:
                     plt.close(fig)
                     continue
-                src = "ODE (lines), 16 sims ±2 s.e. (bands)" if model == "m0" else \
+                src = "ODE (lines), 16-sim mean (○) ±2 s.e. (band)" if model == "m0" else \
                     "16-run mean ± 2 s.e. (bias model, simulation)"
                 fig.suptitle(f"{'no bias' if model == 'm0' else 'with bias'}, K = {kappa:g}·I,"
                              f" α = {alpha:g}: {src}; grey = t < 1", fontsize=12)
@@ -207,7 +208,7 @@ def fig_classes():
                     sm = plt.cm.ScalarMappable(norm=norm, cmap=CLASS_CMAP)
                     fig.colorbar(sm, ax=axes[:len(curs)].tolist(), label="π_c", pad=0.01)
                     fig.suptitle(f"{'no bias (ODE)' if model == 'm0' else 'with bias (sim mean)'},"
-                                 f" K = {kappa:g}·I, C = {C}, α = {alpha:g}", fontsize=12)
+                                 f" K = {kappa:g}·I, C = {C}, α = {alpha:g}", fontsize=12, y=1.06)
                     save(fig, f"B_classes_{model}_k{kappa:g}_a{alpha:g}_C{C}")
 
 
@@ -243,14 +244,16 @@ def fig_rates():
                                 a.axvline(lib.kink(b2, C), color=c, ls=":", lw=1)
                     # guides through the SGD and Adam head
                     sg = lib.curves(model, "sgd", kappa, C, alpha)
-                    if sg is not None:
+                    ad = lib.curves(model, "adam", kappa, C, alpha, I.BETA2S[-1])
+                    if sg is not None and ad is not None:
                         pi = sg["priors"]
                         tcs = lib.level_times(sg["time"], sg["loss"], 0.5)
+                        tca = lib.level_times(ad["time"], ad["loss"], 0.5)
                         x = np.geomspace(pi.min(), pi.max(), 50)
-                        ax.plot(x, tcs[0] * (x / pi[0]) ** -1.0, color=MUTED, ls="--", lw=1,
-                                label="slope −1")
-                        ax.plot(x, tcs[0] * (x / pi[0]) ** -0.5 / 3, color=MUTED, ls="-.", lw=1,
-                                label="slope −½")
+                        ax.plot(x, 0.7 * tcs[0] * (x / pi[0]) ** -1.0, color=MUTED, ls="--",
+                                lw=1, label="slope −1")
+                        ax.plot(x, 0.7 * tca[0] * (x / pi[0]) ** -0.5, color=MUTED, ls="-.",
+                                lw=1, label="slope −½")
                     ax.set(xscale="log", yscale="log", xlabel="π_c", ylabel="t_c (ℓ_c = ℓ_c(0)/2)",
                            title=f"C = {C}")
                     ax2.set(xscale="log", xlabel="π_c", ylabel="−d log ℓ_c/d log t",
@@ -328,7 +331,8 @@ def fig_kink():
                 kF = lib.kink(b2, C)
                 for alpha in I.ALPHAS:
                     rat = ratio_fit(model, kappa, C, alpha, b2)
-                    if rat is not None and rat["interior"]:
+                    if (rat is not None and rat["interior"] and rat["n_above"] >= 2
+                            and rat["n_below"] >= 2):
                         b.plot(kF, rat["pi_b"], mk, color=BLUE[b2], ms=6,
                                mfc="none" if kappa < 1 else BLUE[b2])
             if model == "m0" and kappa == 1.0:
@@ -344,7 +348,7 @@ def fig_kink():
     b.plot(x, x, color=MUTED, lw=1)
     b.fill_between(x, x / 2, x * 2, color="0.9", lw=0)
     b.set(xscale="log", yscale="log", xlabel="predicted κ_β(1−β₂)/(bF²)", ylabel="fitted π_b",
-          title="(b) kink: ★ frozen, ● ratio fit (open: K = 0.1·I)")
+          title="(b) kink: ★ frozen, ratio fit ●■ no bias ◆▲ bias (≥2 classes/side)")
     # (c) t_A/t_S vs pi at C = 32 with predicted asymptotes
     for alpha in I.ALPHAS:
         for kappa in I.KAPPAS:
@@ -461,22 +465,20 @@ def fig_validation():
                     ode = lib.load_ode("m0", opt, kappa, C, alpha, b2)
                     if ode is None:
                         continue
-                    for D, mk in ((1000, "o"), (4000, "s")):
-                        for T in (None, 300.0):
-                            sim = lib.load_sim("m0", opt, kappa, C, alpha, b2, D=D, T=T)
-                            if sim is not None:
-                                break
+                    for D, T, mk in ((1000, None, "o"), (2000, 100.0, "^"), (4000, 100.0, "s"),
+                                     (4000, 300.0, "s")):
+                        sim = lib.load_sim("m0", opt, kappa, C, alpha, b2, D=D, T=T)
                         if sim is None:
                             continue
                         drawn = True
                         pi, t = sim["priors"], sim["time"]
                         Rs = (sim["loss"] @ pi).mean(0)
-                        Ro = lib.interp_log(t, ode["time"], ode["loss"] @ pi)
-                        m = t >= 1
-                        rel = (Rs - Ro) / Ro
-                        k = np.argmax(np.abs(np.where(m, rel, 0)))
-                        a.plot(x, rel[k], mk, color=color(opt, b2),
-                               mfc="none" if kappa < 1 else color(opt, b2), ms=6)
+                        _, lag = lib.time_lag(t, Rs, ode["time"], ode["loss"] @ pi)
+                        if len(lag):
+                            a.errorbar(x, np.median(lag) - 1,
+                                       yerr=[[np.median(lag) - lag.min()], [lag.max() - np.median(lag)]],
+                                       fmt=mk, color=color(opt, b2), ms=6, lw=1,
+                                       mfc="none" if kappa < 1 else color(opt, b2))
                         tc_s = lib.level_times(t, sim["loss"].mean(0))
                         tc_o = lib.level_times(ode["time"], ode["loss"])
                         ok = np.isfinite(tc_s) & np.isfinite(tc_o) & (tc_o >= 1)
@@ -489,8 +491,8 @@ def fig_validation():
         plt.close(fig)
         return
     a.axhline(0, color=MUTED, lw=0.8)
-    a.set(xlabel="configuration (grouped by κ, C, α)", ylabel="signed max (R_sim − R_ode)/R_ode, t ≥ 1",
-          title="(a) risk gap (●: D = 1000, ■: D = 4000; open: K = 0.1·I)")
+    a.set(xlabel="configuration (grouped by κ, C, α)", ylabel="t_sim(R)/t_ode(R) − 1 (median, range)",
+          title="(a) time lag at fixed risk, t ≥ 1 (●: D = 1000, ▲: 2000, ■: 4000; open: K = 0.1·I)")
     a.set_xticks(range(len(labels)))
     a.set_xticklabels(labels, rotation=60, fontsize=7, ha="right")
     b.axhline(1, color=MUTED, lw=0.8)
