@@ -50,9 +50,10 @@ def name(opt, b2):
 
 
 def save(fig, stem):
+    # explicit suffixes: with_suffix() would cut names such as "..._k0.1_a2" at the "."
+    fig.savefig(FIG / f"{stem}.pdf", bbox_inches="tight", metadata={"CreationDate": None})
+    fig.savefig(FIG / f"{stem}.png", dpi=130, bbox_inches="tight")
     path = FIG / stem
-    fig.savefig(path.with_suffix(".pdf"), bbox_inches="tight", metadata={"CreationDate": None})
-    fig.savefig(path.with_suffix(".png"), dpi=130, bbox_inches="tight")
     plt.close(fig)
     print(f"saved {path}.{{pdf,png}}")
 
@@ -117,7 +118,9 @@ def fig_risk():
                 save(fig, f"A_risk_{model}_k{kappa:g}_a{alpha:g}")
 
     # overlays (no-bias ODE): K = I vs 0.1 I; base vs tuned eta at each kappa
-    for which in ("kappa", "tuned_k1", "tuned_k0.1"):
+    tuned = [f"tuned_k{k:g}" for k in I.KAPPAS if I.ETA_FILE.exists()
+             and any(I.eta_of(o, k, "tuned") != I.ETA[o] for o in ("adam", "sgd"))]
+    for which in ["kappa"] + tuned:
         fig, axes = plt.subplots(2, len(I.CLASSES), figsize=(5 * len(I.CLASSES), 7),
                                  sharex=True)
         drawn = False

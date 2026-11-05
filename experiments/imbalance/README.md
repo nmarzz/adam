@@ -423,3 +423,157 @@ It now seeds the solver from a dense scan.
 - **The late rise of Adam's risk at `C = 8`, `K = Id`.**
 - **Learning rates tuned per `kappa`.** At `K = 0.1 Id` the fixed `eta` favours Adam, whose effective step does not
   shrink with the noise.
+
+## Stage 3: next steps (2026-11-04/05)
+
+The bias model is dropped from here on, since it added cost but no insight. Its Stage 1–2 figures were moved to
+`analysis/bias_model_stages1-2/`. This stage adds:
+- `beta2 = 0.999` at every `C`;
+- `C = 128` (both `alpha`, both `kappa`);
+- learning rates tuned per noise level;
+- a diagnosis of the offset of the trajectory kink.
+
+Commands: `figs/experiments/imbalance/logs/stage3.sh`. GPU time was about 2.8 h: 16:00–22:51 wall time, including two
+probes that hung on compilation (below).
+
+### Engineering
+
+- **Compile time at `C = 128`.** One psi-route coefficient evaluation compiled for 496 s (12 s at `C = 32`); inside
+  the ODE loop the first probe was still compiling after 25 min. The cause is the path layout.
+  - With the default `chunk_elements = 2^25`, the 256 paths are split into 3 chunks, and XLA compiles the
+    resulting short outer scan very slowly.
+  - `imbalance.adam_plan` uses a single chunk (`2^27`) for `C > 32`. Compilation drops to 89 s, and a call costs
+    0.31 s instead of 0.38 s.
+  - `C <= 32` keeps the old layout, so its runs are bit-identical.
+  - A persistent JAX compilation cache (`figs/experiments/imbalance/jaxcache`) lets runs that differ only in
+    `kappa` or `alpha` reuse compiled code.
+  - **Cost:** a `C = 128` Adam run to `T = 316` takes 300–600 Heun steps in 3.5–12 min, compilation included.
+- **Learning-rate sets.** Runs now carry an `etaset` (`base` or `tuned`, from `eta_tuned.json`). A run whose `eta`
+  exceeds the base value records from `t = 10^-k`, so that fast-learned classes are resolved. The first tuned runs
+  recorded from `t = 0.01`; their head classes were learned before the first record time, which made the kink
+  fits meaningless. They were rerun.
+- **Margin drifts.** `frozen` also stores the drift of the logit margin `O_cc - mean_{k != c} O_kc`, taken from the
+  full drift matrix `-(phi^T O + r^2 chi^T)`.
+- **Diagnostic.** `offset` decomposes `t_A/t_S` (below).
+- **Bug fix in `figures.py`.** `Path.with_suffix` truncated names such as `C_rates_m0_k0.1_a1` to `C_rates_m0_k0`,
+  so the `alpha = 1` and `alpha = 2` panels for `K = 0.1 Id` overwrote each other, in Stages 1–2 as well. All
+  figures were regenerated.
+- **Recheck.** `recheck.py` reproduces all `t_c` and `R(T)` exactly and the ratio breaks within 0.7%; no flags.
+
+### Learning rates per noise level
+
+Tuning uses `C = 32`, `alpha = 1.5` and `beta2 = 0.99`, with criterion `R(t = 100)`.
+
+| | ODE grid | ODE optimum | simulation at `D = 1000` (16 runs) | adopted (`tuned`) |
+|---|---|---|---|---|
+| `K = Id`, Adam | 0.1–3 | 0.3 | 0.3 (R(100) = 0.034) | 0.3 |
+| `K = Id`, SGD | 0.3–30 | 3 | 3 (0.032) | 3 |
+| `K = 0.1 Id`, Adam | 0.1–100 | 10 (30 rises late, 100 stalls at 2e-3) | 10 (5.8e-8) | 10 |
+| `K = 0.1 Id`, SGD | 0.3–1000 | none: `R ∝ 1/eta` up to 1000 | 300 (5.0e-5); at 1000 the simulation leaves the ODE (`R(10)` 18x higher) | 300 |
+
+- **At `K = Id`** tuning reproduces the E-series values in both the ODE and the simulation.
+- **At `K = 0.1 Id` the ODE limit has no SGD optimum.** Separable, almost noiseless SGD is time-rescaled gradient
+  flow. The finite-`D` process caps it, because the logit change per step on the next sample, about
+  `eta kappa / sqrt(D)`, must stay small. Adam has a genuine optimum, because its normalised noise does not vanish
+  with the gradient.
+- **Tuning narrows Adam's low-noise advantage without removing it.**
+  - At `t = 100` (`C = 32`, `alpha = 1.5`, simulation): `R_A/R_S` is 1/2600 at base rates and 1/860 at tuned
+    rates.
+  - The tuned ODE runs give `R_A/R_S ≈ 1/900` late for every `C <= 32` and `alpha`.
+  - The exception is `beta2 = 0.999` at `eta = 10`: its risk rises late at `C = 32`, to 5–14 times SGD's by
+    `t = 1000`.
+- **Retuning `eta` does not move the kink.** The trajectory ratio breaks at `K = 0.1 Id` are 0.82–1.29 `kink_F`
+  (tuned) against 0.86–1.26 (base) at `C = 32`, as theory says: the kink depends on `beta2`, not on `eta`.
+
+### C = 128 (`T = 316` for Adam with `beta2 <= 0.99`, 1000 for 0.999; `10^4` for SGD)
+
+| `kappa` | `alpha` | Adam `beta2` 0.9 / 0.95 / 0.99 / 0.999: classes learned, `R(T)` | SGD | `R_A/R_S` at t = 1 / 10 / 100 / 316 |
+|---|---|---|---|---|
+| 1 | 1 | **27 / 31 / 77 / 128**; 1.39 / 1.30 / 0.63 / 0.099 | 128; 0.043 (`10^4`) | 1.3 / 1.7 / 8.6 / 18 (0.9); 1.2 / 0.85 / 0.89 / 1.4 (0.999) |
+| 1 | 2 | 22 / 22 / 27 / 57; 0.14 / 0.14 / 0.11 / 0.061 | 128; 0.011 | 1.6 / 1.3 / 1.8 / 2.8 (0.9); 1.6 / 0.84 / 0.97 / 1.4 (0.999) |
+| 0.1 | 1 | all 128 | 128 | 0.85 / 0.51 / 7e-4 / 4e-4 (0.9); 0.67 / 0.018 / 3e-4 / 3e-4 (0.999) |
+| 0.1 | 2 | 115 / 113 / 128 / 128 | 128 | 0.69 / 0.55 / 0.40 / 0.23 (0.9); 0.55 / 0.27 / 0.08 / 1.7e-3 (0.999) |
+
+- **`alpha = 1`, `K = Id`: a genuine fixed point at short memory.**
+  - At `beta2` 0.9 and 0.95 Adam stops with 27–31 of 128 classes learned.
+  - The gaps are stationary to 5e-4 and 1.3e-3 (E4's criterion), and the late risk exponent is 0.00.
+  - The risk is 18 times SGD's at `t = 316`.
+  - Here the stuck classes are only moderately rare (`pi` from 1.4e-3 to about 7e-3). At `alpha = 2`, `C = 128`
+    the stall is still moving (stationarity 0.11).
+  - `beta2 = 0.99` learns 77 classes and is still moving. `beta2 = 0.999` learns all 128 by `t = 1000`.
+  - Memory length, not imbalance alone, decides whether Adam gets stuck.
+- **`alpha = 2`, `K = Id`: the rarest classes get worse first.**
+  - 55–93 classes end above their initial loss.
+  - `beta2 = 0.999` is the best Adam and still trails SGD at `t >= 100`.
+- **`K = 0.1 Id`**: every class is learned except 13–15 of the rarest at `alpha = 2`, `beta2 <= 0.95`. Adam's risk
+  ends 3–5000 times below SGD's.
+- **Frozen kink at `C = 128`:** within 1–3% of `kappa_beta (1-beta2)/(b F^2)` for all four `beta2` (free slopes
+  1.00 / 0.50). This reproduces E1a.
+- **Validation at `D = 1000`, `C = 128`, `alpha = 2`:**
+  - The time lag is 1.011 (Adam 0.99) and 1.007 (SGD).
+  - At `beta2 = 0.999` the median lag is 0.98, but the minimum is 0.41: Adam's memory (1000 steps = 1 time unit) is
+    not separated from the dynamics at `D = 1000`, so the warm-up dominates early.
+
+### `beta2 = 0.999`
+
+- **Frozen kink:** within 0–11% of `kink_F` at `C = 32` and 128. At `C = 8` the kink (0.023) lies at the rare
+  edge of the class range.
+- **Trajectory kink:** the ratio break is 1.79 `kink_F` (`C = 32`, `alpha = 2`) and 2.7 (`C = 128`, `alpha = 2`).
+  The `alpha = 1` fits are not meaningful, because the rare side is barely in range.
+- **`t_c(0.99)/t_c(0.999)` on the rare side** can be measured only at `K = 0.1 Id`, where the `beta2 = 0.99` tail is
+  not stalled: 1.99 (`C = 32`) and 2.17 (`C = 128`), against 3.03 predicted. The window ratio is 0.97–1.04.
+
+### Why the trajectory kink sits above the frozen one (`offset`, `F_offset.png`)
+
+The half-loss time factorises as `t_c = O_cc(t_c) / vbar_c`, where `vbar_c` is the drift averaged along the path.
+So `log(t_A/t_S)` splits into three parts:
+- the **frozen ratio at `Theta_0`**;
+- an **overlap factor**: how much `O_cc` Adam needs at `t_c` relative to SGD;
+- a **path factor**: how far the averaged drift has fallen below its value at `Theta_0`, relative to SGD.
+
+Medians at `C = 32`, `K = Id`, `alpha = 2` (log units):
+
+| `beta2` | band | total | frozen | overlap | path |
+|---|---|---|---|---|---|
+| 0.9 | head (u > 3) | +1.51 | +2.05 | −0.48 | −0.07 |
+| 0.9 | tail (u < 1/3) | +1.01 | +0.82 | −0.25 | +0.43 |
+| 0.99 | head | +1.09 | +1.38 | −0.23 | −0.07 |
+| 0.99 | tail | +0.72 | +0.28 | −0.05 | +0.44 |
+
+- **The margin is equal at `t_c`.** `O_cc - mean O_kc` agrees between Adam and SGD to 1.00–1.03 in the head and
+  near the kink. Adam reaches it with 20–40% less `O_cc`, because its normalisation amplifies the small background
+  gradient `f_k = p_k ≈ 1/C` on the other columns. That pushes the competitors' overlaps `O_kc` down. SGD makes
+  this push about `pi_c / C`; Adam makes it a significant fraction of the own-class push.
+- **At `Theta_0`** this shows up directly. Adam's margin drift is 1.44–1.75 times its `O_cc` drift in the head and
+  1.03–1.21 times in the tail; for SGD the factor is `1/(1 - 1/C)`.
+- **Along the path at `K = Id`**, Adam's rare-class drift decays: the path factor is +0.25 to +0.44, i.e. 1.3–1.55
+  times, and far more in the stall zone. This is the restoring term behind the stall. At `K = 0.1 Id` the path
+  factor is −0.05 to −0.10 everywhere.
+- **Both effects tilt `t_A/t_S`.** Adam gains in the head and loses in the tail, and the break moves to larger `pi`.
+- **Replacing the `O_cc` drift by the margin drift** in the frozen prediction (the same broken-line fit, same
+  classes), at `K = Id`:
+
+  | | `C = 32` | `C = 128` |
+  |---|---|---|
+  | measured break / margin prediction | 1.07–1.40 | 1.11–1.61 |
+  | measured break / `O_cc` prediction | 1.5–2.1 | 1.6–2.7 |
+
+  The leftover factor is the path decay of the tail. At `K = 0.1 Id` the measured break sits below the margin
+  prediction (0.53–0.95), because there is no path decay and the overlap factor favours Adam in the tail too.
+
+## Summary (revised, 2026-11-05; C ∈ {8, 32, 128}, beta2 ∈ {0.9, 0.95, 0.99, 0.999}, b = 1)
+
+| question | answer |
+|---|---|
+| Risk vs time | **`K = Id`:** the advantage shifts to SGD as imbalance and `C` grow. At `C = 8` Adam leads mid-training. At `C = 32` and 128 SGD is ahead at nearly all times, by up to 18 times at `C = 128`, `alpha = 1`, `beta2 <= 0.95`, where Adam is stuck. Longer memory (`beta2 = 0.999`) is the best Adam everywhere and roughly ties SGD up to `t ~ 100`. **`K = 0.1 Id`:** Adam wins by 3–4 decades late. With learning rates tuned for the noise level (Adam 10, SGD 300) Adam is still about 900 times better. |
+| Per-class rates | At `Theta_0`, Adam's drift has slope ½ in `pi` above the kink and 1 below; SGD's has slope 1 exactly. Along trajectories Adam's `t_c` scales as `pi^-0.6` to `pi^-0.8` in the head and `pi^-1` to `pi^-1.3` in the tail; SGD's as about `pi^-1`. At `K = Id`, short memory and large `C` turn the slow tail into a stall: a fixed point at `C = 128`, `alpha = 1`, `beta2 <= 0.95`. |
+| E1 kink | **At `Theta_0`:** within 0–15% of `kappa_beta (1-beta2)/(b F^2)` in all 12 (`C`, `beta2`) cases; `F` matters at small `C`. **Along trajectories:** it moves with `beta2` as predicted (0.95/0.99 ratio 2.8–3.2 against 2.97; 0.9 and 0.95 coincide) and does not depend on `eta`. At `K = Id` it sits 1.5–2.8 times above the `O_cc` prediction. **Most of that offset is the margin effect:** Adam's normalisation also pushes down competitor logits, which helps head classes most. Using the margin drift cuts the offset to 1.1–1.6; the remainder is the decay of the tail drift along the path (absent at `K = 0.1 Id`). |
+| `beta2` | Rare side: 0.9/0.95 = 0.96–1.01 (0.947 predicted), 0.95/0.99 = 1.72–1.75 (1.795), 0.99/0.999 = 2.0–2.2 (3.03, measurable only at `K = 0.1 Id`). The main practical effect is the stall: shorter memory gets stuck. |
+| Noise | `K = 0.1 Id` leaves the frozen kink unchanged, lowers the trajectory kink to at or below the frozen prediction, removes most of the stall, and makes Adam far better than SGD. At `D = 1000` it needs care: Adam has a finite-`D` lag of about `r'^2/D` (30% at `D = 1000`). |
+
+**Open questions.**
+- An analytic margin-drift kink: the `Theta_0` margin ratio needs `psi_k(1/C)` for the competitor columns.
+- Why `t_c(0.99)/t_c(0.999)` falls short of 3.03 on the rare side at `K = 0.1 Id`.
+- The fixed point at `C = 128`, `alpha = 1`, `beta2 <= 0.95`: its learned-class count against `beta2`, and whether
+  `beta2 = 0.99` reaches one too.
+- `D = 4000` simulations at `beta2 = 0.999`, where `D = 1000` is not in the high-dimensional regime.
