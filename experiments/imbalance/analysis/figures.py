@@ -28,7 +28,7 @@ plt.rcParams.update({"font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12
                      "xtick.labelsize": 10, "ytick.labelsize": 10, "legend.fontsize": 9,
                      "lines.linewidth": 1.6})
 
-BLUE = {0.9: "#6da7ec", 0.95: "#2a78d6", 0.99: "#104281"}
+BLUE = {0.9: "#6da7ec", 0.95: "#2a78d6", 0.99: "#1c5cab", 0.999: "#0d366b"}
 SGD_C = "#eb6834"
 INK, MUTED = "#0b0b0b", "#52514e"
 CLASS_CMAP = LinearSegmentedColormap.from_list(
@@ -79,7 +79,8 @@ def fig_risk():
     for model in I.MODELS:
         for kappa in I.KAPPAS:
             for alpha in I.ALPHAS:
-                fig, axes = plt.subplots(2, 2, figsize=(10, 7), sharex="col",
+                fig, axes = plt.subplots(2, len(I.CLASSES), figsize=(5 * len(I.CLASSES), 7),
+                                         sharex="col",
                                          gridspec_kw={"height_ratios": [2, 1]})
                 drawn = False
                 for j, C in enumerate(I.CLASSES):
@@ -115,28 +116,30 @@ def fig_risk():
                 fig.tight_layout()
                 save(fig, f"A_risk_{model}_k{kappa:g}_a{alpha:g}")
 
-    # overlay: kappa (m0 ODE) and model (sims)
-    for which in ("kappa", "model"):
-        fig, axes = plt.subplots(2, 2, figsize=(10, 7), sharex=True)
+    # overlays (no-bias ODE): K = I vs 0.1 I; base vs tuned eta at each kappa
+    for which in ("kappa", "tuned_k1", "tuned_k0.1"):
+        fig, axes = plt.subplots(2, len(I.CLASSES), figsize=(5 * len(I.CLASSES), 7),
+                                 sharex=True)
         drawn = False
         for i, alpha in enumerate(I.ALPHAS):
             for j, C in enumerate(I.CLASSES):
                 ax = axes[i, j]
                 for opt, b2 in opts():
                     c = color(opt, b2)
-                    variants = ([("m0", 1.0, "-"), ("m0", 0.1, "--")] if which == "kappa"
-                                else [("m0", 1.0, "-"), ("m1", 1.0, "--")])
-                    for model, kappa, ls in variants:
-                        if which == "kappa":
-                            cur = lib.curves(model, opt, kappa, C, alpha, b2)
-                            if cur is None:
-                                continue
-                            t, R = cur["time"], risk_of(cur["loss"], cur["priors"])
-                        else:
-                            sim = lib.load_sim(model, opt, kappa, C, alpha, b2)
-                            if sim is None:
-                                continue
-                            t, R = sim["time"], risk_of(sim["loss"].mean(0), sim["priors"])
+                    if which == "kappa":
+                        variants = [(1.0, "base", "-"), (0.1, "base", "--")]
+                    else:
+                        kap = float(which.split("_k")[1])
+                        variants = [(kap, "base", "-"), (kap, "tuned", "--")]
+                    for kappa, es, ls in variants:
+                        if es == "tuned" and (not I.ETA_FILE.exists()
+                                              or f"{kappa:g}" not in I.json.loads(
+                                                  I.ETA_FILE.read_text())):
+                            continue
+                        cur = lib.curves("m0", opt, kappa, C, alpha, b2, etaset=es)
+                        if cur is None:
+                            continue
+                        t, R = cur["time"], risk_of(cur["loss"], cur["priors"])
                         drawn = True
                         k = t > 0
                         ax.plot(t[k], R[k], color=c, ls=ls)
@@ -152,11 +155,12 @@ def fig_risk():
         handles = [Line2D([], [], color=color(o, b), label=name(o, b)) for o, b in opts()]
         handles += ([Line2D([], [], color=INK, ls="-", label="K = I"),
                      Line2D([], [], color=INK, ls="--", label="K = 0.1·I")] if which == "kappa"
-                    else [Line2D([], [], color=INK, ls="-", label="no bias"),
-                          Line2D([], [], color=INK, ls="--", label="with bias")])
+                    else [Line2D([], [], color=INK, ls="-", label="E-series η (0.3 / 3)"),
+                          Line2D([], [], color=INK, ls="--", label="η tuned for this K")])
         axes[0, 0].legend(handles=handles, frameon=False, loc="lower left")
-        fig.suptitle("no-bias ODE: K = I vs K = 0.1·I" if which == "kappa"
-                     else "simulation (D = 1000, K = I): no bias vs bias", fontsize=12)
+        fig.suptitle("ODE: K = I vs K = 0.1·I" if which == "kappa"
+                     else f"ODE, K = {which.split('_k')[1]}·I: base vs tuned learning rates",
+                     fontsize=12)
         fig.tight_layout()
         save(fig, f"A_risk_{which}_overlay")
 
@@ -219,7 +223,7 @@ def fig_rates():
     for model in I.MODELS:
         for kappa in I.KAPPAS:
             for alpha in I.ALPHAS:
-                fig, axes = plt.subplots(3, 2, figsize=(10, 11))
+                fig, axes = plt.subplots(3, len(I.CLASSES), figsize=(5 * len(I.CLASSES), 11))
                 drawn = False
                 for j, C in enumerate(I.CLASSES):
                     ax, ax2, ax3 = axes[:, j]
@@ -265,6 +269,8 @@ def fig_rates():
                         if fr is not None:
                             pi = fr["priors"]
                             for b2 in I.BETA2S:
+                                if f"init_b2{b2:g}_adam" not in fr:
+                                    continue
                                 ax3.errorbar(pi, np.abs(fr[f"init_b2{b2:g}_adam"]),
                                              yerr=2 * fr[f"init_b2{b2:g}_adam_se"],
                                              color=BLUE[b2], marker="o", ms=4, lw=1)
@@ -307,13 +313,15 @@ def fig_kink():
     a, b, c, d, e, f = axes.ravel()
     drawn = False
     # (a) frozen collapse
-    for C, mk in zip(I.CLASSES, ("o", "s")):
+    for C, mk in zip(I.CLASSES, ("o", "s", "^")):
         for alpha in I.ALPHAS:
             fr = lib.load_frozen(1.0, C, alpha)
             if fr is None:
                 continue
             pi = fr["priors"]
             for b2 in I.BETA2S:
+                if f"init_b2{b2:g}_adam" not in fr:
+                    continue
                 drawn = True
                 u = pi / lib.kink(b2, C)
                 y = np.abs(fr[f"init_b2{b2:g}_adam"]) / (lib.R ** 2 * np.sqrt(pi))
@@ -324,8 +332,7 @@ def fig_kink():
           ylabel="frozen rate / (r² √π)", title="(a) frozen drift collapse (K = I)")
     a.legend(frameon=False)
     # (b) fitted vs predicted
-    for (model, kappa), mk in zip([("m0", 1.0), ("m0", 0.1), ("m1", 1.0), ("m1", 0.1)],
-                                  ("o", "s", "D", "^")):
+    for (model, kappa), mk in zip([("m0", 1.0), ("m0", 0.1)], ("o", "o")):
         for C in I.CLASSES:
             for b2 in I.BETA2S:
                 kF = lib.kink(b2, C)
@@ -338,7 +345,7 @@ def fig_kink():
             if model == "m0" and kappa == 1.0:
                 fz = [lib.load_frozen(1.0, C, al) for al in I.ALPHAS]
                 if all(x is not None for x in fz):
-                    for b2 in I.BETA2S:
+                    for b2 in [b for b in I.BETA2S if all(f"init_b2{b:g}_adam" in x for x in fz)]:
                         pis = np.concatenate([x["priors"] for x in fz])
                         rate = np.abs(np.concatenate([x[f"init_b2{b2:g}_adam"] for x in fz]))
                         fit = lib.fit_sbpl(pis, rate, fixed=(1.0, 0.5))
@@ -348,12 +355,14 @@ def fig_kink():
     b.plot(x, x, color=MUTED, lw=1)
     b.fill_between(x, x / 2, x * 2, color="0.9", lw=0)
     b.set(xscale="log", yscale="log", xlabel="predicted κ_β(1−β₂)/(bF²)", ylabel="fitted π_b",
-          title="(b) kink: ★ frozen, ratio fit ●■ no bias ◆▲ bias (≥2 classes/side)")
-    # (c) t_A/t_S vs pi at C = 32 with predicted asymptotes
-    for alpha in I.ALPHAS:
+          title="(b) kink: ★ frozen, ● ratio fit (open: K = 0.1·I; ≥2 classes/side)")
+    # (c) t_A/t_S vs pi at the largest C available (alpha = 2), with predicted asymptotes
+    Cc = max([C for C in I.CLASSES if lib.load_ode("m0", "sgd", 1.0, C, 2.0) is not None],
+             default=32)
+    for alpha in (2.0,):
         for kappa in I.KAPPAS:
             for b2 in I.BETA2S:
-                r = adam_sgd_ratio("m0", kappa, 32, alpha, b2)
+                r = adam_sgd_ratio("m0", kappa, Cc, alpha, b2)
                 if r is None:
                     continue
                 pi, ratio = r
@@ -361,11 +370,12 @@ def fig_kink():
                        mfc="none" if kappa < 1 else BLUE[b2])
     for b2 in I.BETA2S:
         for kappa in I.KAPPAS:
-            win, rare = lib.ratio_asymptotes(b2, 32, kappa)
-            x = np.geomspace(5e-4, 0.7, 100)
+            win, rare = lib.ratio_asymptotes(b2, Cc, kappa)
+            x = np.geomspace(0.5 * (np.arange(1, Cc + 1) ** -2.0 / np.sum(
+                np.arange(1, Cc + 1) ** -2.0)).min(), 0.7, 100)
             c.plot(x, np.maximum(win(x), rare), color=BLUE[b2], ls=DASH[kappa], lw=1)
     c.set(xscale="log", yscale="log", xlabel="π_c", ylabel="t_c(Adam) / t_c(SGD)",
-          title="(c) C = 32, no bias: ratio vs zero-parameter prediction")
+          title=f"(c) C = {Cc}, α = 2: ratio vs zero-parameter prediction")
     # (d) normalised ratio vs u, everything
     for model in I.MODELS:
         for kappa in I.KAPPAS:
@@ -384,10 +394,10 @@ def fig_kink():
     d.plot(u, np.maximum(1, 1 / np.sqrt(u)), color=MUTED, ls="--", lw=1, label="max(1, u^−½)")
     d.set(xscale="log", yscale="log", xlabel="u = π / kink_F",
           ylabel="(t_A/t_S) / window prediction",
-          title="(d) collapse (●: no bias, ◆: bias; open: K = 0.1·I)")
+          title="(d) collapse over C, α, β₂ (open: K = 0.1·I)")
     d.legend(frameon=False)
     # (e) beta2 pairs
-    for (ba, bb), mk in (((0.9, 0.95), "o"), ((0.95, 0.99), "s")):
+    for (ba, bb), mk in (((0.9, 0.95), "o"), ((0.95, 0.99), "s"), ((0.99, 0.999), "^")):
         p = lib.coef_beta(bb) / lib.coef_beta(ba)
         for kappa in I.KAPPAS:
             for C in I.CLASSES:
@@ -404,23 +414,23 @@ def fig_kink():
                   label=f"t_c({ba:g})/t_c({bb:g}) rare pred {p:.3f}")
     e.axhline(1, color=MUTED, lw=0.8)
     e.set(xscale="log", yscale="log", xlabel="π_c", ylabel="t_c ratio",
-          title="(e) β₂ pairs (●: .9/.95, ■: .95/.99), no bias")
+          title="(e) β₂ pairs (●: .9/.95, ■: .95/.99, ▲: .99/.999)")
     e.legend(frameon=False, fontsize=8)
-    # (f) m1 vs m0 t_c ratio (sims), K = I
-    for C, mk in zip(I.CLASSES, ("o", "s")):
-        for alpha in I.ALPHAS:
-            for opt, b2 in opts():
-                s0 = lib.load_sim("m0", opt, 1.0, C, alpha, b2)
-                s1 = lib.load_sim("m1", opt, 1.0, C, alpha, b2)
-                if s0 is None or s1 is None:
-                    continue
-                t0 = lib.level_times(s0["time"], s0["loss"].mean(0))
-                t1 = lib.level_times(s1["time"], s1["loss"].mean(0))
-                f.plot(s0["priors"], t1 / t0, mk, color=color(opt, b2), ms=4,
-                       mfc="none" if alpha == 1 else color(opt, b2))
-    f.axhline(1, color=MUTED, lw=0.8)
-    f.set(xscale="log", yscale="log", xlabel="π_c", ylabel="t_c(bias) / t_c(no bias)",
-          title="(f) effect of the bias (sims, K = I)")
+    # (f) measured t_A/t_S vs the frozen O_cc-drift and margin-drift ratios (K = I, alpha = 2)
+    fz = lib.load_frozen(1.0, Cc, 2.0)
+    for b2 in I.BETA2S:
+        r = adam_sgd_ratio("m0", 1.0, Cc, 2.0, b2)
+        if r is None or fz is None or f"init_b2{b2:g}_margin_adam" not in fz:
+            continue
+        pi_all = fz["priors"]
+        er = I.ETA["sgd"] / I.ETA["adam"]
+        fO = er * np.abs(fz[f"init_b2{b2:g}_sgd"]) / np.abs(fz[f"init_b2{b2:g}_adam"])
+        fM = er * np.abs(fz[f"init_b2{b2:g}_margin_sgd"]) / np.abs(fz[f"init_b2{b2:g}_margin_adam"])
+        f.plot(r[0], r[1], "o", color=BLUE[b2], ms=4)
+        f.plot(pi_all, fO, "-", color=BLUE[b2], lw=1)
+        f.plot(pi_all, fM, "--", color=BLUE[b2], lw=1)
+    f.set(xscale="log", yscale="log", xlabel="π_c", ylabel="t_c(Adam) / t_c(SGD)",
+          title=f"(f) C = {Cc}, K = I: measured (●), frozen O_cc (—), margin (--)")
     for ax in axes.ravel():
         polish_axis(ax)
     handles = [Line2D([], [], color=color(o, b), marker="o", ls="", label=name(o, b))

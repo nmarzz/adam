@@ -77,6 +77,8 @@ def main():
     worst = {"tc": 0.0, "RT": 0.0, "ratio_pi_b": 0.0}
     for k, rec in NUM["runs"].items():
         model, kappa, C, alpha, opt = k.split("_")
+        if model != "m0":
+            continue          # tuned-eta variants: same code path, different file names
         kappa, alpha = f"{float(kappa):g}", f"{float(alpha):g}"
         if rec["source"] == "ode":
             pattern = (f"m0_{'adam' if opt.startswith('adam') else 'sgd'}_k{kappa}_C{C}_a{alpha}_"
@@ -100,6 +102,8 @@ def main():
         if "ratio" not in rec:
             continue
         model, kappa, C, alpha, b2 = k.split("_")
+        if model != "m0":
+            continue
         a = NUM["runs"][f"{model}_{kappa}_{C}_{alpha}_adam{b2}"]
         s = NUM["runs"][f"{model}_{kappa}_{C}_{alpha}_sgd"]
         idx = np.asarray(rec["classes"]) - 1

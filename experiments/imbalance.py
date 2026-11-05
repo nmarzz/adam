@@ -48,12 +48,22 @@ B_START = 0.01          # Theta_0^T Theta_0 = 0.01 Id (deterministic start, orig
 PER_DECADE = 16
 T_MIN = 0.01
 
-CLASSES = (8, 32)
+CLASSES = (8, 32, 128)
 ALPHAS = (1.0, 2.0)
-BETA2S = (0.9, 0.95, 0.99)
+BETA2S = (0.9, 0.95, 0.99, 0.999)
 KAPPAS = (1.0, 0.1)
-MODELS = ("m0", "m1")
+MODELS = ("m0",)          # m1 (learned bias, simulation only) is still available via --models
 OPTS = ("adam", "sgd")
+ETA_FILE = OUT / "eta_tuned.json"
+
+
+def eta_of(opt, kappa, etaset="base"):
+    """``eta`` (original units) of a learning-rate set: ``base`` = E-series values,
+    ``tuned`` = per-``kappa`` values from ``imbalance.py tune`` (``eta_tuned.json``)."""
+    if etaset == "base":
+        return ETA[opt]
+    table = json.loads(ETA_FILE.read_text())
+    return float(table[f"{kappa:g}"][opt])
 
 
 # --------------------------------------------------------------------------- #
@@ -68,10 +78,18 @@ class Run(NamedTuple):
     beta2: float
     horizon: float
     safety: float = SAFETY
+    etaset: str = "base"
 
     @property
     def eta(self):
-        return ETA[self.opt]
+        return eta_of(self.opt, self.kappa, self.etaset)
+
+    @property
+    def t_min(self):
+        """First record time: 0.01, lowered by whole decades when ``eta`` exceeds the base
+        value, so that classes learned early (large ``eta``) are still resolved."""
+        ratio = self.eta / ETA[self.opt]
+        return T_MIN * 10.0 ** -max(0, int(np.ceil(np.log10(ratio) - 1e-9)))
 
 
 def fmt_T(T):
@@ -82,7 +100,8 @@ def stem(run: Run, dimension=None, kind="ode"):
     opt = (f"b1{BETA1:g}_b2{run.beta2:g}_b{BATCH}_e{EPS:g}" if run.opt == "adam"
            else f"b{BATCH}")
     name = (f"{run.model}_{run.opt}_k{run.kappa:g}_C{run.classes}_a{run.alpha:g}_{opt}"
-            f"_eta{run.eta:g}_T{fmt_T(run.horizon)}")
+            f"_eta{run.eta:g}" + (f"_tm{run.t_min:g}" if run.t_min != T_MIN else "")
+            + f"_T{fmt_T(run.horizon)}")
     if kind == "ode":
         return name + f"_s{run.safety:g}"
     return name + f"_D{dimension}"
@@ -97,15 +116,20 @@ def grid(T, t_min=T_MIN, per_decade=PER_DECADE):
 
 
 def ode_horizon(opt, classes):
+    """Default horizons; ``C = 128`` Adam starts at ``10^2.5`` and is extended selectively."""
+    if classes == 128:
+        return 1e4 if opt == "sgd" else 10 ** 2.5
     return 10 ** 3.5 if (opt == "sgd" and classes == 32) else 1e3
 
 
 def sim_horizon(model, opt, classes, alpha):
+    if opt == "sgd" and classes == 128:
+        return 10 ** 3.5
     return 10 ** 3.5 if (opt == "sgd" and classes == 32 and alpha == 2.0) else 1e3
 
 
 def matrix(models=MODELS, kappas=KAPPAS, classes=CLASSES, alphas=ALPHAS, opts=OPTS,
-           beta2s=BETA2S, kind="ode"):
+           beta2s=BETA2S, kind="ode", etaset="base"):
     runs = []
     for model in models:
         for kappa in kappas:
@@ -115,7 +139,8 @@ def matrix(models=MODELS, kappas=KAPPAS, classes=CLASSES, alphas=ALPHAS, opts=OP
                         for beta2 in (beta2s if opt == "adam" else (0.0,)):
                             T = (ode_horizon(opt, C) if kind == "ode"
                                  else sim_horizon(model, opt, C, alpha))
-                            runs.append(Run(model, opt, kappa, C, alpha, beta2, T))
+                            runs.append(Run(model, opt, kappa, C, alpha, beta2, T,
+                                            etaset=etaset))
     return runs
 
 
@@ -147,9 +172,25 @@ def jax_modules():
     from experiments import zipf_scaling as zs   # enables float64
     import jax
     import jax.numpy as jnp
+    # persistent compilation cache: runs differing only in kappa/alpha reuse compiled code
+    jax.config.update("jax_compilation_cache_dir", str(OUT / "jaxcache"))
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 5.0)
     import discounts
     import dynamics
     return zs, jax, jnp, discounts, dynamics
+
+
+def adam_plan(priors, beta2, seed=0):
+    """``zipf_scaling.make_plan`` (psi route, ``2^18`` batches, window 1024 / 8192), but for
+    ``C > 32`` with all paths in one chunk: at ``C = 128`` the default 3-chunk layout takes
+    ~500 s to compile (vs 89 s), for the same cost per call. ``C <= 32`` is unchanged."""
+    zs, jax, jnp, discounts, dynamics = jax_modules()
+    if len(priors) <= 32:
+        return zs.make_plan(jnp.asarray(priors), BETA1, beta2, BATCH, seed=seed)
+    return discounts.softmax_psi_plan(jax.random.PRNGKey(seed), jnp.asarray(priors), BETA1,
+                                      beta2, batch=BATCH, plain_batches=max(2 ** 14, 2 ** 18 // BATCH),
+                                      window=1024 if beta2 <= 0.99 else 8192,
+                                      chunk_elements=2 ** 27)
 
 
 def coefficients_for(opt, priors, beta2, seed=0):
@@ -157,17 +198,17 @@ def coefficients_for(opt, priors, beta2, seed=0):
     zs, jax, jnp, discounts, dynamics = jax_modules()
     priors = jnp.asarray(priors)
     if opt == "adam":
-        layout, arrays = zs.make_plan(priors, BETA1, beta2, BATCH, seed=seed)
+        layout, arrays = adam_plan(priors, beta2, seed=seed)
         return zs.coefficient_fn(layout, "adam", False), (priors, arrays, BETA1, beta2, EPS)
     return zs.moment_fn("sgd"), (priors, zs.moment_draws(len(priors), seed=seed), EPS,
                                  float(BATCH))
 
 
-def solve_state(priors, B0, O0, times, *, opt, beta2, kappa, safety, seed=0):
+def solve_state(priors, B0, O0, times, *, opt, beta2, kappa, safety, seed=0, eta=None):
     """Collapsed ``K = Id`` ODE in primed units, started from ``(B0, O0)`` at ``times[0]``."""
     zs, jax, jnp, discounts, dynamics = jax_modules()
     C = len(priors)
-    r, lr = primed(opt, kappa, ETA[opt])
+    r, lr = primed(opt, kappa, ETA[opt] if eta is None else eta)
     d = 1000                       # cancels in the collapsed ODE (w_iso = w_cov = d)
     modes, _ = dynamics.isotropic_modes(jnp.zeros((d, C)), jnp.zeros((d, 0)),
                                         jnp.zeros((d, C)))
@@ -192,7 +233,7 @@ def ode_cached(run: Run, *, extend=False, overwrite=False, full=True):
         return dict(np.load(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     priors = zs.zipf_priors(run.classes, run.alpha)
-    times = grid(run.horizon)
+    times = grid(run.horizon, t_min=run.t_min)
     C = run.classes
     start, prev = 0, None
     if extend:
@@ -214,7 +255,7 @@ def ode_cached(run: Run, *, extend=False, overwrite=False, full=True):
     else:
         B0, O0 = prev["B"][-1], prev["O"][-1]
     out = solve_state(priors, B0, O0, times[start:], opt=run.opt, beta2=run.beta2,
-                      kappa=run.kappa, safety=run.safety)
+                      kappa=run.kappa, safety=run.safety, eta=run.eta)
     B, O = np.asarray(out["B"]), np.asarray(out["O"])
     loss, err = zs.class_metrics(jnp.asarray(B), jnp.asarray(O))
     res = {"time": times[start:], "loss": loss, "err": err, "B": B, "O": O,
@@ -282,24 +323,41 @@ def sim_cached(run: Run, dimension, runs, *, overwrite=False):
 # --------------------------------------------------------------------------- #
 # Frozen drifts
 # --------------------------------------------------------------------------- #
-def frozen_rates(priors, B, O, *, beta2, kappa, seeds):
-    """``|dO_cc/dt| / eta`` (original ``eta`` units) for Adam over plan seeds, and SGD."""
+def drift_matrix(co, O, r):
+    """``dO/dt / eta = -(phi^T O + r^2 chi^T)`` (``K = Id``, orthonormal means)."""
+    return -(np.asarray(co["phi"]).T @ np.asarray(O) + r ** 2 * np.asarray(co["chi"]).T)
+
+
+def margin_rate(M):
+    """Drift of the logit margin ``O_cc - mean_{k != c} O_kc`` from a drift matrix."""
+    C = M.shape[0]
+    return np.diag(M) - (M.sum(0) - np.diag(M)) / (C - 1)
+
+
+def frozen_rates(priors, B, O, *, beta2, kappa, seeds, margin=False):
+    """``|dO_cc/dt| / eta`` (original ``eta`` units) for Adam over plan seeds, and SGD;
+    with ``margin=True`` also the margin drifts (Adam mean, s.e.; SGD)."""
     zs, jax, jnp, discounts, dynamics = jax_modules()
     priors = jnp.asarray(priors)
     r_a, lr_a = primed("adam", kappa, ETA["adam"])
     r_s, lr_s = primed("sgd", kappa, ETA["sgd"])
-    rates = []
+    rates, margins = [], []
     for s in range(seeds):
-        layout, plan = zs.make_plan(priors, BETA1, beta2, BATCH, seed=s)
+        layout, plan = adam_plan(priors, beta2, seed=s)
         co = discounts.softmax_psi_coefficients(jnp.asarray(B), jnp.asarray(O), priors, plan,
                                                 BETA1, beta2, EPS, layout=layout)
-        rates.append(zs.frozen_rate(co, O, r=r_a) * lr_a / ETA["adam"])
+        M = drift_matrix(co, O, r_a) * lr_a / ETA["adam"]
+        rates.append(np.diag(M))
+        margins.append(margin_rate(M))
     cm = discounts.softmax_moment_coefficients(jnp.asarray(B), jnp.asarray(O), priors,
                                                zs.moment_draws(len(priors)), EPS, BATCH,
                                                mode="sgd")
-    sgd = zs.frozen_rate(cm, O, r=r_s) * lr_s / ETA["sgd"]
-    rates = np.array(rates)
-    return rates.mean(0), rates.std(0, ddof=1) / np.sqrt(len(rates)), sgd
+    Ms = drift_matrix(cm, O, r_s) * lr_s / ETA["sgd"]
+    rates, margins = np.array(rates), np.array(margins)
+    out = (rates.mean(0), rates.std(0, ddof=1) / np.sqrt(len(rates)), np.diag(Ms))
+    if margin:
+        out += (margins.mean(0), margins.std(0, ddof=1) / np.sqrt(len(margins)), margin_rate(Ms))
+    return out
 
 
 def run_frozen(args):
@@ -323,11 +381,15 @@ def run_frozen(args):
                             k = int(np.argmin(np.abs(d["time"] - t)))
                             states[f"t{t:g}"] = (d["B"][k], d["O"][k])
                     for name, (B, O) in states.items():
-                        mean, se, sgd = frozen_rates(priors, B, O, beta2=beta2, kappa=kappa,
-                                                     seeds=args.frozen_seeds)
+                        mean, se, sgd, m_a, m_se, m_s = frozen_rates(
+                            priors, B, O, beta2=beta2, kappa=kappa, seeds=args.frozen_seeds,
+                            margin=True)
                         res[f"{name}_b2{beta2:g}_adam"] = mean
                         res[f"{name}_b2{beta2:g}_adam_se"] = se
                         res[f"{name}_b2{beta2:g}_sgd"] = sgd
+                        res[f"{name}_b2{beta2:g}_margin_adam"] = m_a
+                        res[f"{name}_b2{beta2:g}_margin_adam_se"] = m_se
+                        res[f"{name}_b2{beta2:g}_margin_sgd"] = m_s
                         res[f"{name}_b2{beta2:g}_O"] = np.asarray(O)
                 np.savez_compressed(path, **res)
                 print(f"frozen {path.name}: {time.time() - t0:.0f}s", flush=True)
@@ -419,7 +481,8 @@ def run_frozen_bias(args):
 # --------------------------------------------------------------------------- #
 def selected(args, kind):
     runs = matrix(models=args.models, kappas=args.kappas, classes=args.classes,
-                  alphas=args.alphas, opts=args.opts, beta2s=args.beta2s, kind=kind)
+                  alphas=args.alphas, opts=args.opts, beta2s=args.beta2s, kind=kind,
+                  etaset=args.etaset)
     if args.horizon is not None:
         runs = [r._replace(horizon=args.horizon) for r in runs]
     return runs
@@ -467,6 +530,47 @@ def run_probe(args):
                       f"{1e6 * dt / n:.1f} us/step ({args.runs} runs)", flush=True)
 
 
+def run_tune(args):
+    """Per-``kappa`` learning rates (ODE only), as E-series ``tune``: ``C = 32``,
+    ``alpha = 1.5``, ``beta2 = 0.99``, criterion ``R(t = target)``; also reports
+    ``R`` at ``t = 10`` and ``t = 1000`` and the time to ``R(0)/100``."""
+    zs = jax_modules()[0]
+    C, alpha = args.tune_classes, args.tune_alpha
+    priors = zs.zipf_priors(C, alpha)
+    T = 1e3
+    times = grid(T)
+    table = json.loads(ETA_FILE.read_text()) if ETA_FILE.exists() else {}
+    results = {}
+    for kappa in args.kappas:
+        chosen = {}
+        for opt, etas in (("adam", args.adam_etas), ("sgd", args.sgd_etas)):
+            scores = []
+            for eta in etas:
+                t0 = time.time()
+                out = solve_state(priors, B_START * kappa * np.eye(C), np.zeros((C, C)), times,
+                                  opt=opt, beta2=0.99, kappa=kappa, safety=args.safety, eta=eta)
+                loss, _ = zs.class_metrics(out["B"], out["O"])
+                Rk = np.asarray(loss) @ priors
+                at = lambda t: float(np.exp(np.interp(np.log(t), np.log(times[1:]),
+                                                      np.log(Rk[1:]))))
+                hit = zs.first_crossing(times, Rk, Rk[0] / 100)
+                scores.append(at(args.tune_target))
+                results[f"k{kappa:g}_{opt}_{eta:g}"] = Rk
+                print(f"tune kappa={kappa:g} {opt} eta={eta:g}: R(10)={at(10):.3e}"
+                      f" R({args.tune_target:g})={at(args.tune_target):.3e} R(1000)={at(1e3):.3e}"
+                      f" t(R0/100)={hit:.3g}  [{time.time() - t0:.0f}s,"
+                      f" {int(np.sum(out['steps']))} steps]", flush=True)
+            k = int(np.nanargmin(scores))
+            if k in (0, len(etas) - 1):
+                print(f"  WARNING: {opt} optimum at the edge of the grid ({etas[k]:g})")
+            chosen[opt] = float(etas[k])
+        table[f"{kappa:g}"] = chosen
+        print(f"tuned kappa={kappa:g}: {chosen}", flush=True)
+    OUT.mkdir(parents=True, exist_ok=True)
+    ETA_FILE.write_text(json.dumps(table, indent=1))
+    np.savez_compressed(OUT / "tune.npz", time=times, **results)
+
+
 def run_selftest(args):
     sys.path.insert(0, str(ROOT / "experiments" / "imbalance"))
     import selftest
@@ -484,7 +588,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=["selftest", "ode", "sim", "frozen", "frozen-bias",
-                                       "probe", "analyze", "plot", "recheck"])
+                                       "probe", "tune", "analyze", "plot", "recheck",
+                                       "offset"])
     p.add_argument("--models", nargs="+", default=list(MODELS))
     p.add_argument("--kappas", nargs="+", type=float, default=list(KAPPAS))
     p.add_argument("--classes", nargs="+", type=int, default=list(CLASSES))
@@ -492,6 +597,12 @@ def main():
     p.add_argument("--opts", nargs="+", default=list(OPTS))
     p.add_argument("--beta2s", nargs="+", type=float, default=list(BETA2S))
     p.add_argument("--horizon", type=float, default=None)
+    p.add_argument("--etaset", default="base", choices=["base", "tuned"])
+    p.add_argument("--tune-classes", type=int, default=32)
+    p.add_argument("--tune-alpha", type=float, default=1.5)
+    p.add_argument("--tune-target", type=float, default=100.0)
+    p.add_argument("--adam-etas", nargs="+", type=float, default=[0.1, 0.3, 1.0, 3.0])
+    p.add_argument("--sgd-etas", nargs="+", type=float, default=[0.3, 1.0, 3.0, 10.0, 30.0])
     p.add_argument("--sim-horizon", type=float, default=None)
     p.add_argument("--safety", type=float, default=SAFETY)
     p.add_argument("--extend", action="store_true")
@@ -502,12 +613,13 @@ def main():
     p.add_argument("--frozen-seeds", type=int, default=4)
     p.add_argument("--bias-chains", type=int, default=4096)
     args = p.parse_args()
-    if args.command in ("analyze", "plot", "recheck"):
+    if args.command in ("analyze", "plot", "recheck", "offset"):
         run_numpy_script({"analyze": "analyze.py", "plot": "figures.py",
-                          "recheck": "recheck.py"}[args.command])
+                          "recheck": "recheck.py", "offset": "offset.py"}[args.command])
         return
     {"selftest": run_selftest, "ode": run_ode, "sim": run_sim, "frozen": run_frozen,
-     "frozen-bias": run_frozen_bias, "probe": run_probe}[args.command](args)
+     "frozen-bias": run_frozen_bias, "probe": run_probe,
+     "tune": run_tune}[args.command](args)
 
 
 if __name__ == "__main__":

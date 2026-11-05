@@ -77,31 +77,46 @@ def kink(beta2, C=None, b=BATCH):
     return base if C is None else base / F_pred(beta2, C) ** 2
 
 
-def ratio_asymptotes(beta2, C, kappa):
+def ratio_asymptotes(beta2, C, kappa, etaset="base"):
     """Predicted ``t_c(Adam)/t_c(SGD)`` at ``Theta_0``: ``(window(pi), rare)`` with
     ``window = 10 sqrt(pi)(1 - 1/C) sqrt(kappa)`` and ``rare = 10 (1 - 1/C) sqrt(kappa) /
     (coef_beta F)``; they meet at :func:`kink`. ``sqrt(kappa)``: Adam's frozen rate
     scales by ``r'^2 eta'/eta = r^2/sqrt(kappa)``, SGD's by ``r^2``."""
-    fac = ETA["sgd"] / ETA["adam"] * (1 - 1 / C) * np.sqrt(kappa)
+    fac = (I.eta_of("sgd", kappa, etaset) / I.eta_of("adam", kappa, etaset)
+           * (1 - 1 / C) * np.sqrt(kappa))
     return (lambda pi: fac * np.sqrt(pi)), fac / (coef_beta(beta2) * F_pred(beta2, C))
 
 
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-def run(model, opt, kappa, C, alpha, beta2=0.0):
+def run(model, opt, kappa, C, alpha, beta2=0.0, etaset="base"):
     T = I.ode_horizon(opt, C)
-    return I.Run(model, opt, kappa, C, alpha, beta2 if opt == "adam" else 0.0, T)
+    return I.Run(model, opt, kappa, C, alpha, beta2 if opt == "adam" else 0.0, T,
+                 etaset=etaset)
 
 
-def load_ode(model, opt, kappa, C, alpha, beta2=0.0):
-    p = I.ode_path(run(model, opt, kappa, C, alpha, beta2)).name
-    path = DATA / "ode" / p
-    return dict(np.load(path)) if path.exists() else None
+@functools.lru_cache(maxsize=None)
+def _ode_file(model, opt, kappa, C, alpha, beta2, etaset, safety):
+    """Longest cached ODE trajectory with these parameters (runs are extended in place)."""
+    r = run(model, opt, kappa, C, alpha, beta2, etaset)._replace(horizon=1.0, safety=safety)
+    pattern = I.stem(r).replace("_T1_", "_T*_") + ".npz"
+    best, best_T = None, -1.0
+    for f in (DATA / "ode").glob(pattern):
+        T = float(f.name.split("_T")[-1].split("_s")[0])
+        if T > best_T:
+            best, best_T = f, T
+    return best
 
 
-def load_sim(model, opt, kappa, C, alpha, beta2=0.0, D=1000, T=None):
-    r = run(model, opt, kappa, C, alpha, beta2)
+def load_ode(model, opt, kappa, C, alpha, beta2=0.0, etaset="base", safety=I.SAFETY):
+    f = _ode_file(model, opt, float(kappa), int(C), float(alpha),
+                  float(beta2 if opt == "adam" else 0.0), etaset, float(safety))
+    return dict(np.load(f)) if f is not None else None
+
+
+def load_sim(model, opt, kappa, C, alpha, beta2=0.0, D=1000, T=None, etaset="base"):
+    r = run(model, opt, kappa, C, alpha, beta2, etaset)
     r = r._replace(horizon=T or I.sim_horizon(model, opt, C, alpha))
     path = DATA / "sim" / I.sim_path(r, D).name
     return dict(np.load(path)) if path.exists() else None
@@ -117,16 +132,16 @@ def load_frozen_bias(kappa, C, alpha):
     return dict(np.load(path)) if path.exists() else None
 
 
-def curves(model, opt, kappa, C, alpha, beta2=0.0):
+def curves(model, opt, kappa, C, alpha, beta2=0.0, etaset="base"):
     """The trajectory used for rates: the ODE for m0, the 16-run mean for m1.
     Returns ``dict(time, loss (T, C), priors, source, [runs (n, T, C)])`` or None."""
     if model == "m0":
-        d = load_ode(model, opt, kappa, C, alpha, beta2)
+        d = load_ode(model, opt, kappa, C, alpha, beta2, etaset)
         if d is None:
             return None
         return {"time": d["time"], "loss": d["loss"], "priors": d["priors"], "source": "ode",
                 "O": d["O"], "B": d["B"]}
-    d = load_sim(model, opt, kappa, C, alpha, beta2)
+    d = load_sim(model, opt, kappa, C, alpha, beta2, etaset=etaset)
     if d is None:
         return None
     out = {"time": d["time"], "loss": d["loss"].mean(0), "priors": d["priors"],

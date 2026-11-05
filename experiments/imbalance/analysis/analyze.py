@@ -22,6 +22,24 @@ def key(*parts):
     return "_".join(str(p) for p in parts)
 
 
+def variants():
+    """(name, model, etaset): base learning rates, plus per-kappa tuned ones if available."""
+    out = [("m0", "m0", "base")]
+    if I.ETA_FILE.exists():
+        out.append(("m0tuned", "m0", "tuned"))
+    return out
+
+
+def skip(etaset, kappa):
+    """Tuned variant identical to base (same eta for both optimizers) or not tuned."""
+    if etaset == "base":
+        return False
+    try:
+        return all(I.eta_of(o, kappa, "tuned") == I.ETA[o] for o in ("adam", "sgd"))
+    except KeyError:
+        return True
+
+
 def opt_list():
     return [("adam", b2) for b2 in ADAM_B2] + [("sgd", 0.0)]
 
@@ -38,12 +56,14 @@ def per_run():
     print("| model | kappa | C | alpha | opt | src | T | R(0) | R(T) | t(R/2) | t(R/10) |"
           " -dlogR/dlogt at 1/10/100/T | learned | above init | stat |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
-    for model in I.MODELS:
+    for vname, model, es in variants():
         for kappa in I.KAPPAS:
+            if skip(es, kappa):
+                continue
             for C in I.CLASSES:
                 for alpha in I.ALPHAS:
                     for opt, b2 in opt_list():
-                        cur = lib.curves(model, opt, kappa, C, alpha, b2)
+                        cur = lib.curves(model, opt, kappa, C, alpha, b2, etaset=es)
                         if cur is None:
                             continue
                         t, L, pi = cur["time"], cur["loss"], cur["priors"]
@@ -65,10 +85,10 @@ def per_run():
                             "late_slope": lib.late_slopes(t, L),
                             "stationarity": stat, **diag,
                         }
-                        NUM["runs"][key(model, kappa, C, alpha, label(opt, b2))] = rec
+                        NUM["runs"][key(vname, kappa, C, alpha, label(opt, b2))] = rec
                         ex_s = "/".join(f"{rec['exp_at'].get(s, np.nan):.2f}"
                                         for s in (1.0, 10.0, 100.0)) + f"/{ex[-1]:.2f}"
-                        print(f"| {model} | {kappa:g} | {C} | {alpha:g} | {label(opt, b2)} |"
+                        print(f"| {vname} | {kappa:g} | {C} | {alpha:g} | {label(opt, b2)} |"
                               f" {cur['source']} | {t[-1]:.0f} | {Rk[0]:.3f} | {Rk[-1]:.4f} |"
                               f" {rec['t_half']:.3g} | {rec['t_tenth']:.3g} | {ex_s} |"
                               f" {diag['learned']}/{C} | {diag['above_initial']} |"
@@ -81,28 +101,33 @@ def per_run():
 def kink_fits():
     print("\n## Kink from trajectories (t_c at 1/2): Adam/SGD ratio and t_c breaks\n")
     print("| model | kappa | C | alpha | beta2 | n fit (above/below) | ratio pi_b | /kink | /kink_F"
-          " | level / pred rare | free t_c break (slopes) | smooth p1, p2 / kink_F |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
-    for model in I.MODELS:
+          " | level / pred rare | frozen O-ratio pi_b / kink_F | frozen margin-ratio pi_b / kink_F |"
+          " measured / margin | free t_c break (slopes) | smooth p1, p2 / kink_F |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for vname, model, es in variants():
         for kappa in I.KAPPAS:
+            if skip(es, kappa):
+                continue
             for C in I.CLASSES:
                 for alpha in I.ALPHAS:
-                    sgd = NUM["runs"].get(key(model, kappa, C, alpha, "sgd"))
+                    fz = lib.load_frozen(kappa, C, alpha)
+                    sgd = NUM["runs"].get(key(vname, kappa, C, alpha, "sgd"))
                     if sgd is None:
                         continue
                     pi = np.asarray(sgd["pi"])
                     ts = np.asarray(sgd["tc"]["0.5"])
                     for b2 in ADAM_B2:
-                        a = NUM["runs"].get(key(model, kappa, C, alpha, f"adam{b2:g}"))
+                        a = NUM["runs"].get(key(vname, kappa, C, alpha, f"adam{b2:g}"))
                         if a is None:
                             continue
                         ta = np.asarray(a["tc"]["0.5"])
                         ok = (lib.fit_set(pi, ta, a["T"]) & lib.fit_set(pi, ts, sgd["T"]))
                         k0, kF = lib.kink(b2), lib.kink(b2, C)
-                        _, rare_pred = lib.ratio_asymptotes(b2, C, kappa)
+                        _, rare_pred = lib.ratio_asymptotes(b2, C, kappa, es)
+                        eta_ratio = I.eta_of("sgd", kappa, es) / I.eta_of("adam", kappa, es)
                         rec = {"n": int(ok.sum()), "kink": k0, "kink_F": kF,
                                "rare_pred": rare_pred, "classes": np.flatnonzero(ok) + 1}
-                        line = (f"| {model} | {kappa:g} | {C} | {alpha:g} | {b2:g} |")
+                        line = (f"| {vname} | {kappa:g} | {C} | {alpha:g} | {b2:g} |")
                         if ok.sum() >= 3:
                             rb = lib.ratio_break(pi[ok], ta[ok] / ts[ok])
                             rec["ratio"] = rb
@@ -111,6 +136,21 @@ def kink_fits():
                                      f"{'' if min(rb['n_above'], rb['n_below']) >= 2 else '†'} |"
                                      f" {rb['pi_b'] / k0:.2f} | {rb['pi_b'] / kF:.2f} |"
                                      f" {rb['level'] / rare_pred:.2f} |")
+                            # the same broken line fitted to the frozen (Theta_0) ratios
+                            fb = {}
+                            if fz is not None and f"init_b2{b2:g}_margin_adam" in fz:
+                                for what, ka, ks in (("O", "adam", "sgd"),
+                                                     ("margin", "margin_adam", "margin_sgd")):
+                                    fr_ratio = eta_ratio * np.abs(fz[f"init_b2{b2:g}_{ks}"]) / \
+                                        np.abs(fz[f"init_b2{b2:g}_{ka}"])
+                                    fb[what] = lib.ratio_break(pi[ok], fr_ratio[ok])
+                            rec["frozen_ratio"] = fb
+                            if fb:
+                                line += (f" {fb['O']['pi_b'] / kF:.2f} |"
+                                         f" {fb['margin']['pi_b'] / kF:.2f} |"
+                                         f" {rb['pi_b'] / fb['margin']['pi_b']:.2f} |")
+                            else:
+                                line += " – | – | – |"
                             br = lib.tc_breaks(pi[ok], ta[ok])
                             rec["tc_breaks"] = br
                             fr = br.get("free")
@@ -119,8 +159,8 @@ def kink_fits():
                             line += (f" {br['smooth_p1']['pi_b'] / kF:.2f},"
                                      f" {br['smooth_p2']['pi_b'] / kF:.2f} |")
                         else:
-                            line += f" {int(ok.sum())} | unresolved | | | | | |"
-                        NUM["kink"][key(model, kappa, C, alpha, b2)] = rec
+                            line += f" {int(ok.sum())} | unresolved | | | | | | | | |"
+                        NUM["kink"][key(vname, kappa, C, alpha, b2)] = rec
                         print(line)
     print("\n(* = break outside the fitted pi range; † = fewer than 2 classes on one side;"
           " kink_F = kappa_beta(1-beta2)/(b F^2))")
@@ -132,9 +172,12 @@ def beta2_pairs():
     print("| model | kappa | C | alpha | pair | pred rare | rare: median (n) | window: median (n) |")
     print("|---|---|---|---|---|---|---|---|")
     pred = {(0.9, 0.95): lib.coef_beta(0.95) / lib.coef_beta(0.9),
-            (0.95, 0.99): lib.coef_beta(0.99) / lib.coef_beta(0.95)}
-    for model in I.MODELS:
+            (0.95, 0.99): lib.coef_beta(0.99) / lib.coef_beta(0.95),
+            (0.99, 0.999): lib.coef_beta(0.999) / lib.coef_beta(0.99)}
+    for model, _, es in variants():
         for kappa in I.KAPPAS:
+            if skip(es, kappa):
+                continue
             for C in I.CLASSES:
                 for alpha in I.ALPHAS:
                     for (b_a, b_b), p in pred.items():
@@ -165,14 +208,17 @@ def beta2_pairs():
 def frozen():
     print("\n## Frozen initial drift (m0, Theta_0): alpha-pooled SBPL fits\n")
     print("| kappa | C | beta2 | n | free: s_rare/s_freq | free pi_b / kink_F | fixed (1,1/2) pi_b"
-          " / kink_F | alpha overlap |rel diff| | SGD / r^2 pi(1-1/C) |")
-    print("|---|---|---|---|---|---|---|---|---|")
+          " / kink_F | alpha overlap |rel diff| | SGD / r^2 pi(1-1/C) |"
+          " margin: Adam margin/O drift (head, tail) | margin free slopes, pi_b / kink_F |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|")
     for kappa in I.KAPPAS:
         for C in I.CLASSES:
             data = {a: lib.load_frozen(kappa, C, a) for a in I.ALPHAS}
             if any(v is None for v in data.values()):
                 continue
             for b2 in ADAM_B2:
+                if not all(f"init_b2{b2:g}_adam" in data[a] for a in I.ALPHAS):
+                    continue
                 pis = np.concatenate([data[a]["priors"] for a in I.ALPHAS])
                 rate = np.abs(np.concatenate([data[a][f"init_b2{b2:g}_adam"] for a in I.ALPHAS]))
                 sgd = np.abs(np.concatenate([data[a][f"init_b2{b2:g}_sgd"] for a in I.ALPHAS]))
@@ -193,12 +239,22 @@ def frozen():
                 rec = {"pi": pis, "rate": rate, "sgd": sgd, "kink_F": kF, "fixed": fixed,
                        "free": free, "alpha_overlap": overlap,
                        "sgd_ratio": [float(sgd_ratio.min()), float(sgd_ratio.max())]}
+                ms = ""
+                if all(f"init_b2{b2:g}_margin_adam" in data[a] for a in I.ALPHAS):
+                    marg = np.abs(np.concatenate([data[a][f"init_b2{b2:g}_margin_adam"]
+                                                  for a in I.ALPHAS]))[order]
+                    boost = marg / rate
+                    mfree = lib.fit_sbpl(pis, marg) if min(n_lo, n_hi) >= 5 else None
+                    rec.update({"margin": marg, "margin_free": mfree})
+                    ms = (f" {boost[-1]:.2f}, {boost[0]:.2f} |" +
+                          (f" {mfree['s1']:.2f}/{mfree['s2']:.2f}, {mfree['pi_b'] / kF:.2f} |"
+                           if mfree else " – |"))
                 NUM["frozen"][key(kappa, C, b2)] = rec
                 fs = (f"{free['s1']:.2f}/{free['s2']:.2f} | {free['pi_b'] / kF:.2f}"
                       if free else f"(sides {n_lo}/{n_hi}) | –")
                 print(f"| {kappa:g} | {C} | {b2:g} | {len(pis)} | {fs} |"
                       f" {fixed['pi_b'] / kF:.2f} (rms {fixed['rms_log']:.3f}) |"
-                      f" {overlap:.3f} | {sgd_ratio.min():.3f}-{sgd_ratio.max():.3f} |")
+                      f" {overlap:.3f} | {sgd_ratio.min():.3f}-{sgd_ratio.max():.3f} |{ms}")
 
 
 def frozen_bias():
@@ -335,9 +391,7 @@ def main():
     kink_fits()
     beta2_pairs()
     frozen()
-    frozen_bias()
     validation()
-    m1_vs_m0()
     (lib.OUTDIR / "numbers.json").write_text(json.dumps(lib.jsonable(NUM), indent=1))
     print(f"\nwrote {lib.OUTDIR / 'numbers.json'}")
 
