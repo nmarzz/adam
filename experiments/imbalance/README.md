@@ -506,7 +506,8 @@ Tuning uses `C = 32`, `alpha = 1.5` and `beta2 = 0.99`, with criterion `R(t = 10
   - 55–93 classes end above their initial loss.
   - `beta2 = 0.999` is the best Adam and still trails SGD at `t >= 100`.
 - **`K = 0.1 Id`**: every class is learned except 13–15 of the rarest at `alpha = 2`, `beta2 <= 0.95`. Adam's risk
-  ends 3–5000 times below SGD's.
+  ends 2500–5000 times below SGD's, except at `alpha = 2`, `beta2 <= 0.95`: only 4 times below at
+  `t = 316`, because the rarest classes are still unlearned.
 - **Frozen kink at `C = 128`:** within 1–3% of `kappa_beta (1-beta2)/(b F^2)` for all four `beta2` (free slopes
   1.00 / 0.50). This reproduces E1a.
 - **Validation at `D = 1000`, `C = 128`, `alpha = 2`:**
@@ -565,7 +566,7 @@ Medians at `C = 32`, `K = Id`, `alpha = 2` (log units):
 
 | question | answer |
 |---|---|
-| Risk vs time | **`K = Id`:** the advantage shifts to SGD as imbalance and `C` grow. At `C = 8` Adam leads mid-training. At `C = 32` and 128 SGD is ahead at nearly all times, by up to 18 times at `C = 128`, `alpha = 1`, `beta2 <= 0.95`, where Adam is stuck. Longer memory (`beta2 = 0.999`) is the best Adam everywhere and roughly ties SGD up to `t ~ 100`. **`K = 0.1 Id`:** Adam wins by 3–4 decades late. With learning rates tuned for the noise level (Adam 10, SGD 300) Adam is still about 900 times better. |
+| Risk vs time | **`K = Id`:** the advantage shifts to SGD as imbalance and `C` grow. At `C = 8` Adam leads mid-training. At `C = 32` and 128 SGD is ahead at nearly all times, by up to 18 times at `C = 128`, `alpha = 1`, `beta2 <= 0.95`, where Adam is stuck. Longer memory (`beta2 = 0.999`) is the best Adam everywhere and roughly ties SGD up to `t ~ 100`. **`K = 0.1 Id`:** Adam wins by 3–4 decades late, except while it is still learning the rarest classes (`C = 128`, `alpha = 2`, `beta2 <= 0.95`: 4 times at `t = 316`). With learning rates tuned for the noise level (Adam 10, SGD 300) Adam is still about 900 times better. |
 | Per-class rates | At `Theta_0`, Adam's drift has slope ½ in `pi` above the kink and 1 below; SGD's has slope 1 exactly. Along trajectories Adam's `t_c` scales as `pi^-0.6` to `pi^-0.8` in the head and `pi^-1` to `pi^-1.3` in the tail; SGD's as about `pi^-1`. At `K = Id`, short memory and large `C` turn the slow tail into a stall: a fixed point at `C = 128`, `alpha = 1`, `beta2 <= 0.95`. |
 | E1 kink | **At `Theta_0`:** within 0–15% of `kappa_beta (1-beta2)/(b F^2)` in all 12 (`C`, `beta2`) cases; `F` matters at small `C`. **Along trajectories:** it moves with `beta2` as predicted (0.95/0.99 ratio 2.8–3.2 against 2.97; 0.9 and 0.95 coincide) and does not depend on `eta`. At `K = Id` it sits 1.5–2.8 times above the `O_cc` prediction. **Most of that offset is the margin effect:** Adam's normalisation also pushes down competitor logits, which helps head classes most. Using the margin drift cuts the offset to 1.1–1.6; the remainder is the decay of the tail drift along the path (absent at `K = 0.1 Id`). |
 | `beta2` | Rare side: 0.9/0.95 = 0.96–1.01 (0.947 predicted), 0.95/0.99 = 1.72–1.75 (1.795), 0.99/0.999 = 2.0–2.2 (3.03, measurable only at `K = 0.1 Id`). The main practical effect is the stall: shorter memory gets stuck. |
