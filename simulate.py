@@ -296,10 +296,10 @@ def _mixture_grad(problem, data, params, key, batch, bias=False):
     k_c, k_z, k_w = jax.random.split(key, 3)
     d = data.means.shape[0]
     classes = jax.random.categorical(k_c, jnp.log(problem.priors), shape=(batch,))
-    z = jax.random.normal(k_z, (batch, d))
+    z = jax.random.normal(k_z, (batch, d), dtype=data.means.dtype)
     noise = z * data.factor if data.factor.ndim == 1 else z @ data.factor.T
     x = data.means.T[classes] + noise
-    w = jax.random.normal(k_w, (batch, problem.outputs))
+    w = jax.random.normal(k_w, (batch, problem.outputs), dtype=data.means.dtype)
     if not bias:
         q = x @ jnp.concatenate([params, data.teacher], axis=1)
         return x.T @ jax.vmap(problem.f)(q, classes, w) / batch
@@ -426,3 +426,51 @@ def run_mixture_at_many(sim: Sim, data: MixtureData, params0, record_steps, *, k
     """``vmap`` :func:`run_mixture_at` over PRNG keys."""
     return jax.vmap(lambda key: run_mixture_at(sim, data, params0, record_steps,
                                                key=key, bias=bias))(keys)
+
+
+def mixture_carry(sim: Sim, params0, key):
+    """Initial ``(params, state, key)`` carry for :func:`run_mixture_segments`."""
+    return params0, sim.init(params0), key
+
+
+def run_mixture_segments(sim: Sim, data: MixtureData, carry, bounds, *, observe,
+                         unroll=1):
+    """Advance ``carry = (params, state, key)`` over consecutive segments and record
+    ``observe(params, state)`` at the end of each.
+
+    ``bounds`` is an ``(S, 2)`` integer array of *global* step indices ``[lo, hi)``
+    (``hi`` of one segment is ``lo`` of the next; zero-length segments are allowed and
+    record the current state), so ``_lr_at`` sees the same ``k`` however a run is cut
+    into calls. Each step splits the key exactly as :func:`run_mixture_at` does
+    (``key, sub = split(key)``; ``step(params, state, sub, k)``), so with matching
+    bounds the trajectories coincide. ``unroll = U``: each segment runs
+    ``(hi - lo) // U`` blocks of ``U`` unrolled steps, then the remaining steps one at a
+    time (same key-split order). ``data`` is unused here (the simulator closes over it);
+    it is accepted for symmetry with the other drivers. Returns ``(carry, records)``
+    with ``records`` stacked over the ``S`` segments."""
+    del data
+    U = int(unroll)
+
+    def advance(k, carry):
+        params, state, key = carry
+        key, sub = jax.random.split(key)
+        params, state = sim.step(params, state, sub, k)
+        return params, state, key
+
+    def segment(carry, lohi):
+        lo, hi = lohi[0], lohi[1]
+        if U > 1:
+            blocks = (hi - lo) // U
+
+            def block(j, carry):
+                base = lo + j * U
+                for u in range(U):
+                    carry = advance(base + u, carry)
+                return carry
+
+            carry = lax.fori_loop(0, blocks, block, carry)
+            lo = lo + blocks * U
+        carry = lax.fori_loop(lo, hi, advance, carry)
+        return carry, observe(carry[0], carry[1])
+
+    return lax.scan(segment, carry, jnp.asarray(bounds))
