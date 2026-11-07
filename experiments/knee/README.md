@@ -294,3 +294,38 @@ at `T = 1000`:
   with no fitting.
 - `beta2 = 0.999`, which is 4.5× above the kink, has no fixed point. Its margin passes the frozen zero and heads
   for the optimum's `m* = 25`.
+
+**Stall margin against noise (`C = 128, alpha = 0`, `eps = 1e-8`, `beta2 = 0.9 / 0.95`).**
+
+| `kappa` | `r'^2` | `beta2 = 0.9`: `m`, `ell/ell0` | `beta2 = 0.95`: `m`, `ell/ell0` |
+|---|---|---|---|
+| 2 | 12.5 | 0.93, 0.836 | 1.11, 0.805 |
+| 1 | 25 | 1.86, 0.652 | 2.25, 0.587 |
+| 0.5 | 50 | 3.95, 0.297 | 5.0, 0.181 |
+| 0.25 | 100 | no stall: the `eps` floor releases it (below) | no stall |
+
+`m_stall ∝ r'^2` (it doubles each time `kappa` halves), as in the rare-side K2 formula
+`mbar ≈ r'^2 psi_sat F/(C phi_cc)`. In that formula `phi`, `chi` and `psi` do not depend on `kappa`.
+
+**The two roles of `eps` (`kappa = 0.5` and `0.25`, `eps = 1e-8` against `1e-16`).** The two arms are identical
+until coordinates reach the `eps` floor (`frac_eps`). After that the effect depends on `beta2`. At `kappa = 0.25`
+(`D = 2000`), `t = 274`, `ell/ell0` with `eps = 1e-8 / 1e-16`:
+
+| `beta2` | `ell/ell0` (`eps = 1e-8 / 1e-16`) | `m` (`eps = 1e-8 / 1e-16`) |
+|---|---|---|
+| 0.9 | 4.1e-6 / 4.4e-4 | 19.6 / 12.8 |
+| 0.95 | 3.4e-6 / 1.2e-5 | 19.9 / 18.2 |
+| 0.99 | 2.4e-6 / 1.5e-8 | 20.6 / 31.9 |
+| 0.999 | 2.1e-6 / 1.1e-8 | 21.0 / 34.0 |
+
+- **Long memory (`beta2 ≥ 0.99`): the floor causes the knee (Kε, P2).** With `eps = 1e-8` the cliff ends near
+  `ell/ell0 ≈ 1e-5`, when `frac_eps -> 1` (0.89 at `t = 36.5`). With `eps = 1e-16` the cliff keeps going, already
+  160–190× lower and still falling.
+- **Short memory (`beta2 ≤ 0.95`): the floor is an escape from K2.** Without the floor, `beta2 = 0.9` brakes at
+  `m ≈ 11–13` and creeps with a local exponent of about 1.5. With the floor, `frac_eps` jumps from 0.06 to 0.98
+  between `t = 65` and 115, and the loss drops 70× in one half decade. At the floor Adam is SGD with step
+  `eta'/sqrt(eps)`, and the restoring/forcing balance that holds K2 no longer applies.
+- At `kappa = 0.5`, `beta2 = 0.99` lies in between. The floor engages late (`frac_eps` 0.04 → 0.85 over
+  `t = 115 → 649`) and speeds things up: 1.5e-4 against 5.1e-4 at `t = 649`.
+- This revises Kε. The `eps` floor is the knee only for lanes that would otherwise keep their normalised cliff. For
+  lanes heading into a K2 balance it ends that balance.
