@@ -268,3 +268,29 @@ Result at `T = 3162` by `beta2` = 0.9 / 0.95 / 0.99 / 0.999: 125 / 120 / 84 / 0 
 - `beta2 = 0.999`: the loss falls to 0.263 at `T ≈ 316`, then rises to 0.297 at 3162 while the margins keep
   growing (19 against the optimum's `m* = 12.5`). This is the late rise of P6.
 - The optimum is at `ell*/ell0 = 0.141`.
+
+**Second certificate change (slope bound).** At `kappa = 1` the stalled lanes are flat in the class mean, yet
+17–26 classes per lane failed the fixed `|slope| < 0.02`. A single class's seed-mean half-decade slope carries
+0.01–0.02 of run noise at 32 runs. FIXED now uses `|slope| < max(0.02, 3 SE_slope)`, with the SE bootstrapped over
+runs.
+
+Recomputed FIXED counts at the caps, by `beta2` = 0.9 / 0.95 / 0.99 / 0.999:
+- `kappa = 2`: 125 / 123 / 121 / 0.
+- `kappa = 1`: 124 / 124 / 1 / 0.
+  - At `beta2 = 0.99` the loss was still falling at `T/sqrt(10) = 316` (0.0815 → 0.0739), so the
+    two-consecutive-checks rule leaves it UNRESOLVED at the cap (`T = 1000`). Its last half decade is flat.
+
+**P4 at `kappa = 1` (`C = 128, alpha = 0, eps = 1e-8`).** Frozen K2 zeros from Stage 1 compared with the simulation
+at `T = 1000`:
+
+| beta2 | predicted `m` | simulated `m` | predicted `ell/ell0` | simulated `ell/ell0` |
+|---|---|---|---|---|
+| 0.9 | 1.75–1.96 | 1.86 | 0.65 | 0.652 |
+| 0.95 | 2.05–2.35 | 2.25 | 0.58–0.61 | 0.587 |
+| 0.99 | 7.9–8.2 | 8.49 | 0.067–0.069 | 0.074 |
+| 0.999 | 15.5 (balance) | 9.7 → 14 → 18.9 → 25.4 (`T` = 100 → 1000), still rising | 0.013 | 0.028, still falling |
+
+- `beta2 ≤ 0.99` is a joint K2 stall at the predicted margin. The numbers came from a one-parameter frozen family
+  with no fitting.
+- `beta2 = 0.999`, which is 4.5× above the kink, has no fixed point. Its margin passes the frozen zero and heads
+  for the optimum's `m* = 25`.

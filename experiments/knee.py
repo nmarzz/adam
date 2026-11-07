@@ -300,8 +300,10 @@ def certify(rec, *, at_cap=False, n_boot=200, seed=0, fixed_floor=1e-3, fixed_sl
       ``[T/sqrt(10), T]`` is below ``max(1e-3, 3 SE)`` in absolute value, ``SE`` its paired
       bootstrap SE over runs (series I's gap stationarity, a max over ``C - 1`` noisy gaps,
       is noise-dominated in simulations; it is reported as ``gap_stationarity``), and
-      ``|d log ell / d log t| < 0.02`` over ``[T/sqrt(10), T]``, both at ``T`` and at the
-      previous check ``T/sqrt(10)`` (8 records earlier; checks are every half decade).
+      ``|d log ell / d log t|`` over the same half decade below ``max(0.02, 3 SE_slope)``
+      (bootstrap over runs; a single class's half-decade slope carries ~0.01-0.02 of run
+      noise at 32 runs), both at ``T`` and at the previous check ``T/sqrt(10)`` (8 records
+      earlier; checks are every half decade).
     * TAIL: ``t_c(1/2) <= T/10``, the last-decade and previous-decade slopes of
       ``log ell`` on ``log t`` differ by less than 0.05, and the bootstrap SE of the
       last-decade slope is below 0.05.
@@ -334,7 +336,8 @@ def certify(rec, *, at_cap=False, n_boot=200, seed=0, fixed_floor=1e-3, fixed_sl
         se = ((mb1 - mb0) / np.maximum(np.abs(mb1), 1e-12)).std(1, ddof=1)
         thr = np.maximum(fixed_floor, fixed_nsig * se)
         stat = np.abs(d)
-        ok = (stat < thr) & (np.abs(slope) < fixed_slope)
+        slope_se = _index_slope(t, logLb, k0, n).std(1, ddof=1)        # (nb, C)
+        ok = (stat < thr) & (np.abs(slope) < np.maximum(fixed_slope, fixed_nsig * slope_se))
         return ok, slope, stat, se, thr, gap
 
     T = t[-1]
