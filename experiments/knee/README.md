@@ -187,3 +187,63 @@ numbers, so it adds nothing beyond that.
 `experiments/imbalance.py selftest` now fails one check: the E2 `C = 64` Adam ODE regression. That check runs only
 the ODE path, which does not import `simulate.py`, so this series cannot cause it. The likely cause, not yet
 verified, is `2fd4407`, which changed the psi plan for `C > 32`.
+
+### Self-tests (`real/bin/python experiments/knee.py selftest`, 121 s): 30 pass, 0 fail, 5 flags
+
+What passes:
+- The default path is bit-identical to pinned `0db8cce:simulate.py` (40 arrays).
+- Segments match `run_mixture_at` bitwise, and so does the chunk executable.
+- Resume is bitwise for Adam and SGD × f64 and f32 × `U ∈ {1, 4}`, and across processes.
+- `U = 4` vs `U = 1`: Adam is bitwise; SGD in f64 differs by 8.5e-16.
+- A traced `beta2` lane matches a scalar one to 2.8e-15.
+- The diagnostics match a numpy recompute to 2e-15.
+- The new default of 2^16 draws matches an independent 2^19 reference:
+  - plain loss within 1.2–2.4% (max over 128 classes);
+  - `loss_cv` within 1e-6 to 4e-4 at `kappa = 0.1`, and 1.7% at `kappa = 1` late states (above the
+    control-variate gate).
+
+The 5 flags record the error of the 2^14-draw estimator used in series I (2.4–5.8% per class).
+
+Two independent reviewers reran the self-tests and an adversarial test script. They found:
+- no defect in the step index, the key order, zero-length segments or checkpoint atomicity;
+- the six issues fixed above.
+
+### Probe (`figs/experiments/knee/probe.json`, idle GPU, 4000 steps, best of 3)
+
+µs per step for all lanes together:
+
+| opt, lanes | D | f64 U=1 | f64 U=4 | f32 U=1 | f32 U=4 |
+|---|---|---|---|---|---|
+| Adam C=128, 128 | 1000 | 686 | 690 | 327 | 257 |
+| Adam C=128, 128 | 5000 | 3304 | 3379 | 1958 | 1318 |
+| SGD C=128, 32 | 1000 | 98 | 134 | 36 | 23 |
+| SGD C=128, 32 | 5000 | 345 | 430 | 79 | 50 |
+| Adam C=32, 128 | 1000 | 232 | 401 | | |
+
+- `U = 16` is never faster.
+- Compile times: f64 Adam at `U = 1` takes 51 s, at `U = 4` 4 s (both cached afterwards).
+- Metrics take 15 s per chunk at `C = 128` with 128 lanes (2^16 draws).
+- Choice: f64 for everything in S3a and S3b; Adam at `U = 4`, SGD at `U = 1`.
+- f32 gives only a 2–2.7× speedup. It is reserved for the S3c `eps = 1e-8` groups, and only after passing the
+  f32/f64 gate at `alpha = 1, kappa = 1`.
+
+### Budget (f64, horizon rule; GPU-h at `T0` / at the cap)
+
+| stage | at T0 | at cap |
+|---|---|---|
+| S3a `alpha = 0` (C = 128 and 32, both eps) | 2.3 | 4.2 |
+| S3b `alpha = 1` (both eps) | 7.6 | 24 |
+| S3c `alpha = 2` (eps = 1e-8) | 127 | 313 |
+
+S3c is far over the plan's 60 GPU-h gate. Its cost is driven by the rarest classes (`pi_128 = 3.7e-5`, so
+`t_S ≈ 2400 kappa^0.4`) and by `D = 5000` at `kappa = 0.1` (46 GPU-h at `T0`). The gate's first step is to drop
+`kappa = 0.5` and 2, which leaves about 98 GPU-h in f64, or about 40 in f32. A decision is still needed before S3c
+starts.
+
+## Stage 3a: alpha = 0 (started 2026-11-06)
+
+Driver: `experiments/knee/s3a.sh`, log in `figs/experiments/knee/logs/s3a.log`. It runs:
+- `C = 128` and `C = 32`, `kappa ∈ {2, 1, 0.5, 0.25, 0.1}`, `eps ∈ {1e-8, 1e-16}`, 32 runs, with SGD
+  references;
+- a `D = 2500` finite-D check at `C = 128, kappa = 0.1`;
+- a `D = 4000` check of the `beta2 = 0.999` lane at `C = 32, kappa = 1`.

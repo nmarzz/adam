@@ -290,17 +290,18 @@ def _gap_stationarity(O0, O1):
 
 
 def certify(rec, *, at_cap=False, n_boot=200, seed=0, fixed_floor=1e-3, fixed_slope=0.02,
+            fixed_nsig=3.0,
             tail_dslope=0.05, tail_se=0.05):
     """Per ``(beta2, class)`` convergence certificate from :func:`load_group` records.
 
     Seed means over runs, bootstrap SEs over runs (``n_boot`` resamples).
 
-    * FIXED: gap stationarity (largest change of the seed-mean gaps ``O_cc - O_kc`` over
-      ``[T/sqrt(10), T]`` / largest gap) below ``max(1e-3, 2 SE_runs)`` and
+    * FIXED: the signed relative change of the seed-mean margin ``margin_mean`` over
+      ``[T/sqrt(10), T]`` is below ``max(1e-3, 3 SE)`` in absolute value, ``SE`` its paired
+      bootstrap SE over runs (series I's gap stationarity, a max over ``C - 1`` noisy gaps,
+      is noise-dominated in simulations; it is reported as ``gap_stationarity``), and
       ``|d log ell / d log t| < 0.02`` over ``[T/sqrt(10), T]``, both at ``T`` and at the
       previous check ``T/sqrt(10)`` (8 records earlier; checks are every half decade).
-      ``SE_runs``: bootstrap SE of the same relative change of the per-run
-      ``margin_mean`` (full per-run ``O`` is not stored).
     * TAIL: ``t_c(1/2) <= T/10``, the last-decade and previous-decade slopes of
       ``log ell`` on ``log t`` differ by less than 0.05, and the bootstrap SE of the
       last-decade slope is below 0.05.
@@ -323,18 +324,21 @@ def certify(rec, *, at_cap=False, n_boot=200, seed=0, fixed_floor=1e-3, fixed_sl
         k0 = n - H                                       # T / sqrt(10), half a decade back
         if k0 < 1:
             z = np.zeros((nb, C))
-            return z.astype(bool), z + np.nan, z + np.nan, z + np.nan, z + np.nan
+            return z.astype(bool), z + np.nan, z + np.nan, z + np.nan, z + np.nan, z + np.nan
         slope = _index_slope(t, logL, k0, n)
-        stat = _gap_stationarity(Om[k0], Om[n])                     # (nb, C)
-        rel = lambda m0, m1: np.abs(m1 - m0) / np.maximum(np.abs(m1), 1e-300)
-        sb = rel(mm[k0][:, boot].mean(2), mm[n][:, boot].mean(2))   # (nb, n_boot, C)
-        se = sb.std(1, ddof=1)
-        thr = np.maximum(fixed_floor, 2 * se)
+        gap = _gap_stationarity(Om[k0], Om[n])                      # (nb, C), diagnostic
+        # signed relative change of the seed-mean margin over the half decade, and its
+        # paired bootstrap SE over runs (same statistic, so noise-consistent)
+        d = (mm[n].mean(1) - mm[k0].mean(1)) / np.maximum(np.abs(mm[n].mean(1)), 1e-12)
+        mb0, mb1 = mm[k0][:, boot].mean(2), mm[n][:, boot].mean(2)   # (nb, n_boot, C)
+        se = ((mb1 - mb0) / np.maximum(np.abs(mb1), 1e-12)).std(1, ddof=1)
+        thr = np.maximum(fixed_floor, fixed_nsig * se)
+        stat = np.abs(d)
         ok = (stat < thr) & (np.abs(slope) < fixed_slope)
-        return ok, slope, stat, se, thr
+        return ok, slope, stat, se, thr, gap
 
     T = t[-1]
-    fixed_now, slope_half, stat, stat_se, thr = fixed_at(N - 1)
+    fixed_now, slope_half, stat, stat_se, thr, gap = fixed_at(N - 1)
     if N - 1 - H >= 1 and t[N - 1 - H] > 0:
         fixed_prev = fixed_at(N - 1 - H)[0]
     else:
@@ -356,7 +360,7 @@ def certify(rec, *, at_cap=False, n_boot=200, seed=0, fixed_floor=1e-3, fixed_sl
            "fixed_prev": fixed_prev, "tail": tail, "t_half": t_half,
            "slope_half_decade": slope_half, "slope_last_decade": s1, "slope_prev_decade": s2,
            "slope_last_se": s1_se, "stationarity": stat, "stationarity_se": stat_se,
-           "stationarity_threshold": thr, "loss_last": Lm[-1]}
+           "stationarity_threshold": thr, "gap_stationarity": gap, "loss_last": Lm[-1]}
     if "frac_eps" in rec:
         out["frac_eps_last"] = np.asarray(rec["frac_eps"], float)[-1].mean(1)
     out["counts"] = {s: int((status == s).sum()) for s in ("FIXED", "TAIL", "MOVING",
