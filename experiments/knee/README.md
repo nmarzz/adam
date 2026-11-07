@@ -247,3 +247,24 @@ Driver: `experiments/knee/s3a.sh`, log in `figs/experiments/knee/logs/s3a.log`. 
   references;
 - a `D = 2500` finite-D check at `C = 128, kappa = 0.1`;
 - a `D = 4000` check of the `beta2 = 0.999` lane at `C = 32, kappa = 1`.
+
+**Certificate change (2026-11-06, `919b19d`).** On the first group (`C = 128, kappa = 2, eps = 1e-8`) the
+planned FIXED test failed on visibly flat stalls:
+- `ell/ell0` stayed at 0.8359–0.8364 over two decades with slope 0.000, yet only 20–45 of 128 classes certified.
+- The cause is the gap statistic: it is the maximum over 127 seed-mean gaps, about 5% from run noise. Its threshold
+  came from the much less noisy class-averaged margin, so the test was a coin flip.
+
+FIXED now requires both of the following, at `T` and at `T/sqrt(10)`:
+- the signed relative half-decade change of the seed-mean margin is within `max(1e-3, 3 SE)` of zero, with `SE`
+  its paired bootstrap error over runs;
+- `|d ln ell/d ln t| < 0.02`.
+
+Result at `T = 3162` by `beta2` = 0.9 / 0.95 / 0.99 / 0.999: 125 / 120 / 84 / 0 FIXED. I restarted the driver
+(bit-identical resume) so that later groups stop once they certify.
+
+**First readings (`C = 128, alpha = 0, kappa = 2, eps = 1e-8`, `T = 3162`):**
+- `beta2 = 0.9, 0.95`: a joint stall at `ell/ell0 = 0.836` and 0.805, with median margin 0.9 and 1.1.
+- `beta2 = 0.99`: a stall at 0.373 (margin 4.8).
+- `beta2 = 0.999`: the loss falls to 0.263 at `T ≈ 316`, then rises to 0.297 at 3162 while the margins keep
+  growing (19 against the optimum's `m* = 12.5`). This is the late rise of P6.
+- The optimum is at `ell*/ell0 = 0.141`.
