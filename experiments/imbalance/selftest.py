@@ -197,7 +197,8 @@ def test_regression():
         th = zs.deterministic_start(64, data.means)
         B0, O0 = th.T @ th, th.T @ data.means       # what E2 started from
         t0 = time.time()
-        out = I.solve_state(priors, B0, O0, times, opt=opt, beta2=0.99, kappa=1.0, safety=1.0)
+        out = I.solve_state(priors, B0, O0, times, opt=opt, beta2=0.99, kappa=1.0, safety=1.0,
+                            legacy_plan=True)    # E2 used the multi-chunk psi layout
         loss, _ = zs.class_metrics(out["B"], out["O"])
         worst[opt] = (float(np.max(np.abs(np.asarray(out["B"]) - ref["B"][:n]))),
                       float(np.max(np.abs(loss - ref["loss"][:n]))), time.time() - t0)

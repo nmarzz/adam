@@ -180,12 +180,14 @@ def jax_modules():
     return zs, jax, jnp, discounts, dynamics
 
 
-def adam_plan(priors, beta2, seed=0):
+def adam_plan(priors, beta2, seed=0, legacy=False):
     """``zipf_scaling.make_plan`` (psi route, ``2^18`` batches, window 1024 / 8192), but for
     ``C > 32`` with all paths in one chunk: at ``C = 128`` the default 3-chunk layout takes
-    ~500 s to compile (vs 89 s), for the same cost per call. ``C <= 32`` is unchanged."""
+    ~500 s to compile (vs 89 s), for the same cost per call. ``C <= 32`` is unchanged.
+    ``legacy=True`` forces the ``zipf_scaling.make_plan`` layout (same Monte Carlo draws as
+    the E-series caches, e.g. for regression tests at ``C = 64``)."""
     zs, jax, jnp, discounts, dynamics = jax_modules()
-    if len(priors) <= 32:
+    if legacy or len(priors) <= 32:
         return zs.make_plan(jnp.asarray(priors), BETA1, beta2, BATCH, seed=seed)
     return discounts.softmax_psi_plan(jax.random.PRNGKey(seed), jnp.asarray(priors), BETA1,
                                       beta2, batch=BATCH, plain_batches=max(2 ** 14, 2 ** 18 // BATCH),
@@ -193,18 +195,19 @@ def adam_plan(priors, beta2, seed=0):
                                       chunk_elements=2 ** 27)
 
 
-def coefficients_for(opt, priors, beta2, seed=0):
+def coefficients_for(opt, priors, beta2, seed=0, legacy=False):
     """``(fn, aux)`` for ``dynamics.run_mode_ode_logtime``."""
     zs, jax, jnp, discounts, dynamics = jax_modules()
     priors = jnp.asarray(priors)
     if opt == "adam":
-        layout, arrays = adam_plan(priors, beta2, seed=seed)
+        layout, arrays = adam_plan(priors, beta2, seed=seed, legacy=legacy)
         return zs.coefficient_fn(layout, "adam", False), (priors, arrays, BETA1, beta2, EPS)
     return zs.moment_fn("sgd"), (priors, zs.moment_draws(len(priors), seed=seed), EPS,
                                  float(BATCH))
 
 
-def solve_state(priors, B0, O0, times, *, opt, beta2, kappa, safety, seed=0, eta=None):
+def solve_state(priors, B0, O0, times, *, opt, beta2, kappa, safety, seed=0, eta=None,
+                legacy_plan=False):
     """Collapsed ``K = Id`` ODE in primed units, started from ``(B0, O0)`` at ``times[0]``."""
     zs, jax, jnp, discounts, dynamics = jax_modules()
     C = len(priors)
@@ -214,7 +217,7 @@ def solve_state(priors, B0, O0, times, *, opt, beta2, kappa, safety, seed=0, eta
                                         jnp.zeros((d, C)))
     initial = ((jnp.asarray(B0)[None], jnp.zeros((1, C, 0)), jnp.asarray(O0)[None]),
                (jnp.zeros((1, 0, 0)), jnp.zeros((1, 0, C)), (r ** 2 * jnp.eye(C))[None]))
-    fn, aux = coefficients_for(opt, priors, beta2, seed)
+    fn, aux = coefficients_for(opt, priors, beta2, seed, legacy=legacy_plan)
     return dynamics.run_mode_ode_logtime(fn, aux, modes, initial, lr, times, dimension=d,
                                          safety=safety)
 
