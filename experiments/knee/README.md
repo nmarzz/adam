@@ -329,3 +329,68 @@ until coordinates reach the `eps` floor (`frac_eps`). After that the effect depe
   `t = 115 → 649`) and speeds things up: 1.5e-4 against 5.1e-4 at `t = 649`.
 - This revises Kε. The `eps` floor is the knee only for lanes that would otherwise keep their normalised cliff. For
   lanes heading into a K2 balance it ends that balance.
+
+### S3a completion (runs finished 2026-11-07 02:07; logged 2026-11-09)
+
+`s3a.sh` finished every group: 32 groups at `alpha = 0`, plus the `D = 2500` check at `kappa = 0.1` and the `D = 4000`
+`beta2 = 0.999` check at `C = 32, kappa = 1`. The session that launched it ended before the later groups were logged
+and before Stage 4 was written; both are done here.
+
+**Certificates.** No group certified; every one stopped at its cap.
+- **FIXED** is reached only by stalls:
+  - `C = 128`: 125 / 120 / 84 at `kappa = 2` (`beta2` = 0.9 / 0.95 / 0.99), 101 / 79 at `kappa = 1`, and 34 / 18 at
+    `kappa = 0.5` (`beta2` = 0.9 / 0.95, the same at both `eps`);
+  - `C = 32`: 22 of 32 at `kappa = 2`, `beta2 = 0.9`.
+- **TAIL** is reached only by 89 classes (`C = 128, kappa = 0.1, D = 2500, beta2 = 0.99`) and 1 class elsewhere.
+- **UNRESOLVED means "still bending at the cap", not a broken test.** The decade slopes are still changing at `T`:
+  - SGD at `kappa = 1`, `C = 128`: 0.91 → 0.37;
+  - Adam at `kappa = 0.1`: 1.3–3.6 → 1.7–4.2 (the end of the cliff and the floor escape);
+  - Adam at `kappa = 1`, `C = 32`: 1.3 → 0.2–0.5.
+
+  The caps (`min(100 t_A, 2e8/D steps)`) stop these runs before a clean tail.
+
+## Stage 4: analysis of S3a (2026-11-09)
+
+Files in `analysis/`:
+- `lib_knee.py`: loading and phase markers.
+- `analyze_knee.py`: tables and P2–P6.
+- `frozen_field.py`: GPU, P1/P6/J5/J6.
+- `figures_knee.py`: J1–J8.
+- `recheck_knee.py`.
+- `s3b_gate.py`.
+
+Outputs are in `figs/experiments/knee/analysis/`: `s3a_tables.md`, `s3a_numbers.json`, `field/` and `figures/J*.png`.
+`recheck_knee.py` recomputes every `t_c`, knee, `ell(T)` and `m(T)` from the raw chunks with separate code and finds 0
+discrepancies.
+
+**Markers.** These use the seed-mean, class-mean `loss_cv`; at `alpha = 0` the classes are exchangeable.
+- The class spread of `ln t_c` is 0.015–0.035, and the bootstrap 5–95% intervals over runs are a few percent.
+- **The knee** is defined as the first local maximum of `-d ln ell/d ln t` after `t_c` that is followed, within half a
+  decade, by a drop to 0.8 of it. The plain global maximum picked up the later `eps`-floor escape from K2 at
+  `kappa <= 0.25`, `beta2 <= 0.95`.
+- Two early records at `D = 1000` share a step (rounded log grid). They are de-duplicated.
+
+### Verdicts
+
+| prediction | verdict | numbers |
+|---|---|---|
+| **P1**: the frozen field at the current state predicts the slope `d ln ell/dt` (within 25%) | **✔ for `beta2 <= 0.99` and SGD**; **✘ for `beta2 = 0.999`** (overpredicts 1.2–1.6x on the cliff) | `frozen_field.py` evaluates `ito_split` (psi route; SGD moments) at the seed-mean `(B, O)` on every other record. On `[t_c, t_knee]` the median predicted/measured is 1.01–1.10, with 100% of states within 25%, for every Adam `beta2 <= 0.99` lane and SGD at every `kappa` and `C`. Over all `t >= 0.1` the median is 0.97–1.06. `beta2 = 0.999`: 1.07–1.57 on the cliff, and worse at smaller `D` (1.50 at `D = 2500` vs 1.26 at 5000, `kappa = 0.1`). Adam's memory (1000 steps = `1000/D` time units) is then comparable to the cliff, so the stationary normaliser leads the simulation. `ell(mean state)/mean ell` = 1.000–1.02, so the comparison is not a Jensen artefact. One ill-conditioned window: `C = 128, kappa = 2, beta2 = 0.99` (its `[t_c, t_knee]` runs into the stall, where the slope is near 0). |
+| cliff: `ln ell` linear in `t` | **✔ at `kappa <= 0.5`, ✘ at `kappa = 2`** | `R^2` (linear `t` / `ln t`) medians: 0.997 / 0.932 at `kappa = 0.1` (linear wins in all 20 lanes), 0.985 / 0.958 at 0.25 (all 16), 0.995 / 0.974 at 0.5 (71%), 0.997 / 0.991 at 1 (69%), 0.997 / 1.000 at 2 (none). The cliff spans 6.6–11x in `t` at `kappa <= 0.25` and 1.5x at `kappa = 2`. SGD's shorter cliffs (2.4–2.7x) fit both forms. |
+| **P2** (`kappa <= 0.25`): the knee is the `eps` floor, it moves with `eps`, and the tail ratio `G ≈ 1.15` | **✔ at `kappa = 0.1`; mixed at 0.25** | **`kappa = 0.1`:** `ell_knee/ell0` is 5.8e-4–1.1e-3 at `eps = 1e-8` and 8e-8–8e-7 at `1e-16`, a drop of 1.4e-4–9e-4 (`sqrt(eps)` predicts 1e-4; the plan's "about 100x" was a typo). The knee margin moves from 10–11 to 18–22. **`G`** = 1.10–1.35 (`C = 128`) and 1.17–1.19 (`C = 32`). The J5 regime map puts every `kappa <= 0.25` knee at the switch of the normaliser to the `eps` floor. **`kappa = 0.25`, `C = 128`:** the effect depends on `beta2`. `beta2 = 0.9` sits 82x *higher* with `eps = 1e-16`: without the floor it stays in a K2 balance at `m = 8.3`. `beta2 = 0.999` sits 0.22x lower. These are the two roles of `eps` noted above. |
+| knee margin against `r'` (J4) | the knee sits at **`m ∝ r'`**, not at `m* = r'^2` | Without floor interference (`eps = 1e-16`, `beta2 >= 0.99`) the slope of `m_knee` against `r'` is 0.98–1.04 (`C = 128`) and 1.03–1.25 (`C = 32`), so `m_knee ≈ 1.2 r'`. With `eps = 1e-8` the floor caps it at `m ≈ 10–12` for `kappa <= 0.25` (slope 0.65–0.78). |
+| **P3** (`kappa >= 0.5`): the late loss approaches `ell*`, and `eps` changes nothing | **partly** | At `T`, `ell/ell*` is 1.6–3.0 for every non-stalled lane at `kappa = 1, 2` (SGD 1.6–2.9). These runs flatten **above** the optimum and are not converging onto it: margins overshoot `m*` at `kappa = 2` (20–22 vs 12.5), and the loss there rises again. `eps` has no effect at `kappa >= 1` (ratio 1.000). At `kappa = 0.5` it does (`eps = 1e-16 / 1e-8` = 4.5 at `C = 128, beta2 = 0.99`; 0.4–0.6 at `C = 32`), because the loss (≈ 1e-4) reaches the floor there. |
+| **P4**: `alpha = 0` stalls sit at the frozen K2 zero (scaled by `1/kappa`) | **✔, no fitting** | `C = 128` stall margins against the predicted range: `kappa = 2`: 0.92 (0.87–0.98), 1.11 (1.03–1.18), 4.84 (3.93–4.08); `kappa = 1`: 1.86 (1.75–1.96), 2.25 (2.05–2.35), 8.49 (7.86–8.17); `kappa = 0.5`: 3.95 (3.49–3.92), 4.97 (4.10–4.70). `C = 32, kappa = 2, beta2 = 0.9` (22/32 FIXED): 6.32 against 7.85–8.66, 20% low. J6: the K2 balance ratio tends to 1 in every stalled lane. |
+| **P5** (`C = 32`) | **✔ qualitatively** | No stall except at `kappa = 2`, `beta2 = 0.9`, where it sits near the optimum (`ell/ell* = 2.1`; 1.4 was predicted). At `kappa = 1, 2` every lane ends at 1.6–2.8 `ell*`. The `beta2 = 0.999` cliff is not faster: its slope is −0.33 against −0.36 for 0.99 at `kappa = 1`, and its `t_c` is shorter only through the earlier start. |
+| **P6**: a late rise is the Itô term, which balances the B drift at a fixed point | **✔ where a rise is seen; ✔ at the fixed points** | Late split of `d ell/dt` (last 3 field records). **Where the loss rises:** SGD at `kappa = 2` has Itô/(−drift) = 1.008 (`C = 128`) and 1.015 (`C = 32`), predicted +8.7e-5 / +1.9e-4 against measured +1.3e-4 / +2.0e-4. Adam `C = 32`, `beta2 = 0.999` gives 1.003 (+2.3e-5 against +3.9e-5). Adam `C = 128`, `beta2 = 0.999`, `kappa = 2` is balanced to 0.4%, too fine to resolve. **At the stalls:** the Itô part (2–4e-2) cancels the B drift to 2–6%. The residual (1.5–5e-3) is the precision of that cancellation; the measured slope is about 1e-6. |
+| finite D | ✔ | Halving `D` at `kappa = 0.1`, `C = 128` (5000 → 2500): `t_c` +3%, `ell_knee` 1.26–1.40x higher for `beta2 <= 0.99`, `ell(T)` +1%. `beta2 = 0.999` at `C = 32, kappa = 1`, `D = 1000` against 4000: `t_c` 1.05 against 1.48 (the `D = 1000` warm-up runs ahead), knee 6.5 against 4.9, `ell(T)` 1.19e-2 against 1.18e-2. |
+
+**Revised picture of the four phases (`alpha = 0`).**
+1. **Plateau.** It lasts until the margin is `O(1)`.
+2. **Cliff.** Its slope is exactly the frozen ODE field at the current state (P1). Adam's is steeper than SGD's because the
+   normalised forcing does not shrink with the gradient. At low noise `ln ell` is linear in `t` over a 7–11x span.
+3. **Knee.** There are three mechanisms, and which one acts depends on `kappa`:
+   - at `kappa <= 0.25`, the `eps` floor (Kε; it moves with `eps`, at margin `≈ 1.2 r'` when not floor-capped);
+   - at `kappa >= 1` with short memory, a K2 fixed point at the predicted margin;
+   - otherwise the approach to a noise floor at 1.6–3 `ell*`.
+4. **Tail.** After the `eps` floor, Adam is SGD with a larger step (`G ≈ 1.1–1.35`). At `kappa = 2`, a late rise
+   driven by the Itô term.
