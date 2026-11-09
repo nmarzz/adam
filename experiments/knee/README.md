@@ -394,3 +394,36 @@ discrepancies.
    - otherwise the approach to a noise floor at 1.6–3 `ell*`.
 4. **Tail.** After the `eps` floor, Adam is SGD with a larger step (`G ≈ 1.1–1.35`). At `kappa = 2`, a late rise
    driven by the Itô term.
+
+### S3b gate (`C = 128, alpha = 1, kappa = 1, eps = 1e-8`; run 2026-11-09, `s4gpu.sh`; `analysis/s3b_gate.py`)
+
+The plan's gate: the simulation must reproduce series I's cached ODE (`figs/experiments/imbalance/ode`): the
+`beta2 <= 0.95` fixed point with about 27–31 classes learned, and `t_c` within about 3%.
+
+Setup: Adam ran to `T = 3162` (3.2M steps, 38 min) and SGD to `T = 1000`.
+
+| | learned at `t = 316`, sim / ODE | learned at `T` | `t_c` sim/ODE: median, max \|log\| (classes) | stalled classes `ell(T)`, sim/ODE | certificate at `T` |
+|---|---|---|---|---|---|
+| Adam 0.9 | 28 / 27 | 28 | 1.002, 0.11 (27) | 1.000 | 126 FIXED |
+| Adam 0.95 | 32 / 31 | 32 | 1.001, 0.32 (31) | 0.998 | 126 FIXED |
+| Adam 0.99 | 80 / 77 | 81 | 0.997, 0.37 (77) | 0.983 | 123 FIXED |
+| Adam 0.999 | 128 / 128 | 128 | 0.963, 1.37 (128) | – | 128 MOVING |
+| SGD | 128 / 128 | 128 | 1.009, 0.09 (128) | – | 127 MOVING, 1 TAIL |
+
+**The gate passes.**
+- Learned counts agree to within 1–3 classes.
+- The median `t_c` agrees to 0.3%. The largest deviations are classes at the edge of the stall, where `t_c` is
+  ill-conditioned.
+- The stalled classes end at the same loss, to within 2%.
+
+**New result: `beta2 = 0.99` also stops at a fixed point.** It reaches 123 of 128 classes FIXED, with 81 learned, which
+answers series I's open question. Series I's ODE had stopped at `T = 316`, where 77 classes were learned and the run
+was still moving.
+
+The `beta2 = 0.999` lane deviates by up to 1.37 in `|log t_c|`. This is the known `D = 1000` memory issue at that
+`beta2` (P1), not a gate failure.
+
+**Not run (decision needed):**
+- the rest of S3b: `alpha = 1`, the other `kappa`, both `eps`; about 2.5 GPU-h at `T0` on this H100 in f64;
+- S3c: `alpha = 2`, 100–300 GPU-h;
+- the `eps = 1e-16` frozen field, which needs the finer psi grid.
