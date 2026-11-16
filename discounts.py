@@ -36,9 +36,9 @@ def drift_matrix_from_B(B, f, beta1, beta2, key, num_samples=100_000,
     multiclass softmax. ``noise_std`` adds independent centered Gaussian noise
     to the gradient profile, as required by noisy linear regression.
     """
-    key_Q, key_Q_hist, key_z, key_z_hist = jax.random.split(key, 4)
-    key_noise = jax.random.fold_in(key, 1)
-    key_noise_hist = jax.random.fold_in(key, 2)
+    # All six streams from one split: with partitionable threefry,
+    # fold_in(key, i) == split(key, n)[i], so fold_in here would reuse key_Q_hist / key_z.
+    key_Q, key_Q_hist, key_z, key_z_hist, key_noise, key_noise_hist = jax.random.split(key, 6)
     Binv = jnp.linalg.pinv(B, hermitian=True)
 
     Q = jax.random.multivariate_normal(key_Q, jnp.zeros(len(B)), B, shape=(num_samples, 1))
@@ -98,8 +98,9 @@ def sigma0_samples(B, f, beta1, beta2, key, corr_chol, *,
     coordinate and enables the cheap diagonal contraction.
     """
     n, H, D = num_samples, history_length, corr_chol.shape[0]
-    key_q, key_x = jax.random.split(key)
-    key_noise = jax.random.fold_in(key, 1)
+    # One split for all streams: fold_in(key, 1) == split(key)[1] == key_x, which
+    # made the label noise a copy of xi (omega = noise_std * xi).
+    key_q, key_x, key_noise = jax.random.split(key, 3)
     sequence = 2 * H - 1
     q = jax.random.multivariate_normal(
         key_q, jnp.zeros(B.shape[0]), B, shape=(n, sequence)
