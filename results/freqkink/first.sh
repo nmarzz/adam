@@ -5,5 +5,6 @@
 cd "$(dirname "$0")/../.."
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 real/bin/python experiments/freqkink.py sweep --spec results/freqkink/first.json 2>&1 | grep --line-buffered -v Warn
-real/bin/python experiments/freqkink_analysis.py --rate S --tw 100
+real/bin/python experiments/freqkink_analysis.py --rate G --tw 100
+real/bin/python experiments/freqkink_analysis.py --rate Gt --theta 1
 real/bin/python experiments/freqkink_analysis.py --rate half

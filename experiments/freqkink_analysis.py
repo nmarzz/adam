@@ -4,12 +4,19 @@ Per-token quantities are pooled into log-frequency bins of the empirical
 training frequency pi_c. Two curves per bin and checkpoint:
 
 * loss      l_bin(t)  pooled held-out cross-entropy of the bin's tokens,
-* signal    S_bin(t)  pooled  w_c . (x_c - xbar): own logit on the token's own held-out
-                      contexts minus its logit on the mean held-out context.
+* gain      G_bin(t)  pooled  z_c - z_u on the token's own held-out contexts, with u a
+                      token never seen in training. Every column without an own event
+                      equals the common background column, so G isolates the effect of
+                      the token's own events and l_c = (lse - z_u) - G_c exactly.
+* signal    S_bin(t)  pooled  w_c . (x_c - xbar) (contaminated by the background push).
 
 Rate estimates per bin (all per optimizer step):
 
-* ``S``     early slope of the class-specific signal, S_bin(t_w) / t_w,
+* ``Gslope`` stationary slope dG/dt on [T/4, T]; for the frozen-drift runs this is
+            the per-class drift at initialization (use with --frozen),
+* ``G``     early slope of the own-event gain, G_bin(t_w) / t_w (default),
+* ``Gt``    theta / t_theta with t_theta the first step at which G_bin >= theta,
+* ``S``     early slope of the signal S_bin(t_w) / t_w,
 * ``half``  1 / t_half with t_half the first step at which l_bin <= l_bin(0) / 2,
 * ``drop``  delta / t_delta with t_delta the first step at which l_bin <= l_bin(0) - delta.
 
@@ -78,7 +85,7 @@ def bins_for(train_counts, width=0.25, min_count=1):
 def bin_curves(r, edges, k, min_test=50):
     """Pooled loss and signal per bin, shapes (n_bins, n_ckpt); plus bin centres."""
     tc = r["test_counts"]
-    L, S, cen, mass, ntypes = [], [], [], [], []
+    L, S, G, cen, mass, ntypes = [], [], [], [], [], []
     pi = r["train_counts"] / r["train_counts"].sum()
     for j in range(1, len(edges)):
         m = (k == j) & (tc > 0)
@@ -87,11 +94,15 @@ def bin_curves(r, edges, k, min_test=50):
             continue
         L.append(r["per_tok_sum"][:, m].sum(1) / n)
         S.append((r["own_logit_sum"][:, m].sum(1) - (r["mean_ctx_logit"][:, m] * tc[m]).sum(1)) / n)
+        if "gain_sum" in r:
+            G.append(r["gain_sum"][:, m].sum(1) / n)
+        elif "bg_logit_sum" in r:
+            G.append((r["own_logit_sum"][:, m].sum(1) - r["bg_logit_sum"][:, m].sum(1)) / n)
         # centre: test-occurrence-weighted mean of log10 pi over the bin
         cen.append(10 ** (np.sum(tc[m] * np.log10(pi[m])) / n))
         mass.append(pi[k == j].sum())
         ntypes.append(int(m.sum()))
-    return dict(L=np.array(L), S=np.array(S), pi=np.array(cen), mass=np.array(mass),
+    return dict(L=np.array(L), S=np.array(S), G=np.array(G), pi=np.array(cen), mass=np.array(mass),
                 ntypes=np.array(ntypes))
 
 
@@ -112,12 +123,22 @@ def interp_at(steps, y, t):
     return float(np.interp(np.log(t), np.log(np.maximum(steps, 0.5)), y))
 
 
-def rates(r, bc, kind="S", tw=100, delta=1.0):
+def first_rise(steps, y, level):
+    return first_crossing(steps, -y, -level)
+
+
+def rates(r, bc, kind="G", tw=100, delta=1.0, theta=1.0):
     steps = r["steps"].astype(float)
     out = []
     for j in range(len(bc["pi"])):
-        if kind == "S":
-            out.append(interp_at(steps, bc["S"][j], tw) / tw)
+        if kind in ("S", "G"):
+            out.append(interp_at(steps, bc[kind][j], tw) / tw)
+        elif kind == "Gslope":
+            # stationary drift: least-squares slope of G against steps on [T/4, T]
+            sel = steps >= steps[-1] / 4
+            out.append(np.polyfit(steps[sel], bc["G"][j][sel], 1)[0])
+        elif kind == "Gt":
+            out.append(theta / first_rise(steps, bc["G"][j], theta))
         elif kind == "half":
             l0 = bc["L"][j, 0]
             out.append(1.0 / first_crossing(steps, bc["L"][j], l0 / 2))
@@ -188,7 +209,9 @@ def group_key(cfg):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rate", default="S", choices=["S", "half", "drop"])
+    ap.add_argument("--rate", default="G", choices=["G", "Gslope", "Gt", "S", "half", "drop"])
+    ap.add_argument("--frozen", action="store_true", help="analyse the frozen-drift (lr -> 0) runs")
+    ap.add_argument("--theta", type=float, default=1.0, help="gain threshold for --rate Gt")
     ap.add_argument("--tw", type=float, default=100, help="early window (steps) for --rate S")
     ap.add_argument("--delta", type=float, default=1.0)
     ap.add_argument("--width", type=float, default=0.25, help="bin width in decades")
@@ -199,23 +222,26 @@ def main():
     apply_paper_style()
     FIGS.mkdir(parents=True, exist_ok=True)
 
-    runs = [r for r in load_runs() if bool(r["cfg"].get("center", False)) == args.center]
+    runs = [r for r in load_runs() if bool(r["cfg"].get("center", False)) == args.center
+            and bool(r["cfg"].get("frozen", False)) == args.frozen]
     if not runs:
         raise SystemExit("no runs")
     pi, edges, k = bins_for(runs[0]["train_counts"], args.width)
     groups = {}
     for r in runs:
         r["bc"] = bin_curves(r, edges, k)
-        r["rate"] = rates(r, r["bc"], args.rate, args.tw, args.delta)
+        r["rate"] = rates(r, r["bc"], args.rate, args.tw, args.delta, args.theta)
         groups.setdefault(group_key(r["cfg"]), []).append(r)
     for g in groups.values():
         g.sort(key=lambda r: r["cfg"]["b"])
     bs = sorted({r["cfg"]["b"] for r in runs})
     cmap = plt.get_cmap("viridis")
     col = {b: cmap(i / max(len(bs) - 1, 1) * 0.9) for i, b in enumerate(bs)}
-    suffix = f"_{args.rate}" + (f"_tw{args.tw:g}" if args.rate == "S" else "") + \
+    suffix = f"_{args.rate}" + (f"_tw{args.tw:g}" if args.rate in ("S", "G") else "") + \
+        (f"_th{args.theta:g}" if args.rate == "Gt" else "") + ("_frozen" if args.frozen else "") + \
         ("_center" if args.center else "") + args.tag
-    report = {"rate": args.rate, "tw": args.tw, "center": args.center, "groups": {}}
+    report = {"rate": args.rate, "tw": args.tw, "theta": args.theta, "center": args.center,
+              "frozen": args.frozen, "groups": {}}
 
     # ---- Figure 1: rate vs frequency -------------------------------------
     names = sorted(groups, key=lambda s: (s == "SGD", s))
@@ -254,7 +280,10 @@ def main():
         ax.set_xlabel(r"token frequency $\pi_c$")
         ax.set_title(gname, fontsize=15)
         polish_axis(ax)
-    lab = {"S": rf"early signal rate $S(t_w)/(\eta t_w)$, $t_w$={args.tw:g}",
+    lab = {"G": rf"own-event gain rate $G(t_w)/(\eta t_w)$, $t_w$={args.tw:g}",
+           "Gslope": r"init drift $\dot G/\eta$ (frozen, per step)",
+           "Gt": rf"$\theta/(\eta\, t_\theta)$, $G(t_\theta)=\theta$={args.theta:g}",
+           "S": rf"early signal rate $S(t_w)/(\eta t_w)$, $t_w$={args.tw:g}",
            "half": r"$1/(\eta\, t_{1/2})$", "drop": rf"$\delta/(\eta\, t_\delta)$, $\delta$={args.delta:g}"}
     axes[0, 0].set_ylabel(lab[args.rate])
     axes[0, 0].legend(fontsize=11, loc="lower right")
@@ -283,6 +312,8 @@ def main():
                 ok = np.isfinite(R) & (R > 0)
                 ax.loglog(x[ok], R[ok], "o", ms=5, color=col[b], label=f"b={b} / {b_ref}")
                 X.append(x[ok]); Y.append(R[ok])
+            if not X:
+                continue
             X, Y = np.concatenate(X), np.concatenate(Y)
             f = fit_bend(X, Y)
             kap = kappa(0.0, beta2)

@@ -14,8 +14,15 @@ loss are stored, so per-token and per-frequency-bin curves l_c(t) can be formed
 afterwards. For Adam the per-output RMS and median over coordinates of
 sqrt(v_hat) are stored as well (to compare against eps). Per-token sums of the
 own logit on the held-out contexts and the logits on the mean held-out context
-give the class-specific signal S_c = w_c . (xbar_c - xbar), which is insensitive
-to the background push of every column along the shared mean direction.
+give the signal S_c = w_c . (xbar_c - xbar). Per-token sums of the logit of a
+never-seen token u give the own-event gain G_c = mean over c's held-out contexts
+of z_c - z_u: from W = 0 every column without an own event receives the same
+update, so all such columns equal a common w_bg(t) and l_c = (lse - z_u) - G_c
+splits the loss exactly into a background part and an own-event part. The gain is
+also stored computed elementwise in float32 (``gain_sum``), which keeps the tiny
+column differences of the frozen-drift runs (lr -> 0, "frozen": true in a spec):
+there the denominators become stationary while W barely moves, so G(t)/(lr t)
+measures the per-class drift at initialization.
 
 Usage (from the repository root):
     real/bin/python experiments/freqkink.py tune --opt adam --b 32 --beta2 0.99 --eps 1e-12
@@ -91,6 +98,9 @@ class Data:
         self.perm = jnp.asarray(np.random.default_rng(seed).permutation(n_train).astype(np.int32))
         self.train_counts = np.bincount(ytr[:n_train], minlength=C)
         self.test_counts = np.bincount(yte[:n_test], minlength=C)
+        self.unseen = jnp.asarray(np.nonzero(self.train_counts == 0)[0].astype(np.int32))
+        # per-token sums of the held-out contexts, (C, D) float32, for the exact gain
+        self.ctx_sum = context_sums(self.Xte, self.yte, self.mu)
         print(f"data: train {n_train:,}  test {n_test:,}  centre={center}  "
               f"|mu|={float(jnp.linalg.norm(self.mu)):.1f}  ({time.time() - t0:.0f}s)", flush=True)
 
@@ -123,21 +133,46 @@ def make_train(opt, b, beta2, eps):
 
 
 @jax.jit
-def evaluate(W, Xte, yte, mu):
-    """Per-token sums of held-out cross-entropy and the total."""
+def evaluate(W, Xte, yte, mu, u):
+    """Per-token sums over held-out positions of: the loss, the own logit z_y,
+    and the logit z_u of the background column u (a token never seen in training)."""
 
     def chunk(carry, xy):
         x, y = xy
         logits = (x.astype(jnp.float32) - mu) @ W
         lse = jax.nn.logsumexp(logits, axis=-1)
         own = jnp.take_along_axis(logits, y[:, None], axis=1)[:, 0]
-        L, O = carry
+        L, O, B = carry
         return (L + jax.ops.segment_sum(lse - own, y, num_segments=C),
-                O + jax.ops.segment_sum(own, y, num_segments=C)), None
+                O + jax.ops.segment_sum(own, y, num_segments=C),
+                B + jax.ops.segment_sum(logits[:, u], y, num_segments=C)), None
 
     z = jnp.zeros(C, jnp.float32)
-    (per_tok, own), _ = lax.scan(chunk, (z, z), (Xte, yte))
-    return per_tok, own
+    (per_tok, own, bg), _ = lax.scan(chunk, (z, z, z), (Xte, yte))
+    return per_tok, own, bg
+
+
+@jax.jit
+def context_sums(Xte, yte, mu):
+    def chunk(acc, xy):
+        x, y = xy
+        return acc + jax.ops.segment_sum(x.astype(jnp.float32) - mu, y, num_segments=C), None
+    acc, _ = lax.scan(chunk, jnp.zeros((C, Xte.shape[-1]), jnp.float32), (Xte, yte))
+    return acc
+
+
+@jax.jit
+def gain_sums(W, ctx_sum, u):
+    """Sum over c's held-out contexts of z_c - z_u, computed elementwise in float32
+    as (w_c - w_u) . sum_i x_i (no TF32 rounding of the small column differences)."""
+    return jnp.sum((W - W[:, u][:, None]).T * ctx_sum, axis=1)
+
+
+@jax.jit
+def bg_spread(W, idx):
+    """Max deviation among the columns of never-seen tokens (identical in exact arithmetic)."""
+    Wz = W[:, idx]
+    return jnp.max(jnp.abs(Wz - Wz[:, :1])), jnp.max(jnp.abs(Wz[:, :1]))
 
 
 @jax.jit
@@ -166,16 +201,17 @@ def run(data, opt, b, lr, beta2=0.99, eps=1e-12, budget=None, per_octave=4, vsta
     train = make_train(opt, b, beta2, eps)
     W = jnp.zeros((768, C), jnp.float32)
     v = jnp.zeros((768, C), jnp.float32) if opt == "adam" else jnp.zeros((1, 1), jnp.float32)
-    per_tok, own, gen, vrms, vmed, wall = [], [], [], [], [], []
+    per_tok, own, bgl, gsum, gen, vrms, vmed, wall = [], [], [], [], [], [], [], []
     t0 = time.time()
     prev = 0
     for t in ckpt:
         if t > prev:
             W, v = train(W, v, data.Xtr, data.ytr, data.perm, data.mu, prev, int(t), jnp.float32(lr))
             prev = int(t)
-        pt, ow = evaluate(W, data.Xte, data.yte, data.mu)
+        pt, ow, bl = evaluate(W, data.Xte, data.yte, data.mu, data.unseen[0])
         pt = np.asarray(pt)
-        per_tok.append(pt); own.append(np.asarray(ow))
+        per_tok.append(pt); own.append(np.asarray(ow)); bgl.append(np.asarray(bl))
+        gsum.append(np.asarray(gain_sums(W, data.ctx_sum, data.unseen[0])))
         gen.append(np.asarray(mean_context_logits(W, data.xbar)))
         if opt == "adam" and vstats and t > 0:
             r, m = v_stats(v, jnp.float32(t), jnp.float32(beta2))
@@ -190,8 +226,14 @@ def run(data, opt, b, lr, beta2=0.99, eps=1e-12, budget=None, per_octave=4, vsta
     out = dict(steps=ckpt[:len(per_tok)], samples=ckpt[:len(per_tok)] * b,
                per_tok_sum=np.stack(per_tok).astype(np.float32),
                own_logit_sum=np.stack(own).astype(np.float32),
+               bg_logit_sum=np.stack(bgl).astype(np.float32),
+               gain_sum=np.stack(gsum).astype(np.float32),
                mean_ctx_logit=np.stack(gen).astype(np.float32),
                total=np.stack(per_tok).sum(1) / data.n_test, wall=np.array(wall))
+    spread, scale = bg_spread(W, data.unseen)
+    out["bg_spread"] = np.array([float(spread), float(scale)])
+    if log:
+        print(f"    never-seen columns: max deviation {float(spread):.2e} (column scale {float(scale):.2e})", flush=True)
     if vrms:
         out["v_rms"] = np.stack(vrms).astype(np.float32)
         out["v_med"] = np.stack(vmed).astype(np.float32)
@@ -282,10 +324,10 @@ def sweep(data, spec):
     tfile = OUT / "tune.json"
     tuned = json.loads(tfile.read_text()) if tfile.exists() else {}
     for cfg in spec["configs"]:
-        cfg = dict(beta2=0.99, eps=1e-12, **cfg)
+        cfg = {"beta2": 0.99, "eps": 1e-12, **cfg}
         key = tag(cfg["opt"], cfg["b"], 0, cfg["beta2"], cfg["eps"], data.center).replace("_lr0", "")
         print(f"=== {key}", flush=True)
-        if key not in tuned:
+        if key not in tuned and not cfg.get("lr"):
             grid = cfg.pop("grid", ADAM_GRID if cfg["opt"] == "adam" else SGD_GRID)
             best, res = tune(data, cfg["opt"], cfg["b"], cfg["beta2"], cfg["eps"], grid,
                              spec["tune_budget"])
@@ -294,14 +336,15 @@ def sweep(data, spec):
             tuned[key] = {"best": best, "losses": {f"{k:.3g}": v for k, v in res.items()}}
             tfile.write_text(json.dumps(tuned, indent=1))
         cfg.pop("grid", None)
+        frozen = cfg.pop("frozen", False)
         lr = cfg.pop("lr", None) or tuned[key]["best"]
-        name = tag(cfg["opt"], cfg["b"], lr, cfg["beta2"], cfg["eps"], data.center)
+        name = tag(cfg["opt"], cfg["b"], lr, cfg["beta2"], cfg["eps"], data.center) + ("_frozen" if frozen else "")
         if (OUT / "runs" / f"{name}.npz").exists():
             print(f"    {name} exists, skipping", flush=True)
             continue
         c = dict(cfg, lr=lr)
         out = run(data, **c)
-        save(name, out, c, data)
+        save(name, out, dict(c, frozen=frozen), data)
 
 
 if __name__ == "__main__":
