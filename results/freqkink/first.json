@@ -1,0 +1,18 @@
+{
+ "tune_budget": 4000000,
+ "center": false,
+ "configs": [
+  {"opt": "adam", "b": 2048, "beta2": 0.99, "eps": 1e-12},
+  {"opt": "adam", "b": 512,  "beta2": 0.99, "eps": 1e-12},
+  {"opt": "adam", "b": 128,  "beta2": 0.99, "eps": 1e-12},
+  {"opt": "adam", "b": 32,   "beta2": 0.99, "eps": 1e-12},
+  {"opt": "sgd",  "b": 2048},
+  {"opt": "sgd",  "b": 512},
+  {"opt": "sgd",  "b": 128},
+  {"opt": "sgd",  "b": 32},
+  {"opt": "adam", "b": 2048, "beta2": 0.99, "eps": 1e-8},
+  {"opt": "adam", "b": 512,  "beta2": 0.99, "eps": 1e-8},
+  {"opt": "adam", "b": 128,  "beta2": 0.99, "eps": 1e-8},
+  {"opt": "adam", "b": 32,   "beta2": 0.99, "eps": 1e-8}
+ ]
+}
