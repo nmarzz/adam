@@ -218,6 +218,8 @@ def main():
     ap.add_argument("--center", action="store_true", help="analyse the centred-feature runs")
     ap.add_argument("--b-ref", type=int, default=None, help="reference batch (default: largest)")
     ap.add_argument("--tag", default="")
+    ap.add_argument("--norm", default="window", choices=["window", "plateau"],
+                    help="collapse normalization: sqrt(b) window law vs reference, or each run's plateau")
     args = ap.parse_args()
     apply_paper_style()
     FIGS.mkdir(parents=True, exist_ok=True)
@@ -238,7 +240,7 @@ def main():
     cmap = plt.get_cmap("viridis")
     col = {b: cmap(i / max(len(bs) - 1, 1) * 0.9) for i, b in enumerate(bs)}
     suffix = f"_{args.rate}" + (f"_tw{args.tw:g}" if args.rate in ("S", "G") else "") + \
-        (f"_th{args.theta:g}" if args.rate == "Gt" else "") + ("_frozen" if args.frozen else "") + \
+        (f"_th{args.theta:g}" if args.rate == "Gt" else "") + ("_frozen" if args.frozen else "") + ("_plateau" if args.norm == "plateau" else "") + \
         ("_center" if args.center else "") + args.tag
     report = {"rate": args.rate, "tw": args.tw, "theta": args.theta, "center": args.center,
               "frozen": args.frozen, "groups": {}}
@@ -293,7 +295,7 @@ def main():
     plt.close(fig)
 
     # ---- Figure 2: collapse ----------------------------------------------
-    adam = [g for g in names if g != "SGD"]
+    adam = [g for g in names if g != "SGD" and len(groups[g]) > 1]
     if adam:
         fig, axes = plt.subplots(1, len(adam), figsize=(6.2 * len(adam), 5.4), squeeze=False)
         for ax, gname in zip(axes[0], adam):
@@ -303,14 +305,20 @@ def main():
             beta2 = ref["cfg"]["beta2"]
             X, Y = [], []
             for r in g:
-                if r is ref:
+                if r is ref and args.norm == "window":
                     continue
                 b = r["cfg"]["b"]
-                # window law: rate per step ∝ eta sqrt(b pi)  =>  normalize so the window is flat
-                R = (r["rate"] / r["cfg"]["lr"]) / (ref["rate"] / ref["cfg"]["lr"]) * np.sqrt(b_ref / b)
+                if args.norm == "window":
+                    # window law: rate per step ∝ eta sqrt(b pi)  =>  normalize so the window is flat
+                    R = (r["rate"] / r["cfg"]["lr"]) / (ref["rate"] / ref["cfg"]["lr"]) * np.sqrt(b_ref / b)
+                else:
+                    # each run divided by its own plateau (median rate over pi_c in [1e-4, 1e-2])
+                    pl = (r["bc"]["pi"] >= 1e-4) & (r["bc"]["pi"] <= 1e-2)
+                    R = r["rate"] / np.nanmedian(r["rate"][pl])
                 x = b * r["bc"]["pi"] / (1 - beta2)
                 ok = np.isfinite(R) & (R > 0)
-                ax.loglog(x[ok], R[ok], "o", ms=5, color=col[b], label=f"b={b} / {b_ref}")
+                ax.loglog(x[ok], R[ok], "o", ms=5, color=col[b],
+                          label=f"b={b} / {b_ref}" if args.norm == "window" else f"b={b}")
                 X.append(x[ok]); Y.append(R[ok])
             if not X:
                 continue
@@ -331,7 +339,8 @@ def main():
             ax.set_xlabel(r"$x=b\pi_c/(1-\beta_2)$")
             ax.set_title(gname, fontsize=15)
             polish_axis(ax)
-        axes[0, 0].set_ylabel(r"$\frac{\mathrm{rate}(b)/\eta_b}{\mathrm{rate}(b_\mathrm{ref})/\eta_\mathrm{ref}}\sqrt{b_\mathrm{ref}/b}$")
+        axes[0, 0].set_ylabel(r"$\frac{\mathrm{rate}(b)/\eta_b}{\mathrm{rate}(b_\mathrm{ref})/\eta_\mathrm{ref}}\sqrt{b_\mathrm{ref}/b}$"
+                              if args.norm == "window" else "rate / plateau rate")
         axes[0, 0].legend(fontsize=11)
         fig.tight_layout()
         fig.savefig(FIGS / f"collapse{suffix}.pdf", metadata={"CreationDate": None})
