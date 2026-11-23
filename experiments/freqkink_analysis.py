@@ -51,6 +51,7 @@ ROOT = Path(__file__).resolve().parents[1]
 OUT = Path(os.environ.get("FREQKINK_OUT", ROOT / "results" / "freqkink"))
 FIGS = Path(os.environ.get("FREQKINK_FIGS", ROOT / "figs" / "freqkink"))
 C = 50257
+GAIN_KEY = os.environ.get("FREQKINK_GAIN", "gain_sum")  # gptkink probes: gain_own_sum = forcing
 
 
 def kappa(beta1=0.0, beta2=0.99):
@@ -94,8 +95,8 @@ def bin_curves(r, edges, k, min_test=50):
             continue
         L.append(r["per_tok_sum"][:, m].sum(1) / n)
         S.append((r["own_logit_sum"][:, m].sum(1) - (r["mean_ctx_logit"][:, m] * tc[m]).sum(1)) / n)
-        if "gain_sum" in r:
-            G.append(r["gain_sum"][:, m].sum(1) / n)
+        if GAIN_KEY in r:
+            G.append(r[GAIN_KEY][:, m].sum(1) / n)
         elif "bg_logit_sum" in r:
             G.append((r["own_logit_sum"][:, m].sum(1) - r["bg_logit_sum"][:, m].sum(1)) / n)
         # centre: test-occurrence-weighted mean of log10 pi over the bin
