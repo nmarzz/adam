@@ -6,12 +6,17 @@ repository root with the system python3 (standard library only; it works on the 
 or jump host, where the lm/ venv's python3.12 does not exist; the jobs themselves use
 lm/bin/python on the GPU node). Add --dry-run to print the sbatch commands.
 
-    python3 experiments/gptkink_launch.py prep      # tokenize OWT (once, ~1-2 h)
-    python3 experiments/gptkink_launch.py smoke     # Stage 0 checks (~30 min)
-    python3 experiments/gptkink_launch.py tune      # lr grid, 10% budget (20 short jobs)
-    python3 experiments/gptkink_launch.py status    # tuning table, runs, probes
-    python3 experiments/gptkink_launch.py stage1    # 8 runs + dependent probe jobs
-    python3 experiments/gptkink_launch.py resume    # resubmit unfinished runs / probes
+The QOS allows one running H100 job per user (five submitted), so runs are not separate
+jobs: ``tune`` and ``stage1`` append tasks to results/gptkink/queue/tasks.txt and a
+single ``gk_worker`` job (gptkink_worker.py) runs them in order, checkpointing and
+resubmitting itself before the 24 h limit.
+
+    python3 experiments/gptkink_launch.py prep      # tokenize OWT (own job, once)
+    python3 experiments/gptkink_launch.py smoke     # Stage 0 checks (own job, ~30 min)
+    python3 experiments/gptkink_launch.py tune      # queue the lr grid (20 tasks, 10% budget)
+    python3 experiments/gptkink_launch.py worker    # submit the worker if none is queued
+    python3 experiments/gptkink_launch.py status    # queue, tuning table, runs, probes
+    python3 experiments/gptkink_launch.py stage1    # queue 8 runs + probes (after tuning)
 """
 from __future__ import annotations
 
@@ -25,6 +30,7 @@ RES = ROOT / "results" / "gptkink"
 CK = ROOT / "data" / "gptkink" / "ckpt"
 PY = "lm/bin/python"
 JOB = "results/gptkink/job.sbatch"
+Q = RES / "queue"
 
 L = 256
 BS = {1024: 4, 4096: 16, 16384: 64, 65536: 256}     # b (tokens/step) -> B (sequences)
@@ -89,18 +95,57 @@ def cmd_smoke(a):
     sbatch("gk_smoke", cmd, a.dry_run, extra=["-t", "0-02:00"])
 
 
+def enqueue(tid, cmd, dry):
+    """Append a task (one command, no shell operators) unless the id is already listed."""
+    f = Q / "tasks.txt"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    have = {line.split("\t", 1)[0] for line in f.read_text().splitlines()} if f.exists() else set()
+    line = f"{tid}\t{' '.join(cmd)}"
+    if tid in have:
+        print(f"  (queued already) {tid}")
+        return
+    print(f"  + {line}")
+    if not dry:
+        with open(f, "a") as fh:
+            fh.write(line + "\n")
+
+
 def cmd_tune(a):
     for b in BS:
         for g in GRID:
             lr = LR0 * (b / B0) ** 0.5 * g
             run = f"tune_b{b // 1024}k_lr{lr:.3g}"
-            if (RES / "tune" / f"{run}.json").exists():
-                continue
-            sbatch(f"gk_{run}", train_cmd(run, b, lr, 0.99, TUNE_TOKENS, tune=True), a.dry_run,
-                   extra=["-t", "0-06:00"])
+            enqueue(run, train_cmd(run, b, lr, 0.99, TUNE_TOKENS, tune=True), a.dry_run)
+
+
+def cmd_worker(a):
+    jobs = running_jobs()
+    if "gk_worker" in jobs:
+        print("a gk_worker job is already queued or running")
+        return
+    others = sorted(j for j in jobs if j.startswith("gk_"))
+    if others:
+        print(f"note: {others} queued/running; the worker waits for them (1 running job per user)")
+    sbatch("gk_worker", [PY, "experiments/gptkink_worker.py"], a.dry_run)
+
+
+def queue_status():
+    f = Q / "tasks.txt"
+    if not f.exists():
+        return
+    ids = [line.split("\t", 1)[0] for line in f.read_text().splitlines() if line.strip()]
+    run = (Q / "running").read_text().split("\t")[0] if (Q / "running").exists() else None
+    print("== queue (" + ", ".join(f"{k}: {v}" for k, v in (
+        ("tasks", len(ids)), ("done", sum((Q / "done" / t).exists() for t in ids)),
+        ("failed", sum((Q / "failed" / t).exists() for t in ids)))) + f"; running: {run or '-'})")
+    for t in ids:
+        if (Q / "failed" / t).exists():
+            print(f"  FAILED {t}: {(Q / 'failed' / t).read_text().strip()}  (log: results/gptkink/queue/logs/{t}.log)")
+    print("== slurm:", " ".join(sorted(j for j in running_jobs() if j.startswith("gk_"))) or "-")
 
 
 def cmd_status(a):
+    queue_status()
     print("== tuning (final held-out loss after 1e8 tokens)")
     rows = {}
     for f in sorted((RES / "tune").glob("*.json")):
@@ -123,42 +168,28 @@ def cmd_status(a):
             print(f"  {run:10s} {st:8s} probes: {','.join(probes) or '-'}")
 
 
-def cmd_stage1(a, only_missing=False):
+def cmd_stage1(a):
     best = tuned_lrs()
     missing = [b for b in BS if b not in best]
     if missing and not a.lr_from_rule:
-        raise SystemExit(f"no tuning result for b = {missing}; run `tune` first (or pass --lr-from-rule)")
-    queued = running_jobs()
+        raise SystemExit(f"no tuning result for b = {missing}; run `tune` + `worker` first (or --lr-from-rule)")
     for b in BS:
         lr = LR0 * (b / B0) ** 0.5 if a.lr_from_rule else best[b]["lr"]
         for beta2 in HEAD_BETA2:
             run = name(b, beta2)
-            if f"gk_{run}" in queued or f"gk_probe_{run}" in queued:
-                print(f"  {run}: already queued/running, skipping")
-                continue
-            if (CK / run / "DONE").exists():
-                jid = None
-            else:
-                jid = sbatch(f"gk_{run}", train_cmd(run, b, lr, beta2, RUN_TOKENS), a.dry_run)
-            n_ck = len(list((CK / run).glob("probe_*.pt"))) if (CK / run).exists() else 0
-            n_pr = len(list((RES / "probes").glob(f"frac_*/runs/{run}.npz")))
-            if not only_missing or jid or n_pr < max(n_ck, 7):
-                sbatch(f"gk_probe_{run}", [PY, "experiments/gptkink_probe.py", "--run", run], a.dry_run,
-                       extra=["-t", "0-06:00"], dep=jid)
+            enqueue(run, train_cmd(run, b, lr, beta2, RUN_TOKENS), a.dry_run)
+            enqueue(f"probe_{run}", [PY, "experiments/gptkink_probe.py", "--run", run], a.dry_run)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["prep", "smoke", "tune", "status", "stage1", "resume"])
+    ap.add_argument("cmd", choices=["prep", "smoke", "tune", "status", "stage1", "worker"])
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--lr-from-rule", action="store_true", help="stage1 without tuning: sqrt rule")
     a = ap.parse_args()
     (RES / "slurm").mkdir(parents=True, exist_ok=True)
-    if a.cmd == "resume":
-        cmd_stage1(a, only_missing=True)
-    else:
-        {"prep": cmd_prep, "smoke": cmd_smoke, "tune": cmd_tune, "status": cmd_status,
-         "stage1": cmd_stage1}[a.cmd](a)
+    {"prep": cmd_prep, "smoke": cmd_smoke, "tune": cmd_tune, "status": cmd_status,
+     "stage1": cmd_stage1, "worker": cmd_worker}[a.cmd](a)
 
 
 if __name__ == "__main__":

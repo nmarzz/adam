@@ -8,3 +8,4 @@ data/
 lm/
 results/gptkink/slurm/
 results/gptkink/smoke/
+results/gptkink/queue/
