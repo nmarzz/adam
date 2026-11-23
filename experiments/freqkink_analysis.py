@@ -218,6 +218,8 @@ def main():
     ap.add_argument("--center", action="store_true", help="analyse the centred-feature runs")
     ap.add_argument("--b-ref", type=int, default=None, help="reference batch (default: largest)")
     ap.add_argument("--tag", default="")
+    ap.add_argument("--pool", action="store_true", help="also plot one collapse pooling all Adam settings")
+    ap.add_argument("--eps", type=float, default=None, help="keep only Adam runs with this eps")
     ap.add_argument("--norm", default="window", choices=["window", "plateau"],
                     help="collapse normalization: sqrt(b) window law vs reference, or each run's plateau")
     args = ap.parse_args()
@@ -225,7 +227,8 @@ def main():
     FIGS.mkdir(parents=True, exist_ok=True)
 
     runs = [r for r in load_runs() if bool(r["cfg"].get("center", False)) == args.center
-            and bool(r["cfg"].get("frozen", False)) == args.frozen]
+            and bool(r["cfg"].get("frozen", False)) == args.frozen
+            and (args.eps is None or r["cfg"]["opt"] != "adam" or r["cfg"]["eps"] == args.eps)]
     if not runs:
         raise SystemExit("no runs")
     pi, edges, k = bins_for(runs[0]["train_counts"], args.width)
@@ -345,6 +348,48 @@ def main():
         fig.tight_layout()
         fig.savefig(FIGS / f"collapse{suffix}.pdf", metadata={"CreationDate": None})
         fig.savefig(FIGS / f"collapse{suffix}.png")
+        plt.close(fig)
+
+    # ---- Figure 2b: pooled collapse over all Adam settings (b and beta2 sweeps) ----
+    pooled = [r for g in names if g != "SGD" for r in groups[g]]
+    if args.pool and pooled:
+        b2s = sorted({r["cfg"]["beta2"] for r in pooled})
+        mk = dict(zip(b2s, "osD^v"))
+        fig, ax = plt.subplots(figsize=(7.4, 5.8))
+        X, Y = [], []
+        for r in pooled:
+            b, beta2 = r["cfg"]["b"], r["cfg"]["beta2"]
+            pl = (r["bc"]["pi"] >= 1e-4) & (r["bc"]["pi"] <= 1e-2)
+            R = r["rate"] / np.nanmedian(r["rate"][pl])
+            x = b * r["bc"]["pi"] / (1 - beta2)
+            ok = np.isfinite(R) & (R > 0)
+            ax.loglog(x[ok], R[ok], mk[beta2], ms=4.5, color=col[b], alpha=0.85, mfc="none" if beta2 != 0.99 else None)
+            X.append(x[ok]); Y.append(R[ok])
+        X, Y = np.concatenate(X), np.concatenate(Y)
+        f = fit_bend(X, Y)
+        kap = kappa(0.0, b2s[0])
+        ax.axvline(kap, color="k", ls="--", lw=1.4)
+        handles = [plt.Line2D([], [], color=col[b], marker="o", ls="", label=f"b={b}") for b in bs]
+        handles += [plt.Line2D([], [], color="0.3", marker=mk[v], ls="", mfc="none" if v != 0.99 else None,
+                               label=rf"$\beta_2$={v}") for v in b2s]
+        handles += [plt.Line2D([], [], color="k", ls="--", label=r"predicted $x=\pi/2$")]
+        if f:
+            lo, hi = bootstrap_bend(X, Y)
+            xs = np.logspace(np.log10(X.min()), np.log10(X.max()), 200)
+            us = np.log10(xs)
+            ax.loglog(xs, 10 ** (f["a"] + f["s_hi"] * np.maximum(us - f["u_k"], 0)
+                                 + f["s_lo"] * np.minimum(us - f["u_k"], 0)), color="C3", lw=2)
+            ax.axvspan(10 ** lo, 10 ** hi, color="C3", alpha=0.12)
+            handles += [plt.Line2D([], [], color="C3", lw=2, label=rf"fit: bend $x$={10 ** f['u_k']:.2g}")]
+            report["pooled_collapse"] = dict(f, x_k=10 ** f["u_k"], x_k_90ci=[10 ** lo, 10 ** hi], kappa=kap,
+                                             runs=[r["name"] for r in pooled])
+        ax.set_xlabel(r"$x=b\pi_c/(1-\beta_2)$")
+        ax.set_ylabel("rate / plateau rate")
+        ax.legend(handles=handles, fontsize=10, ncol=2, loc="lower right")
+        polish_axis(ax)
+        fig.tight_layout()
+        fig.savefig(FIGS / f"collapse_pooled{suffix}.pdf", metadata={"CreationDate": None})
+        fig.savefig(FIGS / f"collapse_pooled{suffix}.png")
         plt.close(fig)
 
     # ---- Figure 3: sqrt(v) vs eps ----------------------------------------
