@@ -418,9 +418,24 @@ def cmd_run(args):
         curves[mode] = (t, P)
         print(f"  sim[{mode}] {time.time() - t1:.1f}s  final P mean {P[-1].mean():.4g}")
 
+    # Long-time behaviour: ODE fixed point vs late-time levels.
+    fps = {}
+    for noise, (a_d, a_i, g) in tables.items():
+        fps[noise] = fixed_point(lam, Gam, P_grid, a_d, g, args.eta, args.T)
+        fp = fps[noise]
+        print(f"  fixed point[{noise}]: P* {fp['P_star']:.4g}  "
+              f"(modes with t_relax > T/3: {100 * fp.get('slow_mode_frac', np.nan):.1f}%, "
+              f"carrying {100 * fp.get('slow_risk_frac', np.nan):.1f}% of P*; "
+              f"t_relax median {fp.get('t_relax_median', np.nan):.3g}, max {fp.get('t_relax_max', np.nan):.3g})")
+    late = {}
+    for k, (t, P) in curves.items():
+        sel = t >= 0.5 * args.T
+        late[k] = float((P.mean(axis=1) if P.ndim == 2 else P)[sel].mean())
+    print("  late level (t >= T/2): " + "  ".join(f"{k} {v:.4g}" for k, v in late.items()))
+
     RES.mkdir(parents=True, exist_ok=True)
     np.savez(RES / f"run_{tag}.npz", P_grid=P_grid, sigma2=sig2, P0=P0, info=info,
-             args=json.dumps(vars(args)),
+             args=json.dumps(vars(args)), fixed_points=json.dumps(fps), late=json.dumps(late),
              **{f"{k}_t": v[0] for k, v in curves.items()},
              **{f"{k}_P": v[1] for k, v in curves.items()},
              **{f"tab_{k}_a": v[0] for k, v in tables.items()},
@@ -428,6 +443,39 @@ def cmd_run(args):
              **{f"tab_{k}_g": v[2] for k, v in tables.items()})
     summarize(curves, tag)
     plot_run(curves, tag, info, sig2, args)
+
+
+def fixed_point(lam, Gam, P_grid, a_tab, g_tab, eta, T):
+    """Stationary excess risk of the ODE and how much of it is reachable by time T.
+
+    de_i/dt = 0 gives e_i* = eta (g . Gam)_i / (2 lambda_i a), so
+    P* = eta sum_i (g(P*) . Gam)_i / lambda_i / (4 a(P*))  (modes with lambda_i = 0
+    carry no risk).  Mode i relaxes on t_i = 1 / (2 eta lambda_i a(P*)).
+    """
+    lam = np.asarray(lam)
+    Gam = np.asarray(Gam)
+    pos = lam > 1e-10 * lam.max()
+    S = (Gam[:, pos] / lam[pos]).sum(axis=1)                       # (nodes - 1,)
+    lg = np.log(P_grid)
+    fine = np.geomspace(P_grid[0], P_grid[-1], 4000)
+    lf = np.log(fine)
+    a = np.exp(np.interp(lf, lg, np.log(a_tab)))
+    g = np.stack([np.interp(lf, lg, col) for col in g_tab.T], axis=1)
+    F = eta * (g[:, 1:] @ S) / (4 * a)
+    h = lf - np.log(np.maximum(F, 1e-300))
+    roots = np.where(np.sign(h[:-1]) != np.sign(h[1:]))[0]
+    if len(roots) == 0:
+        return dict(P_star=float("nan"))
+    r = roots[0]
+    Ps = float(np.exp(lf[r] - h[r] * (lf[r + 1] - lf[r]) / (h[r + 1] - h[r])))
+    a_s = float(np.exp(np.interp(np.log(Ps), lg, np.log(a_tab))))
+    g_s = np.array([np.interp(np.log(Ps), lg, col) for col in g_tab.T])
+    contrib = eta * (g_s[1:] @ Gam[:, pos]) / lam[pos] / (4 * a_s)
+    t_relax = 1.0 / (2 * eta * lam[pos] * a_s)
+    slow = t_relax > T / 3
+    return dict(P_star=Ps, slow_mode_frac=float(slow.mean()),
+                slow_risk_frac=float(contrib[slow].sum() / contrib.sum()),
+                t_relax_median=float(np.median(t_relax)), t_relax_max=float(t_relax.max()))
 
 
 def rel_error(curves, sim, ode, tmin=0.0):

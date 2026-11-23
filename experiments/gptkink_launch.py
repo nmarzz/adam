@@ -2,14 +2,16 @@
 
 Plan: ``experiments/Frequency kink in full GPT-2 training.md``. Every job runs through
 ``results/gptkink/job.sbatch`` (one H100, 23h50 limit, checkpoint on USR1). Run from the
-repository root; add --dry-run to print the sbatch commands without submitting.
+repository root with the system python3 (standard library only; it works on the login
+or jump host, where the lm/ venv's python3.12 does not exist; the jobs themselves use
+lm/bin/python on the GPU node). Add --dry-run to print the sbatch commands.
 
-    lm/bin/python experiments/gptkink_launch.py prep      # tokenize OWT (once, ~1-2 h)
-    lm/bin/python experiments/gptkink_launch.py smoke     # Stage 0 checks (~30 min)
-    lm/bin/python experiments/gptkink_launch.py tune      # lr grid, 10% budget (20 short jobs)
-    lm/bin/python experiments/gptkink_launch.py status    # tuning table, runs, probes
-    lm/bin/python experiments/gptkink_launch.py stage1    # 8 runs + dependent probe jobs
-    lm/bin/python experiments/gptkink_launch.py resume    # resubmit unfinished runs / probes
+    python3 experiments/gptkink_launch.py prep      # tokenize OWT (once, ~1-2 h)
+    python3 experiments/gptkink_launch.py smoke     # Stage 0 checks (~30 min)
+    python3 experiments/gptkink_launch.py tune      # lr grid, 10% budget (20 short jobs)
+    python3 experiments/gptkink_launch.py status    # tuning table, runs, probes
+    python3 experiments/gptkink_launch.py stage1    # 8 runs + dependent probe jobs
+    python3 experiments/gptkink_launch.py resume    # resubmit unfinished runs / probes
 """
 from __future__ import annotations
 
