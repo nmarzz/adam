@@ -299,7 +299,7 @@ def main():
     print(f"{a.name}: b={b:,} tokens/step, T={T:,} steps, {n_params / 1e6:.1f}M params "
           f"(head {model.head.numel() / 1e6:.1f}M), n_test={data.n_test:,}", flush=True)
 
-    rec, step, tau, n_clip, t_used = [], 0, 0.0, 0, 0.0
+    rec, step, tau, n_clip, t_used, gns = [], 0, 0.0, 0, 0.0, []
     if (ck / "last.pt").exists():
         s = torch.load(ck / "last.pt", map_location=dev, weights_only=False)
         model.load_state_dict(s["model"]); opt.load_state_dict(s["opt"])
@@ -324,19 +324,24 @@ def main():
         vr, vm = head_v_stats(opt, model, a.head_beta2)
         sp, sc = pad_spread(model)
         r.pop("ctx")
+        g = np.array(gns) if gns else np.full(1, np.nan)
         r.update(step=step, tau=tau, v_rms=vr, v_med=vm, pad_spread=sp, pad_scale=sc,
-                 clip_frac=n_clip / max(step, 1), wall=t_used + time.time() - t0)
+                 clip_frac=n_clip / max(step, 1), wall=t_used + time.time() - t0,
+                 gnorm=[float(np.median(g)), float(np.quantile(g, 0.9)), float(g.max())])
+        gns.clear()
         rec.append(r)
         tot = r["loss"].sum() / data.n_test
         print(f"  step {step:>9,} ({step * b:>13,} tok)  loss {tot:.4f}  G[pad spread {sp:.1e}]  "
-              f"shared-mean {r['shared_mean_frac']:.3f}  clip {r['clip_frac']:.3f}  [{r['wall'] / 60:.1f} min]",
+              f"shared-mean {r['shared_mean_frac']:.3f}  clip {r['clip_frac']:.3f}  "
+              f"|g| med/p90/max {r['gnorm'][0]:.2f}/{r['gnorm'][1]:.2f}/{r['gnorm'][2]:.2f}  [{r['wall'] / 60:.1f} min]",
               flush=True)
         return tot
 
     def write_records():
         if a.tune:
             tot = rec[-1]["loss"].sum() / data.n_test
-            done_file.write_text(json.dumps(dict(cfg, final_loss=float(tot) if np.isfinite(tot) else None)))
+            done_file.write_text(json.dumps(dict(cfg, final_loss=float(tot) if np.isfinite(tot) else None,
+                                                 gnorm_med_p90_max=rec[-1]["gnorm"])))
             return
         arr = lambda k: np.stack([r[k] for r in rec]).astype(np.float32)
         o = dict(steps=np.array([r["step"] for r in rec]), samples=np.array([r["step"] * b for r in rec]),
@@ -345,7 +350,8 @@ def main():
                  total=np.array([r["loss"].sum() / data.n_test for r in rec]),
                  shared_mean_frac=np.array([r["shared_mean_frac"] for r in rec]),
                  pad_spread=np.array([[r["pad_spread"], r["pad_scale"]] for r in rec]),
-                 clip_frac=np.array([r["clip_frac"] for r in rec]), wall=np.array([r["wall"] for r in rec]))
+                 clip_frac=np.array([r["clip_frac"] for r in rec]), wall=np.array([r["wall"] for r in rec]),
+                 gnorm=np.array([r.get("gnorm", [np.nan] * 3) for r in rec]))
         vs = [r for r in rec if r["v_rms"] is not None]
         if vs:
             o["v_steps"] = np.array([r["step"] for r in vs])
@@ -390,7 +396,9 @@ def main():
             loss = F.cross_entropy(z, ys.reshape(-1), reduction="sum") / b
             loss.backward()
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip)
-        n_clip += int(gn.item() > a.clip)
+        gn = gn.item()
+        gns.append(gn)
+        n_clip += int(gn > a.clip)
         opt.step()
         opt.zero_grad(set_to_none=True)
         tau += a.lr * f

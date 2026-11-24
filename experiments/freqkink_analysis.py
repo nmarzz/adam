@@ -287,7 +287,8 @@ def main():
         ax.set_title(gname, fontsize=15)
         polish_axis(ax)
     lab = {"G": rf"own-event gain rate $G(t_w)/(\eta t_w)$, $t_w$={args.tw:g}",
-           "Gslope": r"init drift $\dot G/\eta$ (frozen, per step)",
+           "Gslope": (r"own-event forcing $\dot G_\mathrm{own}/\eta$ (per step)" if GAIN_KEY == "gain_own_sum"
+                      else r"drift $\dot G/\eta$ (frozen, per step)"),
            "Gt": rf"$\theta/(\eta\, t_\theta)$, $G(t_\theta)=\theta$={args.theta:g}",
            "S": rf"early signal rate $S(t_w)/(\eta t_w)$, $t_w$={args.tw:g}",
            "half": r"$1/(\eta\, t_{1/2})$", "drop": rf"$\delta/(\eta\, t_\delta)$, $\delta$={args.delta:g}"}
